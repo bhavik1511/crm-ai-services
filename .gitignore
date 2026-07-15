@@ -1,0 +1,81 @@
+# Dependencies
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Logs
+logs
+*.log
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDEs
+.idea/
+.vscode/
+
+# Temporary / Junk Files
+*_debug.txt
+*_out.txt
+*_marker.txt
+err.txt
+error_full.txt
+counts.txt
+test_*.txt
+
+# Archive
+archive/
+
+# Local AI Databases & Memory
+chroma_db/
+brain/
+memory/
+scratch/
+
+# AI Generated Blueprints & References
+AI_FOUNDRY_BLUEPRINT_*.md
+ANTIGRAVITY_CRM_MASTER_REFERENCE_FINAL.md
+
+# Output, Logs & Raw Data
+output.txt
+output_utf8.txt
+clean_results.txt
+live_results.txt
+verify_pipeline.txt
+emp_schema.txt
+certification_raw.json
+*.bak
+
+# Top-level Scratch & Testing Scripts
+test_adhoc.py
+test_kpi.py
+test_prompt.py
+test_fast.py
+test_flow.py
+test_rbac5.py
+test_recoverability.py
+test_all_live.py
+check_dept.py
+check_id.py
+check_role.py
+get_employee.py
+get_token.py
+analyze.py
+scratch_kpi_test.py
