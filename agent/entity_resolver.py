@@ -12,7 +12,10 @@ from typing import Dict, Any, Tuple, List
 
 logger = logging.getLogger(__name__)
 
-CRM_API_BASE = 'http://localhost:3001/api/v1'
+import os
+
+CRM_API_BASE = os.getenv('CRM_API_BASE', 'http://localhost:3001/api/v1').rstrip('/')
+
 
 # Entity to API Mapping
 ENTITY_API_MAP = {

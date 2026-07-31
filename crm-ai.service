@@ -1,0 +1,14 @@
+[Unit]
+Description=CRM AI FastAPI Service
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/crm-ai-services
+ExecStart=/home/ubuntu/crm-ai-services/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+Restart=always
+RestartSec=5
+EnvironmentFile=/home/ubuntu/crm-ai-services/.env
+
+[Install]
+WantedBy=multi-user.target

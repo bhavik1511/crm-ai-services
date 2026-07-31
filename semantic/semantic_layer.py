@@ -10,9 +10,12 @@ import urllib.request
 import urllib.error
 import contextvars
 
+import os
+
 # Global auth token set by main.py before each request
 _CRM_AUTH_TOKEN = ''
-CRM_API_BASE = 'http://localhost:3001/api/v1'
+CRM_API_BASE = os.getenv('CRM_API_BASE', 'http://localhost:3001/api/v1').rstrip('/')
+
 
 # ---------------------------------------------------------------------------
 # Server-side RBAC: user context set before every request by main.py / chat_routes.py
