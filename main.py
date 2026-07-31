@@ -54,14 +54,20 @@ except Exception:
     pass
 
 raw_origins = os.getenv("ALLOWED_ORIGINS", "")
-allowed_origins = [orig.strip() for orig in raw_origins.split(",")] if raw_origins else [
+default_origins = [
     "http://localhost:5173",
     "http://localhost:5174",
+    "http://localhost:3000",
     "http://localhost:3001",
     "http://127.0.0.1:5173",
-    "http://127.0.0.1:5174",
-    "http://192.168.1.13:5173",
+    "https://gtcrm-bh.com",
+    "https://staging.gtcrm-bh.com",
+    "https://www.gtcrm-bh.com",
 ]
+if raw_origins:
+    allowed_origins = list(set([orig.strip() for orig in raw_origins.split(",") if orig.strip()] + default_origins))
+else:
+    allowed_origins = default_origins
 
 app.add_middleware(
     CORSMiddleware,
