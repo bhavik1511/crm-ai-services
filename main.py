@@ -712,13 +712,17 @@ def _format_kpi_report(kpi_payload: dict) -> str:
 
 
 def _call_json_api(url: str, auth_token: Optional[str]) -> dict:
-    headers = {"Accept": "application/json"}
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    }
     if auth_token:
         headers["Authorization"] = f"Bearer {auth_token}"
     req = UrlRequest(url=url, headers=headers, method="GET")
     with urlopen(req, timeout=25) as resp:
         body = resp.read().decode("utf-8")
         return json.loads(body)
+
 
 
 def _build_kpi_contract(kpi_data: dict, aging_data: dict, filters_applied: dict, period: dict) -> dict:
