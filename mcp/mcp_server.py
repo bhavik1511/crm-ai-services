@@ -5,6 +5,9 @@ import asyncio
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from mcp.server.fastmcp import FastMCP
 import jwt
 from redis.asyncio import Redis
@@ -23,7 +26,7 @@ load_dotenv()
 JWT_SECRET = os.getenv("JWT_SECRET", "shhh_change_me")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 MONGODB_URI = os.getenv("MONGODB_URI")
-MCP_PORT = int(os.getenv("MCP_PORT", "8000"))
+MCP_PORT = int(os.getenv("MCP_PORT", "8001"))
 AUDIT_LOG_COL = "mcp_audit_log"
 HISTORY_COL = "ai_chat_history"
 
@@ -233,9 +236,11 @@ async def handle_edit_intent(entity_type: str, entity_name: str, user_id: int, r
     return await _edit_fn(entity_type, entity_name, user_id, role)
 
 
+MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
+
 if __name__ == "__main__":
     import uvicorn
-    print(f"Starting MCP Server (SSE) on port {MCP_PORT}...")
-    # Get the SSE app from FastMCP and run it with uvicorn on a custom port
+    print(f"Starting MCP Server (SSE) on {MCP_HOST}:{MCP_PORT}...")
+    # Get the SSE app from FastMCP and run it with uvicorn on custom host & port
     app = mcp.sse_app()
-    uvicorn.run(app, host="0.0.0.0", port=MCP_PORT)
+    uvicorn.run(app, host=MCP_HOST, port=MCP_PORT)

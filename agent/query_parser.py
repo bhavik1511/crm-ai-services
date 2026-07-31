@@ -63,7 +63,28 @@ def _is_company_name(name: str) -> bool:
 _MONTH_NAMES_SET = {'january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december', 'jan', 'feb', 'mar', 'apr', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'}
 _MONTH_NAMES_DICT = {'jan':1,'feb':2,'mar':3,'apr':4,'may':5,'jun':6, 'jul':7,'aug':8,'sep':9,'oct':10,'nov':11,'dec':12}
 
+KNOWN_SERVICE_LINES = {
+    "audit", "tax", "advisory", "consulting", "deals", "strategy", 
+    "risk advisory", "financial advisory", "accounting", "legal", 
+    "technology", "assurance", "corporate finance"
+}
+
+def _extract_service_line_name(question: str) -> str:
+    """Extracts known service line names from question text."""
+    if not question:
+        return ""
+    q_lower = question.lower()
+    for sl in KNOWN_SERVICE_LINES:
+        pattern = r'\b' + re.escape(sl) + r'\b'
+        if re.search(pattern, q_lower):
+            return sl.title()
+    return ""
+
 def _extract_person_name(question: str) -> str:
+    """Extracts person name ONLY when explicit employee trigger words are present."""
+    from agent.entity_resolver import has_employee_trigger
+    if not has_employee_trigger(question):
+        return ""
     lines = question.strip().splitlines()
     if any(re.match(r'^\s*(Date Range|Financial Year|Service Line|Duration|Employee Name|Project Name)\s*:', l, re.IGNORECASE) for l in lines):
         question = lines[0] if lines else question
@@ -73,7 +94,7 @@ def _extract_person_name(question: str) -> str:
         candidate = m.group(1).strip()
         candidate = re.sub(r'^(the|a|an)\s+', '', candidate, flags=re.IGNORECASE).strip()
         candidate = re.sub(r'\b(report|summary|data|details?|for|in|on|last|next|this|year|month|quarter|fy|20\d\d)\b.*$', '', candidate, flags=re.IGNORECASE).strip()
-        if len(candidate) > 2 and not _is_company_name(candidate) and candidate.lower() not in _MONTH_NAMES_SET:
+        if len(candidate) > 2 and not _is_company_name(candidate) and candidate.lower() not in _MONTH_NAMES_SET and candidate.lower() not in KNOWN_SERVICE_LINES:
             return candidate
 
     m = _OF_PATTERN.search(question)
@@ -81,7 +102,7 @@ def _extract_person_name(question: str) -> str:
         candidate = m.group(1).strip()
         candidate = re.sub(r'^(the|a|an)\s+', '', candidate, flags=re.IGNORECASE).strip()
         candidate = re.sub(r'\b(report|summary|data|details?|for|in|on|last|next|this|year|month|quarter|fy|20\d\d)\b.*$', '', candidate, flags=re.IGNORECASE).strip()
-        if len(candidate) > 2 and not _is_company_name(candidate) and candidate.lower() not in _MONTH_NAMES_SET:
+        if len(candidate) > 2 and not _is_company_name(candidate) and candidate.lower() not in _MONTH_NAMES_SET and candidate.lower() not in KNOWN_SERVICE_LINES:
             return candidate
     return ""
 
@@ -581,6 +602,14 @@ Example: "What is Bhavik's utilization?"
         intent.date_from = parsed.date_from or current_fy_start
         intent.date_to = parsed.date_to or current_fy_end
         intent.date_was_specified = parsed.date_was_specified
+
+        from agent.entity_resolver import is_fiscal_year_expression, resolve_fiscal_year
+        if is_fiscal_year_expression(question):
+            fy_info = resolve_fiscal_year(question)
+            intent.date_from = fy_info["start_date"]
+            intent.date_to = fy_info["end_date"]
+            intent.date_was_specified = True
+            intent.extra["financial_year"] = fy_info["financial_year"]
     except Exception as e:
         logger.error(f"[QueryParser] LLM extraction failed, falling back to legacy: {e}")
         # Extremely basic fallback
@@ -644,58 +673,68 @@ Example: "What is Bhavik's utilization?"
         "resource_utilization", "leave", "salary", "project_tasks", "project_summary", "kpi", "receivables", "revenue"
     }
     if intent.metric_type in employee_metrics and intent.entity_type == "employee":
-        name = intent.entity_name
-        if name:
-            intent.entity_type = "employee"
-            intent.entity_name = name
+        from agent.entity_resolver import has_employee_trigger
+        if not has_employee_trigger(question):
+            sl_cand = _extract_service_line_name(question)
+            if sl_cand:
+                intent.entity_type = "service_line"
+                intent.entity_name = sl_cand
+            else:
+                intent.entity_type = "general"
+                intent.entity_name = ""
+        else:
+            name = intent.entity_name
+            if name:
+                intent.entity_type = "employee"
+                intent.entity_name = name
 
-            # Verify in DB
-            result = _lookup_employee_by_name(name)
-            if result:
-                emp_id, emp_name = result
-                intent.entity_id    = emp_id
-                intent.entity_name  = emp_name   # use canonical DB name
-                logger.info(f"[QueryParser] Resolved '{name}' → employee_id={emp_id} ({emp_name})")
+                # Verify in DB
+                result = _lookup_employee_by_name(name)
+                if result:
+                    emp_id, emp_name = result
+                    intent.entity_id    = emp_id
+                    intent.entity_name  = emp_name   # use canonical DB name
+                    logger.info(f"[QueryParser] Resolved '{name}' → employee_id={emp_id} ({emp_name})")
 
-                # Build confirmed SQL
-                if intent.metric_type == "resource_utilization":
-                    intent.verified_sql = _build_resource_utilization_sql(
-                        emp_id, emp_name, date_from, date_to
-                    )
+                    # Build confirmed SQL
+                    if intent.metric_type == "resource_utilization":
+                        intent.verified_sql = _build_resource_utilization_sql(
+                            emp_id, emp_name, date_from, date_to
+                        )
+                        intent.context_hint = (
+                            f"Employee '{emp_name}' (id={emp_id}) verified in DB. "
+                            f"Query provides month-wise and overall breakdown including exact Standard Hours and Utilization %. "
+                            f"NOTE: Display this exact data professionally as a Markdown table."
+                        )
+
+                    elif "leave balance" in q_lower:
+                        intent.verified_sql = _build_leave_balance_sql(emp_id)
+                        intent.context_hint = f"Employee '{emp_name}' id={emp_id}. Query employee_leave_balance."
+
+                    elif intent.metric_type == "leave":
+                        intent.verified_sql = _build_leave_sql(emp_id, emp_name)
+                        intent.context_hint = f"Employee '{emp_name}' id={emp_id}. Query leave_request."
+
+                    elif intent.metric_type == "salary":
+                        intent.verified_sql = _build_salary_sql(emp_id)
+                        intent.context_hint = f"Employee '{emp_name}' id={emp_id}. Use emp_basic_salary, emp_gross_salary from employees."
+
+                else:
+                    logger.info(f"[QueryParser] Could not find employee '{name}' in DB")
                     intent.context_hint = (
-                        f"Employee '{emp_name}' (id={emp_id}) verified in DB. "
-                        f"Query provides month-wise and overall breakdown including exact Standard Hours and Utilization %. "
+                        f"WARNING: Employee '{name}' not found in database. "
+                        f"Use LIKE '%{name}%' search on employees.employee_name. "
+                        f"If still not found, return 'No employee named {name!r} was found.'"
+                    )
+            else:
+                # No specific employee — aggregate query
+                intent.entity_type = "all_employees"
+                if intent.metric_type == "resource_utilization":
+                    intent.context_hint = (
+                        f"Aggregate resource utilization for ALL employees. "
+                        f"Query timesheet_project JOIN ts_project_date (tpd) JOIN employees (status_id=3). "
                         f"NOTE: Display this exact data professionally as a Markdown table."
                     )
-
-                elif "leave balance" in q_lower:
-                    intent.verified_sql = _build_leave_balance_sql(emp_id)
-                    intent.context_hint = f"Employee '{emp_name}' id={emp_id}. Query employee_leave_balance."
-
-                elif intent.metric_type == "leave":
-                    intent.verified_sql = _build_leave_sql(emp_id, emp_name)
-                    intent.context_hint = f"Employee '{emp_name}' id={emp_id}. Query leave_request."
-
-                elif intent.metric_type == "salary":
-                    intent.verified_sql = _build_salary_sql(emp_id)
-                    intent.context_hint = f"Employee '{emp_name}' id={emp_id}. Use emp_basic_salary, emp_gross_salary from employees."
-
-            else:
-                logger.info(f"[QueryParser] Could not find employee '{name}' in DB")
-                intent.context_hint = (
-                    f"WARNING: Employee '{name}' not found in database. "
-                    f"Use LIKE '%{name}%' search on employees.employee_name. "
-                    f"If still not found, return 'No employee named {name!r} was found.'"
-                )
-        else:
-            # No specific employee — aggregate query
-            intent.entity_type = "all_employees"
-            if intent.metric_type == "resource_utilization":
-                intent.context_hint = (
-                    f"Aggregate resource utilization for ALL employees. "
-                    f"Query timesheet_project JOIN ts_project_date (tpd) JOIN employees (status_id=3). "
-                    f"NOTE: Display this exact data professionally as a Markdown table."
-                )
 
     # ── Set a generic hint for LLM fallback ───────────────────────────────
     if not intent.context_hint:

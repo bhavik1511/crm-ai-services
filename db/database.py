@@ -9,7 +9,6 @@ import time
 unique_id = int(time.time())
 print(f"[DEBUG ENV] Server unique ID: {unique_id}")
 print(f"[DEBUG ENV] Loaded .env from: {os.path.abspath('.env')}")
-print(f"[DEBUG ENV] OPENROUTER_PRIMARY_MODEL: {os.getenv('OPENROUTER_PRIMARY_MODEL')}")
 print(f"[DEBUG ENV] LLM_PROVIDER: {os.getenv('LLM_PROVIDER')}")
 
 _engine = None
@@ -49,10 +48,10 @@ def get_db_engine() -> Engine:
         )
         cursor.close()
 
-    # Automatically initialize the AI token tracking table
+    # Automatically initialize tracking tables
     with _engine.begin() as conn:
         conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS ai_token_usage (
+            CREATE TABLE IF NOT EXISTS ai_chatbot_usage (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 employee_id INT NOT NULL,
                 session_id VARCHAR(255) NULL,
@@ -61,13 +60,15 @@ def get_db_engine() -> Engine:
                 output_tokens INT DEFAULT 0,
                 total_tokens INT DEFAULT 0,
                 total_cost_usd DECIMAL(10, 6) DEFAULT 0.000000,
+                status VARCHAR(20) NOT NULL DEFAULT 'success',
+                error_type VARCHAR(50) NULL,
+                error_message VARCHAR(512) NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """))
 
-        # Automatically initialize the document parsing token tracking table
         conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS ai_parsing_token_usage (
+            CREATE TABLE IF NOT EXISTS ai_email_parsing (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 employee_id INT NOT NULL,
                 document_type VARCHAR(50) NOT NULL,
@@ -79,9 +80,31 @@ def get_db_engine() -> Engine:
                 output_tokens INT DEFAULT 0,
                 total_tokens INT DEFAULT 0,
                 total_cost_usd DECIMAL(10, 6) DEFAULT 0.000000,
+                confidence_score INT NULL,
+                confidence_level VARCHAR(20) NULL,
+                processing_status VARCHAR(20) NULL,
+                processing_time_ms INT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """))
+
+    # Safe column migration: add new columns if they don't exist yet (compatible with all MySQL versions)
+    _col_migrations = [
+        ("status",        "ALTER TABLE ai_chatbot_usage ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'success'"),
+        ("error_type",    "ALTER TABLE ai_chatbot_usage ADD COLUMN error_type VARCHAR(50) NULL"),
+        ("error_message", "ALTER TABLE ai_chatbot_usage ADD COLUMN error_message VARCHAR(512) NULL"),
+    ]
+    for col_name, col_sql in _col_migrations:
+        with _engine.begin() as _conn:
+            exists = _conn.execute(text(
+                "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                f"WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ai_chatbot_usage' AND COLUMN_NAME = '{col_name}'"
+            )).scalar()
+            if not exists:
+                try:
+                    _conn.execute(text(col_sql))
+                except Exception as _e:
+                    logger.warning(f"[DB Migration] Could not add column {col_name}: {_e}")
 
     return _engine
 
@@ -97,10 +120,14 @@ async def save_token_usage_async(
     input_tokens: int, 
     output_tokens: int, 
     total_tokens: int, 
-    total_cost_usd: float
+    total_cost_usd: float,
+    status: str = "success",
+    error_type: str = None,
+    error_message: str = None
 ):
     """
     Asynchronously saves the token usage record to MySQL to avoid blocking chat responses.
+    Tracks success, rate limit, and failure states per request.
     """
     def _insert_sync():
         try:
@@ -108,9 +135,9 @@ async def save_token_usage_async(
             with engine.begin() as conn:
                 conn.execute(
                     text("""
-                        INSERT INTO ai_token_usage 
-                        (employee_id, session_id, model_name, input_tokens, output_tokens, total_tokens, total_cost_usd)
-                        VALUES (:emp_id, :sess_id, :model, :in_tok, :out_tok, :tot_tok, :cost)
+                        INSERT INTO ai_chatbot_usage 
+                        (employee_id, session_id, model_name, input_tokens, output_tokens, total_tokens, total_cost_usd, status, error_type, error_message)
+                        VALUES (:emp_id, :sess_id, :model, :in_tok, :out_tok, :tot_tok, :cost, :status, :error_type, :error_message)
                     """),
                     {
                         "emp_id": employee_id,
@@ -119,7 +146,10 @@ async def save_token_usage_async(
                         "in_tok": input_tokens,
                         "out_tok": output_tokens,
                         "tot_tok": total_tokens,
-                        "cost": total_cost_usd
+                        "cost": total_cost_usd,
+                        "status": status,
+                        "error_type": error_type,
+                        "error_message": (error_message or "")[:512] if error_message else None
                     }
                 )
         except Exception as e:
@@ -145,7 +175,6 @@ async def save_parsing_token_usage_async(
     if model_name is None:
         model_name = (
             os.getenv("PRIMARY_MODEL") or 
-            os.getenv("OPENROUTER_PRIMARY_MODEL") or 
             os.getenv("GROQ_MODEL") or 
             os.getenv("LLM_PROVIDER") or 
             "unknown"
@@ -157,7 +186,7 @@ async def save_parsing_token_usage_async(
             with engine.begin() as conn:
                 conn.execute(
                     text("""
-                        INSERT INTO ai_parsing_token_usage 
+                        INSERT INTO ai_email_parsing 
                         (employee_id, document_type, reference_id, model_name, input_tokens, output_tokens, total_tokens, total_cost_usd, has_attachment, file_extension)
                         VALUES (:emp_id, :doc_type, :ref_id, :model, :in_tok, :out_tok, :tot_tok, :cost, :has_att, :ext)
                     """),
@@ -197,7 +226,6 @@ def save_parsing_token_usage(
     if model_name is None:
         model_name = (
             os.getenv("PRIMARY_MODEL") or 
-            os.getenv("OPENROUTER_PRIMARY_MODEL") or 
             os.getenv("GROQ_MODEL") or 
             os.getenv("LLM_PROVIDER") or 
             "unknown"
@@ -208,7 +236,7 @@ def save_parsing_token_usage(
         with engine.begin() as conn:
             conn.execute(
                 text("""
-                    INSERT INTO ai_parsing_token_usage 
+                    INSERT INTO ai_email_parsing 
                     (employee_id, document_type, reference_id, model_name, input_tokens, output_tokens, total_tokens, total_cost_usd, has_attachment, file_extension)
                     VALUES (:emp_id, :doc_type, :ref_id, :model, :in_tok, :out_tok, :tot_tok, :cost, :has_att, :ext)
                 """),
@@ -227,3 +255,54 @@ def save_parsing_token_usage(
             )
     except Exception as e:
         logger.error(f"[TokenTracker] Failed to save parsing token usage (sync): {e}")
+
+async def save_ai_email_parsing_async(
+    employee_id: int, 
+    document_type: str, 
+    reference_id: str,
+    input_tokens: int, 
+    output_tokens: int, 
+    total_tokens: int, 
+    total_cost_usd: float,
+    model_name: str, 
+    has_attachment: bool,
+    file_extension: str,
+    confidence_score: int,
+    confidence_level: str,
+    processing_status: str,
+    processing_time_ms: int
+):
+    """
+    Asynchronously saves the combined email parsing token usage and analytics to MySQL.
+    """
+    def _insert_sync():
+        try:
+            engine = get_db_engine()
+            with engine.begin() as conn:
+                conn.execute(
+                    text("""
+                        INSERT INTO ai_email_parsing 
+                        (employee_id, document_type, reference_id, model_name, input_tokens, output_tokens, total_tokens, total_cost_usd, has_attachment, file_extension, confidence_score, confidence_level, processing_status, processing_time_ms)
+                        VALUES (:emp_id, :doc_type, :ref_id, :model, :in_tok, :out_tok, :tot_tok, :cost, :has_att, :ext, :conf_score, :conf_level, :proc_status, :proc_time)
+                    """),
+                    {
+                        "emp_id": employee_id,
+                        "doc_type": document_type,
+                        "ref_id": reference_id,
+                        "model": model_name,
+                        "in_tok": input_tokens,
+                        "out_tok": output_tokens,
+                        "tot_tok": total_tokens,
+                        "cost": total_cost_usd,
+                        "has_att": has_attachment,
+                        "ext": file_extension,
+                        "conf_score": confidence_score,
+                        "conf_level": confidence_level,
+                        "proc_status": processing_status,
+                        "proc_time": processing_time_ms
+                    }
+                )
+        except Exception as e:
+            logger.error(f"[TokenTracker] Failed to save AI email parsing analytics: {e}")
+
+    await asyncio.to_thread(_insert_sync)

@@ -45,6 +45,35 @@ except Exception as e:
     print(f"[WARNING] Failed to load chat_routes: {e}")
     print("[INFO] API will work but JWT chat routes unavailable")
 
+@app.on_event("startup")
+async def startup_event():
+    """Automatically spawn background MCP server dynamically based on environment config."""
+    enable_mcp = os.getenv("ENABLE_MCP_SERVER", "true").lower() in ("true", "1", "yes")
+    if not enable_mcp:
+        print("[INFO] ENABLE_MCP_SERVER is set to false. Skipping MCP auto-launch.")
+        return
+
+    mcp_port = int(os.getenv("MCP_PORT", "8001"))
+    mcp_host = os.getenv("MCP_HOST", "127.0.0.1")
+    
+    import socket
+    import subprocess
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(1)
+    res = sock.connect_ex((mcp_host, mcp_port))
+    sock.close()
+    if res != 0:
+        print(f"[INFO] Launching background MCP Server on {mcp_host}:{mcp_port}...")
+        mcp_script = os.path.join(os.path.dirname(__file__), "mcp", "mcp_server.py")
+        try:
+            creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0
+            subprocess.Popen([sys.executable, mcp_script], creationflags=creationflags)
+            print(f"[INFO] MCP Server successfully launched on port {mcp_port}.")
+        except Exception as err:
+            print(f"[WARNING] Could not auto-launch MCP Server: {err}")
+    else:
+        print(f"[INFO] MCP Server is already active on port {mcp_port}.")
+
 # ── Server-load marker for hot-reload debugging ──────────────────────────────
 try:
     _main_marker_path = os.path.join(os.path.dirname(__file__), "main_server_load_marker.txt")
@@ -95,6 +124,8 @@ class QuestionRequest(BaseModel):
 class AnswerResponse(BaseModel):
     answer: str
     chart_data: Optional[Dict] = None
+    action: Optional[str] = None
+    navigation_id: Optional[str] = None
     navigate_to: Optional[str] = None
     navigation_links: Optional[List[Dict]] = None
     suggested_questions: Optional[List[str]] = None
@@ -185,7 +216,7 @@ def _extract_named_filter(question: str, marker: str) -> Optional[str]:
         return None
     value = m.group(1).strip()
     # stop at common suffixes
-    value = re.split(r"\b(for|from|to|in|this|current|summary|report|kpi)\b", value, flags=re.IGNORECASE)[0].strip()
+    value = re.split(r"(?:\b(?:for|from|to|in|this|current|summary|report|kpi|fy|financial\s+year|fiscal\s+year)\b|\b20\d{2}\b|fy\d{4})", value, flags=re.IGNORECASE)[0].strip()
     return value or None
 
 
@@ -340,7 +371,8 @@ def _extract_date_range(question: str) -> tuple[Optional[str], Optional[str], Op
 
 def _extract_kpi_filters_from_text(question: str) -> dict:
     q = question or ""
-    from agent.query_parser import _extract_person_name
+    from agent.entity_resolver import has_employee_trigger
+    from agent.query_parser import _extract_person_name, _extract_service_line_name
     
     def _first_valid(*extractors):
         """Runs each lambda safely in sequence, returning the first truthy result."""
@@ -376,7 +408,8 @@ def _extract_kpi_filters_from_text(question: str) -> dict:
     return {
         "service_line": _first_valid(
             lambda: _clean_filter_value(_extract_value_from_line(q, r"Service\s*Line")),
-            lambda: _extract_named_filter(q, r"service\s*line")
+            lambda: _extract_named_filter(q, r"service\s*line"),
+            lambda: _extract_service_line_name(q)
         ),
         "department": _first_valid(
             lambda: _clean_filter_value(_extract_value_from_line(q, r"Department")),
@@ -384,7 +417,7 @@ def _extract_kpi_filters_from_text(question: str) -> dict:
         ),
         "employee_name": _first_valid(
             lambda: _clean_filter_value(_extract_value_from_line(q, r"Employee\s*Name")),
-            lambda: _extract_named_filter(q, r"employee\s*name|employee"),
+            lambda: _extract_named_filter(q, r"employee\s*name|employee") if has_employee_trigger(q) else None,
             lambda: _extract_person_name(q)
         ),
         "project_name": _first_valid(
@@ -2328,6 +2361,18 @@ class EmailTaskRequest(BaseModel):
     files: Optional[List[Dict]] = []
     employee_id: Optional[int] = 0
 
+class EmailLeadRequest(BaseModel):
+    subject: str
+    text_body: str
+    html_body: str
+    outer_from: str
+    outer_to: str
+    outer_cc: str
+    attachments: Optional[List[Dict]] = []
+    files: Optional[List[Dict]] = []
+    employee_id: Optional[int] = 0
+    context: Optional[Dict] = {}
+
 API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
@@ -2394,6 +2439,12 @@ async def extract_email_task(request: EmailTaskRequest):
         if request.files:
             all_attachments.extend(request.files)
             
+        import time
+        import asyncio
+        from db.database import save_ai_email_parsing_async
+        
+        start_time = time.time()
+        
         json_result = extract_entities_with_llm(
             text=prompt_text, 
             sender_type=sender_type, 
@@ -2401,6 +2452,49 @@ async def extract_email_task(request: EmailTaskRequest):
             attachments=all_attachments, 
             employee_id=request.employee_id
         )
+        
+        processing_time_ms = int((time.time() - start_time) * 1000)
+        
+        # Determine status and extract meta
+        meta = json_result.pop("_meta", {}) if isinstance(json_result, dict) else {}
+        total_atts = meta.get("total_attachments", 0)
+        parsed_atts = meta.get("parsed_attachments", 0)
+        model_name = meta.get("model_name", "unknown")
+        token_tracking = meta.get("token_tracking", {})
+        
+        if not json_result or not isinstance(json_result, dict) or "intent" not in json_result:
+            processing_status = "FAILED"
+        elif total_atts > 0 and parsed_atts < total_atts:
+            processing_status = "PARTIAL_SUCCESS"
+        else:
+            processing_status = "SUCCESS"
+            
+        json_result["processing_status"] = processing_status
+        
+        # Get confidence metrics
+        conf_score_raw = json_result.get("confidence_score")
+        try:
+            conf_score = int(conf_score_raw) if conf_score_raw is not None else None
+        except:
+            conf_score = None
+            
+        # Asynchronously save combined data to DB
+        asyncio.create_task(save_ai_email_parsing_async(
+            employee_id=request.employee_id,
+            document_type="email",
+            reference_id="email_task",
+            input_tokens=token_tracking.get("input_tokens", 0),
+            output_tokens=token_tracking.get("output_tokens", 0),
+            total_tokens=token_tracking.get("total_tokens", 0),
+            total_cost_usd=token_tracking.get("total_cost_usd", 0.0),
+            model_name=model_name,
+            has_attachment=token_tracking.get("has_attachment", False),
+            file_extension=token_tracking.get("file_extension", None),
+            confidence_score=conf_score,
+            confidence_level=json_result.get("confidence_level"),
+            processing_status=processing_status,
+            processing_time_ms=processing_time_ms
+        ))
         
         # 6. Server-side enrichments for Node.js
         json_result["sender_type"] = sender_type
@@ -2432,6 +2526,33 @@ async def extract_email_task(request: EmailTaskRequest):
         print(f"Error extracting email task: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.post("/api/extract-email-lead", dependencies=[Depends(verify_internal_api_key)])
+async def extract_email_lead(request: EmailLeadRequest):
+    try:
+        from agent.lead_parser import extract_lead_from_email
+        
+        json_result = await extract_lead_from_email(
+            subject=request.subject,
+            html_body=request.html_body,
+            text_body=request.text_body,
+            outer_from=request.outer_from,
+            outer_to=request.outer_to,
+            context=request.context,
+            employee_id=request.employee_id
+        )
+
+        return {
+            "success": True,
+            "extractedData": json_result,
+            "subject": request.subject,
+            "sender": request.outer_from
+        }
+    except Exception as e:
+        print(f"Error extracting email lead: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn

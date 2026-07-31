@@ -123,11 +123,13 @@ class DiagnosticsTracker:
         if not AI_DEBUG_MODE: return
         selections = []
         for node in execution_graph:
-            impl = node.get("implementation", {})
+            impl = node.get("implementation") or node.get("selected_implementation") or {}
             selections.append({
                 "capability_id": node.get("capability_id"),
-                "implementation_type": impl.get("type"),
-                "priority": impl.get("priority")
+                "implementation_type": impl.get("type") or node.get("implementation_type"),
+                "priority": impl.get("priority") if impl.get("priority") is not None else node.get("priority"),
+                "target": impl.get("endpoint") or impl.get("function_call") or node.get("endpoint"),
+                "backend_endpoint": node.get("backend_endpoint")
             })
         self.replay["tool_registry_selection"] = selections
 
@@ -137,10 +139,12 @@ class DiagnosticsTracker:
         for res in tool_results:
             safe_results.append({
                 "capability": res.get("capability"),
-                "success": "error" not in res,
-                "error_message": res.get("error") if "error" in res else None,
-                # Do not log the actual 'result' payload as it may contain sensitive CRM data
-                "data_points_returned": len(res.get("result", [])) if isinstance(res.get("result"), list) else (1 if res.get("result") else 0)
+                "success": res.get("status") == "success" and "error" not in res and not res.get("error"),
+                "error_message": res.get("error"),
+                "implementation_type": res.get("implementation_type"),
+                "endpoint": res.get("function_call"),
+                "execution_time_ms": res.get("execution_time_ms"),
+                "data_points_returned": len(res.get("result", [])) if isinstance(res.get("result"), list) else (len(res.get("result", {})) if isinstance(res.get("result"), dict) else (1 if res.get("result") else 0))
             })
         self.replay["tool_execution_results"] = safe_results
 
@@ -167,7 +171,7 @@ class DiagnosticsTracker:
         
         # Log purely to stdout for developers
         print("\n" + "="*80)
-        print(f"🛠️ [DEBUG TRACE] AI Execution Pipeline | ID: {self.request_id}")
+        print(f"[DEBUG TRACE] AI Execution Pipeline | ID: {self.request_id}")
         print("="*80)
         print(json.dumps(trace, indent=2))
         print("="*80 + "\n")

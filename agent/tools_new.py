@@ -270,7 +270,7 @@ async def get_entity_profile(entity_type: str, entity_name: str, user_id: int, r
             FROM projects p
             LEFT JOIN m_project_status ps ON p.status_id = ps.id
             LEFT JOIN m_serviceline sl ON p.service_line_id = sl.id
-            LEFT JOIN employees e ON p.incharge = e.id
+            LEFT JOIN employees e ON p.main_incharge = e.id
             WHERE p.is_active = 1
               AND (p.name LIKE '%{entity_name}%' OR p.code LIKE '%{entity_name}%')
             LIMIT 1
@@ -282,9 +282,9 @@ async def get_entity_profile(entity_type: str, entity_name: str, user_id: int, r
         proj = project[0]
         proj_id = proj['id']
 
-        tasks_q = f"SELECT status, COUNT(*) as count FROM project_tasks WHERE project_id = {proj_id} GROUP BY status"
-        invoices_q = f"SELECT invoice_no, total_amt_ex_vat, payment_status_id FROM invoice WHERE project_id = {proj_id} AND is_active = 1"
-        tasks, invoices = await asyncio.gather(_run_query(tasks_q), _run_query(invoices_q))
+        tasks_q = "SELECT status, COUNT(*) as count FROM project_tasks WHERE project_id = :proj_id GROUP BY status"
+        invoices_q = "SELECT invoice_no, total_amt_ex_vat, payment_status_id FROM invoice WHERE project_id = :proj_id AND is_active = 1"
+        tasks, invoices = await asyncio.gather(_run_query(tasks_q, {"proj_id": proj_id}), _run_query(invoices_q, {"proj_id": proj_id}))
 
         return {
             "project": proj,

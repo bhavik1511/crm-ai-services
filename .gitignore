@@ -45,6 +45,7 @@ archive/
 
 # Local AI Databases & Memory
 chroma_db/
+rag/chroma_db/
 brain/
 memory/
 scratch/

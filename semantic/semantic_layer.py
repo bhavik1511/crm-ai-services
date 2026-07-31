@@ -44,19 +44,13 @@ def _resolve_rbac_params(employee_id, user_tier):
             
     return resolved_emp_id, resolved_tier
 
-def get_fiscal_info(dt=None):
-    if dt is None:
-        dt = datetime.now()
-    if dt.month >= 10:
-        fy_start_year = dt.year
-        fy_end_year = dt.year + 1
+def get_fiscal_info(dt=None, fy_input=None):
+    from agent.entity_resolver import resolve_fiscal_year, get_current_fiscal_year
+    if fy_input:
+        info = resolve_fiscal_year(fy_input)
     else:
-        fy_start_year = dt.year - 1
-        fy_end_year = dt.year
-        
-    fy_start = f"{fy_start_year}-10-01"
-    fy_end = f"{fy_end_year}-09-30 23:59:59"
-    return {"fy_start": fy_start, "fy_end": fy_end}
+        info = get_current_fiscal_year(dt)
+    return {"fy_start": info["start_date"], "fy_end": f"{info['end_date']} 23:59:59"}
 
 def _safe_value(v):
     """Convert DB types that are not JSON-serializable to native Python types."""
@@ -66,13 +60,13 @@ def _safe_value(v):
         return v.isoformat()
     return v
 
-async def _run_query(query: str, as_dict: bool = True):
+async def _run_query(query: str, params: dict = None, as_dict: bool = True):
     try:
         import asyncio
         def _sync_run():
             engine = get_db_engine()
             with engine.connect() as conn:
-                result = conn.execute(text(query))
+                result = conn.execute(text(query), params or {})
                 if as_dict:
                     columns = result.keys()
                     return [
@@ -95,7 +89,7 @@ def _build_ownership_sql(employee_id: int, user_tier: int, table_alias: str = "i
             engine = get_db_engine()
             with engine.connect() as conn:
                 try:
-                    emp_res = conn.execute(text(f"SELECT emp_department_id FROM employees WHERE id = {ctx_emp_id}")).fetchone()
+                    emp_res = conn.execute(text("SELECT emp_department_id FROM employees WHERE id = :id"), {"id": ctx_emp_id}).fetchone()
                     if emp_res and emp_res[0]:
                         ctx_dept_id = emp_res[0]
                 except Exception as e:
@@ -109,7 +103,7 @@ def _build_ownership_sql(employee_id: int, user_tier: int, table_alias: str = "i
         if check_service_line and ctx_dept_id:
             engine = get_db_engine()
             with engine.connect() as conn:
-                sl_res = conn.execute(text(f"SELECT serviceline_id FROM serviceline_department WHERE department_id = {ctx_dept_id}")).fetchone()
+                sl_res = conn.execute(text("SELECT serviceline_id FROM serviceline_department WHERE department_id = :dept_id"), {"dept_id": ctx_dept_id}).fetchone()
                 if sl_res and sl_res[0]:
                     return f"({table_alias}.{sl_col} = {sl_res[0]})"
                     
@@ -123,7 +117,7 @@ def _build_ownership_sql(employee_id: int, user_tier: int, table_alias: str = "i
     engine = get_db_engine()
     with engine.connect() as conn:
         try:
-            emp_res = conn.execute(text(f"SELECT emp_department_id FROM employees WHERE id = {employee_id}")).fetchone()
+            emp_res = conn.execute(text("SELECT emp_department_id FROM employees WHERE id = :id"), {"id": employee_id}).fetchone()
         except:
             emp_res = None
             
@@ -142,7 +136,7 @@ def _build_ownership_sql(employee_id: int, user_tier: int, table_alias: str = "i
         # 1. Department Service Line Restriction
         sl_restrict = ""
         if check_service_line and emp_dep_id:
-            sl_res = conn.execute(text(f"SELECT serviceline_id FROM serviceline_department WHERE department_id = {emp_dep_id}")).fetchone()
+            sl_res = conn.execute(text("SELECT serviceline_id FROM serviceline_department WHERE department_id = :dept_id"), {"dept_id": emp_dep_id}).fetchone()
             if sl_res and sl_res[0]:
                 sl_restrict = f" AND {table_alias}.{sl_col} = {sl_res[0]}"
                 
@@ -336,6 +330,10 @@ async def get_pipeline_and_proposals(start_date: Optional[str] = None, end_date:
         start_date = start_date or fy_info['fy_start']
         end_date = end_date or fy_info['fy_end']
 
+        # Normalize end_date to capture full day
+        if end_date and len(end_date) == 10:
+            end_date += " 23:59:59"
+
         # Build ownership filter matching the backend row-level security exactly
         ownership_sql = _build_ownership_sql(employee_id, user_tier, "sl", True, "lead_owner", "serviceline_id")
 
@@ -359,7 +357,7 @@ async def get_pipeline_and_proposals(start_date: Optional[str] = None, end_date:
         # CRITICAL: AND p.project_id IS NULL mirrors the dashboard "Pending Projects" filter.
         # Without this filter the counts are inflated by proposals already converted to projects.
         props_q = f"SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p WHERE p.is_active = 1 AND p.proposal_status_id IN (1, 7, 8) AND p.project_id IS NULL AND p.created_at BETWEEN '{start_date}' AND '{end_date}' AND {prop_ownership_sql}"
-        won_props_q = f"SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p WHERE p.is_active = 1 AND p.project_id IS NOT NULL AND p.created_at BETWEEN '{start_date}' AND '{end_date}' AND {prop_ownership_sql}"
+        won_props_q = f"SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p WHERE p.is_active = 1 AND (p.project_id IS NOT NULL OR p.proposal_status_id = 3) AND p.created_at BETWEEN '{start_date}' AND '{end_date}' AND {prop_ownership_sql}"
         total_props_q = f"SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p WHERE p.is_active = 1 AND p.created_at BETWEEN '{start_date}' AND '{end_date}' AND {prop_ownership_sql}"
         
         # Dashboard chart queries — use proper LEFT JOINs with WHERE clause (MySQL doesn't allow ON filters inside a parenthesized JOIN group).
@@ -434,6 +432,57 @@ async def get_pipeline_and_proposals(start_date: Optional[str] = None, end_date:
         return f"Error retrieving pipeline metrics: {str(e)}"
 
 @tool
+async def get_job_estimation_metrics(start_date: Optional[str] = None, end_date: Optional[str] = None, employee_id: int = None, user_tier: int = None) -> str:
+    """Useful for answering questions about job estimation status breakdown, job estimation counts, proposed fees, approved fees, and estimation status matching the CRM dashboard boxes (Approved, Pending Approvals, Reviewed, Rejected, Not Submitted).
+    Args:
+        start_date: Start of the period (defaults to CURRENT Fiscal Year start: Oct 1)
+        end_date: End of the period (defaults to CURRENT Fiscal Year end: Sep 30)
+        employee_id: The ID of the employee to filter by. Always pass the user's Employee ID from the system prompt to get personalized dashboard results.
+        user_tier: The tier level of the requesting user (1-9). Tier 1-4 can access service_line aggregates. Tier 5+ are restricted to direct involvement only.
+    """
+    try:
+        employee_id, user_tier = _resolve_rbac_params(employee_id, user_tier)
+        fy_info = get_fiscal_info()
+        start_date = start_date or fy_info['fy_start']
+        end_date = end_date or fy_info['fy_end']
+
+        if end_date and len(end_date) == 10:
+            end_date += " 23:59:59"
+
+        ownership_sql = _build_ownership_sql(employee_id, user_tier, "sl", True, "lead_owner", "serviceline_id")
+
+        query = f"""
+        SELECT 
+            js.id as status_id,
+            js.name as status_name, 
+            COUNT(je.id) as count, 
+            ROUND(COALESCE(SUM(je.proposed_fees), 0), 2) as proposed_fees,
+            ROUND(COALESCE(SUM(je.approved_fees), 0), 2) as approved_fees
+        FROM m_jobestimation_status js
+        LEFT JOIN job_estimation je ON js.id = je.status_id AND je.is_active = 1 AND je.created_at BETWEEN '{start_date}' AND '{end_date}'
+        LEFT JOIN saleslead sl ON je.saleslead_id = sl.id
+        WHERE ({ownership_sql} OR je.id IS NULL)
+        GROUP BY js.id, js.name
+        ORDER BY js.id ASC
+        """
+        results = await _run_query(query)
+
+        total_count = sum(r.get('count', 0) for r in results)
+        total_proposed = sum(float(r.get('proposed_fees', 0)) for r in results)
+        total_approved = sum(float(r.get('approved_fees', 0)) for r in results)
+
+        return json.dumps({
+            "status_breakdown": results,
+            "summary": {
+                "total_records": total_count,
+                "total_proposed_fees": round(total_proposed, 2),
+                "total_approved_fees": round(total_approved, 2)
+            }
+        })
+    except Exception as e:
+        return f"Error retrieving job estimation metrics: {str(e)}"
+
+@tool
 async def get_active_projects_metrics(start_date: Optional[str] = None, end_date: Optional[str] = None, employee_id: int = None, is_active: Optional[bool] = True) -> str:
     """Useful for answering questions about projects, active projects, WIP projects, completed projects, non-active projects, task overview, overdue tasks, Overall Completion, Actual Recoverability, and Estimated Recoverability.
     This tool calls the same CRM backend API that the dashboard uses, so the numbers will always match the dashboard exactly.
@@ -459,7 +508,7 @@ async def get_active_projects_metrics(start_date: Optional[str] = None, end_date
         # by 'created_at' since the backend Projects List API uses date_field='created_at'.
         # -----------------------------------------------------------------------
         overlap_count_q = f"""
-            SELECT COUNT(DISTINCT p.id) AS total_active
+            SELECT COUNT(DISTINCT p.id) AS total_records
             FROM projects p
             WHERE p.is_active = {is_active_val}
               AND p.created_at BETWEEN '{start_date}' AND '{end_date}'
@@ -503,7 +552,7 @@ async def get_active_projects_metrics(start_date: Optional[str] = None, end_date
                   ON tp.project_id = p.id
                   AND tp.status_id = 3
                 LEFT JOIN employees e2 ON e2.id = tp.employee_id
-                LEFT JOIN m_designation_rates dr ON dr.designation_id = e2.emp_designation_id
+                LEFT JOIN designation_rates dr ON dr.designation_id = e2.emp_designation_id
                 WHERE p.is_active = {is_active_val}
                   AND p.created_at BETWEEN '{start_date}' AND '{end_date}'
                   AND {ownership_sql}
@@ -517,7 +566,7 @@ async def get_active_projects_metrics(start_date: Optional[str] = None, end_date
             _run_query(recoverability_q),
         )
 
-        total_active = int(overlap_res[0].get('total_active', 0)) if overlap_res else 0
+        total_system_records = int(overlap_res[0].get('total_records', 0)) if overlap_res else 0
         total_approved = float(rec_res[0].get('total_approved_fees', 0)) if rec_res else 0.0
         total_actual   = float(rec_res[0].get('total_actual_cost', 0))   if rec_res else 0.0
         actual_rec_pct = round((total_approved / total_actual) * 100, 2) if total_actual > 0 else 0.0
@@ -558,8 +607,12 @@ async def get_active_projects_metrics(start_date: Optional[str] = None, end_date
             except Exception as task_err:
                 print(f"[AI] task-counts API failed (non-critical): {task_err}")
 
+        # Extract strictly active projects (status_id = 1) from the status breakdown
+        strictly_active_count = next((int(s['total']) for s in status_res if s['label'] == 'Active'), 0)
+
         return json.dumps({
-            "total_projects": total_active,
+            "strictly_active_projects_count": strictly_active_count,
+            "total_projects_all_statuses_combined": total_system_records,
             "total_approved_fees": round(total_approved, 2),
             "total_actual_cost": round(total_actual, 2),
             "actual_recoverability_percentage": actual_rec_pct,
@@ -568,7 +621,7 @@ async def get_active_projects_metrics(start_date: Optional[str] = None, end_date
             "overdue_projects": task_data.get("overdueProject", "N/A"),
             "overall_completion_percentage": task_data.get("overallCompletion", "N/A"),
             "date_range": {"start": start_date, "end": end_date},
-            "methodology": "Filtered by created_at to exactly match CRM Projects List UI counts. Recoverability = approved_fees / actual_hourly_cost * 100",
+            "methodology": "Filtered by created_at to exactly match CRM Projects List UI counts. strictly_active means status='Active'. total_projects_all_statuses_combined includes ALL active statuses (Planned, Doubtful, etc) where is_active=1.",
             "source": "SQL_QUERY"
         }, default=str)
     except Exception as e:
@@ -678,7 +731,7 @@ async def get_comprehensive_customer_report(search_term: str) -> str:
             """
             customers_found = await _run_query(proj_exact_q)
             if customers_found:
-                proj_id_q = f"SELECT id, code FROM projects WHERE code = '{search_term}' AND is_active = 1 LIMIT 1"
+                proj_id_q = "SELECT id, code FROM projects WHERE code = :code AND is_active = 1 LIMIT 1"
                 proj_id_res = await _run_query(proj_id_q)
                 if proj_id_res:
                     matched_project_id = proj_id_res[0].get('id')
@@ -818,10 +871,10 @@ async def get_comprehensive_customer_report(search_term: str) -> str:
         FROM projects p
         JOIN m_project_status ps ON p.status_id = ps.id
         LEFT JOIN m_serviceline sl ON p.service_line_id = sl.id
-        LEFT JOIN employees e ON p.incharge = e.id
+        LEFT JOIN employees e ON p.main_incharge = e.id
         LEFT JOIN employees ep ON p.partner = ep.id
         WHERE p.client = {cust_id} AND p.is_active = 1
-        {'AND (' + f"p.incharge = {ctx_employee_id} OR p.partner = {ctx_employee_id} OR p.main_incharge = {ctx_employee_id} OR p.created_by = {ctx_employee_id} OR p.id IN (SELECT project_id FROM project_team_members WHERE emp_id = {ctx_employee_id})" + ')' if ctx_user_tier is not None and ctx_user_tier >= 5 and ctx_employee_id else ''}
+        {'AND (' + f"p.main_incharge = {ctx_employee_id} OR p.partner = {ctx_employee_id} OR p.created_by = {ctx_employee_id} OR p.id IN (SELECT project_id FROM project_team_members WHERE emp_id = {ctx_employee_id})" + ')' if ctx_user_tier is not None and ctx_user_tier >= 5 and ctx_employee_id else ''}
         ORDER BY p.created_at DESC
         LIMIT 50
         """
@@ -1330,7 +1383,7 @@ async def get_total_estimation_report(
             LEFT JOIN customers c ON p.client = c.id
             LEFT JOIN m_group grp ON c.cust_group_id = grp.id
             LEFT JOIN m_serviceline sl ON p.service_line_id = sl.id
-            LEFT JOIN employees e_incharge ON p.incharge = e_incharge.id
+            LEFT JOIN employees e_incharge ON p.main_incharge = e_incharge.id
             WHERE p.is_active = 1
               AND p.created_at BETWEEN '{start_date}' AND '{end_date}'
               AND {ownership_sql}
@@ -1395,6 +1448,17 @@ async def get_project_recoverability_report(
         user_tier: The Tier level of the logged-in user (1=SuperAdmin, 2=Management, 3=Partner, etc).
     """
     try:
+        # Sanitize aggregate sentinels (e.g. __ALL__, ALL -> None) so company-wide queries are not over-filtered
+        def _clean_sentinel(val):
+            if val and str(val).strip().upper() in ("__ALL__", "ALL", "NONE", "NULL", "ANY", "*", ""):
+                return None
+            return val
+
+        service_line = _clean_sentinel(service_line)
+        customer_name = _clean_sentinel(customer_name)
+        project_name = _clean_sentinel(project_name)
+        incharge_employee = _clean_sentinel(incharge_employee)
+
         employee_id, user_tier = _resolve_rbac_params(employee_id, user_tier)
         fy_info = get_fiscal_info()
         start_date = start_date or fy_info['fy_start']
@@ -1620,16 +1684,16 @@ async def get_project_recoverability_report(
             LEFT JOIN customers c ON p.client = c.id
             LEFT JOIN m_group grp ON c.cust_group_id = grp.id
             LEFT JOIN m_serviceline sl ON p.service_line_id = sl.id
-            LEFT JOIN employees e ON p.incharge = e.id
+            LEFT JOIN employees e ON p.main_incharge = e.id
             LEFT JOIN employees cr ON c.cust_client_rel_id = cr.id
             LEFT JOIN employees pp ON p.partner = pp.id
-            LEFT JOIN m_status ps ON p.status_id = ps.id
+            LEFT JOIN m_project_status ps ON p.status_id = ps.id
             LEFT JOIN proposal pr ON p.id = (
                 SELECT id FROM proposal WHERE project_id = p.id ORDER BY id DESC LIMIT 1
             )
             LEFT JOIN timesheet_project tp ON p.id = tp.project_id
             LEFT JOIN employees te ON tp.employee_id = te.id
-            LEFT JOIN m_designation_rates dr ON te.emp_designation_id = dr.designation_id
+            LEFT JOIN designation_rates dr ON te.emp_designation_id = dr.designation_id
             WHERE p.is_active = 1
               AND p.created_at BETWEEN '{start_date}' AND '{end_date}'
               AND {ownership_sql}

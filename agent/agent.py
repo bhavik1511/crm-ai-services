@@ -182,13 +182,13 @@ LEADS & PROPOSALS:
 - saleslead(id, lead_date, lead_owner, industry_id, client_type, enquiry_details, code, budget_value, currency_id, lead_status_id, job_estimation_id, serviceline_id, servicetype_id, sub_servicetype_id, lead_source, lead_source_external_id, lead_source_existing_client_id, lead_source_internal_id, customer_id, contact_id, is_active, created_at, created_by)
 - m_leadstatus(id, name, is_active)
 - job_estimation(id, saleslead_id, proposal_id, from_date, to_date, remarks, total_costs, total_hours, proposed_fees, approved_fees, recoverability, contact_id, customer_id, code, ref_no, status_id, is_active, is_vendor, approved_by, created_at, created_by)
-- m_jobestimation_status(id, name, is_active)
+- m_jobestimation_status(id, name, is_active) -- IDs: 1=Pending Approvals, 2=Approved, 3=Reviewed, 4=Rejected, 6=Not Submitted
 - proposal(id, job_estimation_id, organization_id, project_id, proposal_template_id, engagement_template_id, proposal_status_id, engagement_status_id, continuous_engagement_status_id, scope, proposal_year, proposed_fees, approved_fees, agreed_fees, recoverability, proposal_date, total_costs, code, ref_no, is_active, contact_id, customer_id, client_id, service_line_id, created_at, created_by)
-- m_proposal_status(id, name, is_active, sequence)
-- m_engagement_status(id, name, is_active, sequence)
+- m_proposal_status(id, name, is_active, sequence) -- IDs: 1=Proposal Sent, 3=Proposal Accepted (Won), 4=Proposal Rejected (Lost), 7=Proposal Created, 8=Proposal Verify, 9=Project Pending, 10=All Project Created
+- m_engagement_status(id, name, is_active, sequence) -- IDs: 1=Engagement Accepted (Won), 2=Engagement Rejected (Lost), 3=Engagement Sent, 4=Engagement Created, 5=Engagement Verify
 
 PROJECTS:
-- projects(id, name, code, incharge, partner, client, client_relation, start_date, end_date, report_sign_date, audit_year, approved_fees, service_line_id, service_type_id, sub_service_type_id, proposal_id, status_id, is_active, main_incharge, created_at, created_by)
+- projects(id, name, code, main_incharge, partner, client, client_relation, start_date, end_date, report_sign_date, audit_year, approved_fees, service_line_id, service_type_id, sub_service_type_id, proposal_id, status_id, is_active, created_at, created_by)
 - m_project_status(id, name)
 - project_tasks(id, project_id, milestone_id, assignee_id, task_id, name, description, due_date, priority, status, tags, created_at, created_by)
 - project_team_members(id, project_id, emp_id)
@@ -248,7 +248,7 @@ KEY JOINS & RELATIONSHIPS
 - proposal.project_id -> projects.id (NULL = pending/open)
 - proposal.service_line_id -> m_serviceline.id
 - projects.status_id -> m_project_status.id (NOTE: column is status_id NOT project_status_id)
-- projects.incharge -> employees.id
+- projects.main_incharge -> employees.id
 - projects.partner -> employees.id
 - projects.client -> customers.id
 - projects.service_line_id -> m_serviceline.id
@@ -283,11 +283,11 @@ SELECT COUNT(*) FROM saleslead WHERE lead_date BETWEEN '2025-10-01' AND '2026-09
 SELECT ls.name AS status, COUNT(sl.id) AS total FROM m_leadstatus ls LEFT JOIN saleslead sl ON sl.lead_status_id = ls.id AND sl.lead_date BETWEEN '2025-10-01' AND '2026-09-30 23:59:59' GROUP BY ls.id, ls.name
 
 --- JOB ESTIMATION PIPELINE ---
--- Job estimation by status:
-SELECT js.name AS status, COUNT(je.id) AS total FROM m_jobestimation_status js LEFT JOIN job_estimation je ON je.status_id = js.id AND je.created_at BETWEEN '2025-10-01' AND '2026-09-30 23:59:59' GROUP BY js.id, js.name
+-- Job estimation by status (Always filter by je.is_active = 1):
+SELECT js.name AS status, COUNT(je.id) AS total FROM m_jobestimation_status js LEFT JOIN job_estimation je ON je.status_id = js.id AND je.is_active = 1 AND je.created_at BETWEEN '2025-10-01' AND '2026-09-30 23:59:59' GROUP BY js.id, js.name
 
 -- Total job estimations this FY:
-SELECT COUNT(*) FROM job_estimation WHERE created_at BETWEEN '2025-10-01' AND '2026-09-30 23:59:59'
+SELECT COUNT(*) FROM job_estimation WHERE is_active = 1 AND created_at BETWEEN '2025-10-01' AND '2026-09-30 23:59:59'
 
 --- OPEN PROPOSALS / ENGAGEMENT LETTERS ---
 -- Open proposals (status IDs 1,7,8 = proposal statuses, project_id IS NULL means pending):
@@ -331,7 +331,7 @@ SELECT CASE WHEN ps.id IN (1, 2) THEN 'Active' WHEN ps.id = 5 THEN 'WIP' WHEN ps
 SELECT COUNT(*) FROM projects WHERE status_id IN (1, 2) AND is_active = 1
 
 -- Project details with client and service line:
-SELECT p.name, p.code, c.customer_name AS client, sl.name AS service_line, ps.name AS status, e.employee_name AS incharge FROM projects p JOIN customers c ON p.client = c.id JOIN m_serviceline sl ON p.service_line_id = sl.id JOIN m_project_status ps ON p.status_id = ps.id JOIN employees e ON p.incharge = e.id WHERE p.is_active = 1 ORDER BY p.created_at DESC LIMIT 50
+SELECT p.name, p.code, c.customer_name AS client, sl.name AS service_line, ps.name AS status, e.employee_name AS incharge FROM projects p JOIN customers c ON p.client = c.id JOIN m_serviceline sl ON p.service_line_id = sl.id JOIN m_project_status ps ON p.status_id = ps.id JOIN employees e ON p.main_incharge = e.id WHERE p.is_active = 1 ORDER BY p.created_at DESC LIMIT 50
 
 --- LEAD SOURCE ---
 -- Lead source breakdown (Internal/Existing Client/External):
@@ -2656,4 +2656,10 @@ async def ask_question_streaming(history, user_context=None):
         }
 
     except Exception as e:
-        yield {"type": "error", "content": f"Streaming error: {str(e)}"}
+        print(f"[AskQuestionStreaming] Error: {e}")
+        yield {
+            "type": "done",
+            "content": f"⚠️ I encountered an error streaming your response: {str(e)}",
+            "error_code": "streaming_error",
+        }
+        yield {"type": "done", "content": "[DONE]\n\n"}

@@ -335,7 +335,7 @@ SEEK_EXAMPLE:
 - invoice.client_name_id -> customers.id (NOT invoice.client_id).
 - receipt_details.client_id -> customers.id.
 - projects.client -> customers.id (NOT projects.client_id).
-- projects.incharge -> employees.id | projects.partner -> employees.id.
+- projects.main_incharge -> employees.id | projects.partner -> employees.id.
 - saleslead.lead_owner -> employees.id.
 - leave_request.status_id -> m_leave_status.id.
 - leave_request.leave_type_id -> m_leave_request_type.id.
@@ -478,7 +478,7 @@ _JOIN_HINTS = [
     ("proposal", "m_serviceline",   "proposal.service_line_id -> m_serviceline.id"),
     # Projects
     ("projects", "m_project_status","projects.status_id -> m_project_status.id"),
-    ("projects", "employees",       "projects.incharge -> employees.id | projects.partner -> employees.id"),
+    ("projects", "employees",       "projects.main_incharge -> employees.id | projects.partner -> employees.id"),
     ("projects", "customers",       "projects.client -> customers.id"),
     ("projects", "m_serviceline",   "projects.service_line_id -> m_serviceline.id"),
     ("project_tasks", "projects",   "project_tasks.project_id -> projects.id"),

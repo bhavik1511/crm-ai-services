@@ -70,7 +70,7 @@ FEW_SHOT_SQL_EXAMPLES: List[Dict[str, str]] = [
     },
     {
         "input": "List the 50 most recent projects with their client, service line, status, and incharge.",
-        "query": "SELECT p.name, p.code, c.customer_name AS client, sl.name AS service_line, ps.name AS status, e.employee_name AS incharge FROM projects p JOIN customers c ON p.client = c.id JOIN m_serviceline sl ON p.service_line_id = sl.id JOIN m_project_status ps ON p.status_id = ps.id JOIN employees e ON p.incharge = e.id WHERE p.is_active = 1 ORDER BY p.created_at DESC LIMIT 50"
+        "query": "SELECT p.name, p.code, c.customer_name AS client, sl.name AS service_line, ps.name AS status, e.employee_name AS incharge FROM projects p JOIN customers c ON p.client = c.id JOIN m_serviceline sl ON p.service_line_id = sl.id JOIN m_project_status ps ON p.status_id = ps.id JOIN employees e ON p.main_incharge = e.id WHERE p.is_active = 1 ORDER BY p.created_at DESC LIMIT 50"
     },
     {
         "input": "How many leads came from each lead source (Internal vs External)?",
@@ -106,7 +106,7 @@ FEW_SHOT_SQL_EXAMPLES: List[Dict[str, str]] = [
     },
     {
         "input": "Which employee has the most project assignments?",
-        "query": "SELECT e.employee_name, COUNT(p.id) AS project_count FROM employees e JOIN projects p ON p.incharge = e.id WHERE p.is_active = 1 AND e.is_active = 1 GROUP BY e.id, e.employee_name ORDER BY project_count DESC LIMIT 10"
+        "query": "SELECT e.employee_name, COUNT(p.id) AS project_count FROM employees e JOIN projects p ON p.main_incharge = e.id WHERE p.is_active = 1 AND e.is_active = 1 GROUP BY e.id, e.employee_name ORDER BY project_count DESC LIMIT 10"
     },
     {
         "input": "Which customer has the highest total invoice value?",
@@ -150,7 +150,7 @@ FEW_SHOT_SQL_EXAMPLES: List[Dict[str, str]] = [
     },
     {
         "input": "Show details in the business development report",
-        "query": "SELECT p.code AS project_code, p.name AS project_name, e_incharge.employee_name AS incharge, sl.name AS service_line, prop.agreed_fees AS approved_fees FROM projects p LEFT JOIN proposal prop ON p.proposal_id = prop.id LEFT JOIN m_serviceline sl ON p.serviceline_id = sl.id LEFT JOIN employees e_incharge ON p.incharge = e_incharge.id WHERE p.is_active = 1 ORDER BY p.created_at DESC LIMIT 50"
+        "query": "SELECT p.code AS project_code, p.name AS project_name, e_incharge.employee_name AS incharge, sl.name AS service_line, prop.agreed_fees AS approved_fees FROM projects p LEFT JOIN proposal prop ON p.proposal_id = prop.id LEFT JOIN m_serviceline sl ON p.serviceline_id = sl.id LEFT JOIN employees e_incharge ON p.main_incharge = e_incharge.id WHERE p.is_active = 1 ORDER BY p.created_at DESC LIMIT 50"
     },
     {
         "input": "How many credit notes were issued this fiscal year?",
@@ -170,7 +170,7 @@ FEW_SHOT_SQL_EXAMPLES: List[Dict[str, str]] = [
     },
     {
         "input": "List all projects for customer Al Salam Bank",
-        "query": "SELECT p.name AS project_name, p.code, sl.name AS service_line, ps.name AS status, e.employee_name AS incharge, p.created_at FROM projects p JOIN customers c ON p.client = c.id LEFT JOIN m_serviceline sl ON p.service_line_id = sl.id LEFT JOIN m_project_status ps ON p.status_id = ps.id LEFT JOIN employees e ON p.incharge = e.id WHERE c.customer_name LIKE '%Al Salam%' AND p.is_active = 1 ORDER BY p.created_at DESC LIMIT 50"
+        "query": "SELECT p.name AS project_name, p.code, sl.name AS service_line, ps.name AS status, e.employee_name AS incharge, p.created_at FROM projects p JOIN customers c ON p.client = c.id LEFT JOIN m_serviceline sl ON p.service_line_id = sl.id LEFT JOIN m_project_status ps ON p.status_id = ps.id LEFT JOIN employees e ON p.main_incharge = e.id WHERE c.customer_name LIKE '%Al Salam%' AND p.is_active = 1 ORDER BY p.created_at DESC LIMIT 50"
     },
     {
         "input": "Show me the leave balance for employee Ahmad",

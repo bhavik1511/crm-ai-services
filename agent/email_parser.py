@@ -198,12 +198,14 @@ RULE 0 — DO NOT HALLUCINATE:
 RULE 1 — project_name:
 - Extract the full project name if mentioned. Project names can be long strings (e.g. "Company XYZ_Audit for 2021 and 2022") or short codes (e.g. "BT-PR-065667").
 - Short abbreviations like "BPS", "VAT", "MIS", "CBB" are services, NOT project names. Set null.
-- For Leave Request or HR emails, always set null.
+- CRITICAL: If the intent is "General Task" or an internal task, you MAY extract the project_name ONLY IF it is an explicitly mentioned, existing active project. DO NOT extract prospective ideas, future tools, or general system descriptions (e.g. "AI-Powered System") as a project_name.
+- ONLY if the intent is "Service Lead" or "Proposal" should you extract a proposed scope/idea as the project_name.
+- For Leave Request, HR Request, or Internal Support emails, always set null.
 
 RULE 2 — customer_name:
 - You MUST extract the COMPANY or ORGANIZATION name if present.
 - CRITICAL: If no company name is found, but a client/prospect person's name is mentioned, YOU MUST extract that person's name as the customer_name (e.g., "Mr. Usama"). Do not leave this null if a person is mentioned as the client!
-- For Leave Request or HR Request emails, always set null.
+- For Leave Request, HR Request, or Internal Support emails, always set null.
 - NEVER extract the email recipient (e.g. "Dear Mr. Arpit") or the sender as a customer.
 
 RULE 3 — contact_name and contact_phone:
@@ -221,10 +223,12 @@ RULE 4 — intent (choose EXACTLY one):
 - "Invoice" = billing related.
 - "Leave Request" = employee leave application (annual, sick, emergency, maternity, etc.). MUST be used whenever subject or body mentions leave, vacation, day off, absence.
 - "HR Request" = other internal HR requests (salary inquiry, documents, onboarding, NOC letter, etc.).
+- "Internal Support" = internal IT support, CRM issues, system access, or administrative requests not related to any client.
 
 RULE 5 — service_line_hint:
 - Extract from context or sender signature. "BPS" = "Business Process Services".
-- For Leave Request or HR Request, set null.
+- CRITICAL: If the intent is "Service Lead", you MUST try to infer the relevant service line (e.g., "Technology", "Audit", "Tax", "Advisory", "BPS") based on the services being requested or proposed.
+- For Leave Request, HR Request, or Internal Support, set null.
 
 RULE 6 — task_description:
 - Write a highly detailed, multi-sentence actionable summary of what needs to be done.
@@ -251,16 +255,28 @@ RULE 10 — task_tag:
 RULE 11 — invoice_amount:
 - If the intent is "Invoice" and an amount/currency is clearly mentioned in the email, extract it (e.g., "BHD 1500" or "1500"). Otherwise, return null.
 
+RULE 12 — EXTRACTION CONFIDENCE:
+- Evaluate your own extraction confidence based on: email clarity, sender identified, tasks clearly identified, due date/priority confidently extracted, customer/project identified, attachments understood, and overall completeness.
+- Calculate a precise `confidence_score` between 0 and 100. START AT 100, then DEDUCT points:
+   * Deduct 7 points if priority is not explicitly mentioned (inferred)
+   * Deduct 13 points if due date is missing
+   * Deduct 18 points if customer/project name is missing or ambiguous
+   * Deduct 5 points if service line is missing or inferred
+   * Deduct 11 points if no clear action items are found
+- The final score MUST reflect the exact math of these deductions (e.g., 88, 79, 93). DO NOT just output 90.
+- Generate a `confidence_level`: "High" (80-100), "Medium" (50-79), or "Low" (0-49).
+- Generate a `confidence_reason` array of strings explaining the confidence. Prefix each reason with "✓" if it was successful or "⚠" if there was an issue or ambiguity (e.g., ["✓ Task clearly identified", "⚠ Priority inferred from context"]).
+
 Return ONLY valid JSON with these exact keys:
-intent, project_name, customer_name, contact_name, contact_phone, service_line_hint, task_description, sender_name, sender_designation, due_date, priority, task_tag, invoice_amount
+intent, project_name, customer_name, contact_name, contact_phone, service_line_hint, task_description, sender_name, sender_designation, due_date, priority, task_tag, invoice_amount, confidence_score, confidence_level, confidence_reason
 
 Email Text:
 {text}"""
 
-    # 1. Process attachments
     attachments = attachments or []
     pdf_text_blocks = []
     image_contents = []
+    parsed_attachments_count = 0
 
     with open("pdf_debug.log", "a") as f:
         f.write(f"\n--- New Request ---\nReceived {len(attachments)} attachments.\n")
@@ -280,15 +296,18 @@ Email Text:
             pdf_text = extract_text_from_pdf_base64(content_bytes)
             if pdf_text:
                 pdf_text_blocks.append(f"=== ATTACHMENT: {att.get('name', 'PDF')} ===\n{pdf_text}")
+                parsed_attachments_count += 1
         elif "wordprocessingml" in ct or att_name.endswith(".docx"):
             docx_text = extract_text_from_docx_base64(content_bytes)
             if docx_text:
                 pdf_text_blocks.append(f"=== ATTACHMENT: {att.get('name', 'DOCX')} ===\n{docx_text}")
+                parsed_attachments_count += 1
         elif "image" in ct:
             image_contents.append({
                 "type": "image_url",
                 "image_url": {"url": f"data:{ct};base64,{content_bytes}"}
             })
+            parsed_attachments_count += 1
 
     if pdf_text_blocks:
         prompt += "\n\n" + "\n\n".join(pdf_text_blocks)
@@ -378,20 +397,16 @@ Email Text:
             elif "gpt-4o" in model_lower:
                 cost = (in_tok / 1_000_000 * 2.50) + (out_tok / 1_000_000 * 10.00)
                     
-            save_parsing_token_usage(
-                employee_id=employee_id,
-                document_type="email",
-                reference_id=reference_id or "email_task",
-                input_tokens=in_tok,
-                output_tokens=out_tok,
-                total_tokens=tot_tok,
-                total_cost_usd=cost,
-                model_name=model_name_used,
-                has_attachment=has_att,
-                file_extension=ext
-            )
-        except Exception as te:
-            print(f"Token tracking error: {te}")
+            token_tracking = {
+                "input_tokens": in_tok,
+                "output_tokens": out_tok,
+                "total_tokens": tot_tok,
+                "total_cost_usd": cost,
+                "has_attachment": has_att,
+                "file_extension": ext
+            }
+        except Exception as e:
+            print(f"Error tracking token usage: {e}")
         # ----------------------
         
         content = response.content or "{}"
@@ -408,6 +423,14 @@ Email Text:
         # Fallback for new customers where LLM refuses to put a person's name as a company name
         if not parsed.get("customer_name") and parsed.get("contact_name"):
             parsed["customer_name"] = parsed["contact_name"]
+            
+        # Append parsing stats for backend
+        parsed["_meta"] = {
+            "model_name": model_name_used,
+            "total_attachments": len(attachments),
+            "parsed_attachments": parsed_attachments_count,
+            "token_tracking": token_tracking
+        }
             
         return parsed
     except Exception as e:

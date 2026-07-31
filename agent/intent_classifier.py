@@ -93,7 +93,7 @@ async def classify_intent(question: str, use_cache: bool = True) -> str:
         "service line breakdown",
     ]
     _PROPOSAL_PATTERNS = [
-        "proposal", "pipeline", "win rate", "engagement letter"
+        "proposal", "pipeline", "win rate", "engagement letter", "service lead", "leads"
     ]
     _PROJECT_PATTERNS = [
         "active project", "project portfolio", "project task", "milestone"
@@ -122,6 +122,7 @@ async def classify_intent(question: str, use_cache: bool = True) -> str:
         "of the", "for the", "revenue of", "revenue for", "billing of", "billing for",
         "invoices of", "invoices for", "receivable of", "receivable for",
         "projects of", "projects for", "proposals of", "proposals for",
+        "how many", "count",
     ]
 
     skip_fast_guard = any(p in q_clean for p in _ANALYTICAL_MARKERS)
@@ -215,8 +216,8 @@ async def classify_intent(question: str, use_cache: bool = True) -> str:
     try:
         from .agent import _build_llm
         import os
-        provider = os.getenv("LLM_PROVIDER", "openai").lower()
-        model_override = "llama-3.1-8b-instant" if provider == "groq" else "gpt-4o-mini"
+        # Use FAST_MODEL for quick classification, fallback to the main LLM_MODEL
+        model_override = os.getenv("FAST_MODEL") or os.getenv("LLM_MODEL") or "llama-3.1-8b-instant"
         llm = _build_llm(model_override, temperature=0.0, max_tokens=30)
         
         classify_prompt = f"""You are a routing agent for a CRM chatbot. Analyze the user's question and pick ONE exact category.
