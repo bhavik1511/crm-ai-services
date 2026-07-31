@@ -31,7 +31,11 @@ def get_mongo_db():
     if _mongo_db is not None:
         return _mongo_db
 
-    uri = os.getenv("MONGODB_URI")
+    uri = os.getenv("MONGODB_URI", "mongodb://mongo:27017/crm_ai")
+    # Auto-resolve localhost -> mongo if running inside a Docker container
+    if uri and "localhost" in uri and os.path.exists("/.dockerenv"):
+        uri = uri.replace("localhost", "mongo")
+
     db_name = os.getenv("MONGODB_DB_NAME", "crm_ai")
     environment = os.getenv("ENVIRONMENT", "development").lower()
 
