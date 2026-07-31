@@ -46,7 +46,6 @@ archive/
 # Local AI Databases & Memory
 chroma_db/
 brain/
-memory/
 scratch/
 
 # AI Generated Blueprints & References
