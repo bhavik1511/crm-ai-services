@@ -2383,6 +2383,11 @@ def verify_internal_api_key(api_key: str = Security(api_key_header)):
     return api_key
 
 @app.post("/api/extract-email-task", dependencies=[Depends(verify_internal_api_key)])
+@app.post("/extract-email-task", dependencies=[Depends(verify_internal_api_key)])
+@app.post("/api/email-lead", dependencies=[Depends(verify_internal_api_key)])
+@app.post("/email-lead", dependencies=[Depends(verify_internal_api_key)])
+@app.post("/api/extract-email-lead", dependencies=[Depends(verify_internal_api_key)])
+@app.post("/extract-email-lead", dependencies=[Depends(verify_internal_api_key)])
 async def extract_email_task(request: EmailTaskRequest):
     try:
         from agent.email_parser import strip_html_to_text, parse_forwarded_email, classify_sender, extract_entities_with_llm
