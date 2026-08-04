@@ -164,6 +164,8 @@ def extract_text_from_docx_base64(base64_data: str) -> str:
         return ""
 
 def extract_entities_with_llm(text: str, sender_type: str, is_forwarded: bool, attachments: list = None, employee_id: int = 0, reference_id: str = None) -> dict:
+    import time
+    start_time = time.time()
     api_key = os.environ.get("EMAIL_API_KEY") or os.environ.get("GROQ_EMAIL_API_KEY") or os.environ.get("CHATBOT_API_KEY") or os.environ.get("GROQ_API_KEY")
     if not api_key:
         return {
@@ -251,8 +253,12 @@ RULE 10 — task_tag:
 RULE 11 — invoice_amount:
 - If the intent is "Invoice" and an amount/currency is clearly mentioned in the email, extract it (e.g., "BHD 1500" or "1500"). Otherwise, return null.
 
+RULE 12 — confidence_score and confidence_level:
+- Estimate an integer confidence_score (0 to 100) based on clarity of the email and extracted fields.
+- Set confidence_level as "high" (>= 80), "medium" (50-79), or "low" (< 50).
+
 Return ONLY valid JSON with these exact keys:
-intent, project_name, customer_name, contact_name, contact_phone, service_line_hint, task_description, sender_name, sender_designation, due_date, priority, task_tag, invoice_amount
+intent, project_name, customer_name, contact_name, contact_phone, service_line_hint, task_description, sender_name, sender_designation, due_date, priority, task_tag, invoice_amount, confidence_score, confidence_level
 
 Email Text:
 {text}"""
@@ -338,25 +344,57 @@ Email Text:
                 
         response = llm.invoke(messages)
         
-        # --- Token Tracking ---
+        # --- Token Tracking Metadata ---
+        meta_dict = {}
         try:
-            from db.database import save_parsing_token_usage
             in_tok = 0
             out_tok = 0
             tot_tok = 0
             
-            if hasattr(response, 'response_metadata') and response.response_metadata:
-                usage = response.response_metadata.get("token_usage", {})
-                if not usage and "usage" in response.response_metadata:
-                    # Some providers nest differently
-                    usage = response.response_metadata["usage"]
-                    
-                in_tok = usage.get("prompt_tokens", 0)
-                out_tok = usage.get("completion_tokens", 0)
-                tot_tok = usage.get("total_tokens", 0)
-                
-            model_name_used = getattr(llm, 'model_name', getattr(llm, 'model', 'unknown'))
-            
+            # A) Try usage_metadata (dict or object)
+            if hasattr(response, 'usage_metadata') and response.usage_metadata:
+                um = response.usage_metadata
+                if isinstance(um, dict):
+                    in_tok = um.get('input_tokens', 0) or um.get('prompt_tokens', 0)
+                    out_tok = um.get('output_tokens', 0) or um.get('completion_tokens', 0)
+                    tot_tok = um.get('total_tokens', in_tok + out_tok)
+                else:
+                    in_tok = getattr(um, 'input_tokens', getattr(um, 'prompt_tokens', 0))
+                    out_tok = getattr(um, 'output_tokens', getattr(um, 'completion_tokens', 0))
+                    tot_tok = getattr(um, 'total_tokens', in_tok + out_tok)
+
+            # B) Fallback to response_metadata
+            if not in_tok and hasattr(response, 'response_metadata') and isinstance(response.response_metadata, dict):
+                rm = response.response_metadata
+                usage = rm.get("token_usage") or rm.get("usage") or rm.get("tokenUsage") or rm.get("token_counts") or {}
+                if isinstance(usage, dict):
+                    in_tok = usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0)
+                    out_tok = usage.get("completion_tokens", 0) or usage.get("output_tokens", 0)
+                    tot_tok = usage.get("total_tokens", in_tok + out_tok)
+
+            # C) Fallback estimation if provider suppresses usage metadata when using llm.bind()
+            if not in_tok:
+                prompt_str = str(messages)
+                completion_str = str(getattr(response, 'content', ''))
+                in_tok = max(1, len(prompt_str) // 4)
+                out_tok = max(1, len(completion_str) // 4)
+                tot_tok = in_tok + out_tok
+
+            tot_tok = max(tot_tok, in_tok + out_tok)
+
+            # Model Name Resolution
+            model_name_used = (
+                getattr(llm, 'model_name', None) or 
+                getattr(llm, 'model', None) or 
+                getattr(getattr(llm, 'bound', None), 'model_name', None) or 
+                getattr(getattr(llm, 'bound', None), 'model', None)
+            )
+            if not model_name_used or model_name_used == 'unknown':
+                if hasattr(response, 'response_metadata') and isinstance(response.response_metadata, dict):
+                    model_name_used = response.response_metadata.get("model_name") or response.response_metadata.get("model")
+            if not model_name_used or model_name_used == 'unknown':
+                model_name_used = os.getenv("VISION_MODEL", "llama-3.2-90b-vision-preview") if is_vision else os.getenv("PRIMARY_MODEL", "llama-3.3-70b-versatile")
+
             has_att = len(attachments) > 0 if attachments else False
             ext = None
             if has_att and isinstance(attachments, list):
@@ -364,8 +402,7 @@ Email Text:
                 if "." in first_name:
                     ext = "." + first_name.split(".")[-1].lower()
                     
-            # Basic cost calculation logic
-            model_lower = model_name_used.lower()
+            model_lower = str(model_name_used).lower()
             cost = 0.0
             if "llama-3.3-70b" in model_lower:
                 cost = (in_tok / 1_000_000 * 0.59) + (out_tok / 1_000_000 * 0.79)
@@ -377,19 +414,21 @@ Email Text:
                 cost = (in_tok / 1_000_000 * 0.150) + (out_tok / 1_000_000 * 0.600)
             elif "gpt-4o" in model_lower:
                 cost = (in_tok / 1_000_000 * 2.50) + (out_tok / 1_000_000 * 10.00)
-                    
-            save_parsing_token_usage(
-                employee_id=employee_id,
-                document_type="email",
-                reference_id=reference_id or "email_task",
-                input_tokens=in_tok,
-                output_tokens=out_tok,
-                total_tokens=tot_tok,
-                total_cost_usd=cost,
-                model_name=model_name_used,
-                has_attachment=has_att,
-                file_extension=ext
-            )
+
+            meta_dict = {
+                "model_name": model_name_used,
+                "total_attachments": len(attachments) if attachments else 0,
+                "parsed_attachments": len(attachments) if attachments else 0,
+                "token_tracking": {
+                    "employee_id": employee_id,
+                    "input_tokens": in_tok,
+                    "output_tokens": out_tok,
+                    "total_tokens": tot_tok,
+                    "total_cost_usd": cost,
+                    "has_attachment": has_att,
+                    "file_extension": ext
+                }
+            }
         except Exception as te:
             print(f"Token tracking error: {te}")
         # ----------------------
@@ -408,7 +447,45 @@ Email Text:
         # Fallback for new customers where LLM refuses to put a person's name as a company name
         if not parsed.get("customer_name") and parsed.get("contact_name"):
             parsed["customer_name"] = parsed["contact_name"]
+
+        # Parse confidence score & level
+        try:
+            conf_score_val = int(parsed.get("confidence_score", 90))
+        except (TypeError, ValueError):
+            conf_score_val = 90
+        conf_level_val = str(parsed.get("confidence_level", "high")).lower()
+        proc_time_ms = int((time.time() - start_time) * 1000)
+
+        # Directly log to ai_email_parsing table (identical pattern to lead_parser.py)
+        try:
+            from db.database import save_ai_email_parsing_async
+            import asyncio
             
+            emp_id = employee_id if (employee_id and employee_id != 0) else None
+            ref_str = str(reference_id or parsed.get("intent") or "email_task")[:50]
+
+            asyncio.create_task(save_ai_email_parsing_async(
+                employee_id=emp_id,
+                document_type="email_task",
+                reference_id=ref_str,
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                total_tokens=tot_tok,
+                total_cost_usd=cost,
+                model_name=model_name_used,
+                has_attachment=has_att,
+                file_extension=ext,
+                confidence_score=conf_score_val,
+                confidence_level=conf_level_val,
+                processing_status="SUCCESS",
+                processing_time_ms=proc_time_ms
+            ))
+        except Exception as dbe:
+            print(f"Direct email_task telemetry logging error: {dbe}")
+            
+        if isinstance(parsed, dict) and meta_dict:
+            parsed["_meta"] = meta_dict
+
         return parsed
     except Exception as e:
         print(f"Extraction error: {e}")

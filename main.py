@@ -2341,6 +2341,18 @@ class EmailTaskRequest(BaseModel):
     files: Optional[List[Dict]] = []
     employee_id: Optional[int] = 0
 
+class EmailLeadRequest(BaseModel):
+    subject: str
+    text_body: str
+    html_body: str
+    outer_from: str
+    outer_to: str
+    outer_cc: str
+    attachments: Optional[List[Dict]] = []
+    files: Optional[List[Dict]] = []
+    employee_id: Optional[int] = 0
+    context: Optional[Dict] = {}
+
 API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
@@ -2352,10 +2364,6 @@ def verify_internal_api_key(api_key: str = Security(api_key_header)):
 
 @app.post("/api/extract-email-task", dependencies=[Depends(verify_internal_api_key)])
 @app.post("/extract-email-task", dependencies=[Depends(verify_internal_api_key)])
-@app.post("/api/email-lead", dependencies=[Depends(verify_internal_api_key)])
-@app.post("/email-lead", dependencies=[Depends(verify_internal_api_key)])
-@app.post("/api/extract-email-lead", dependencies=[Depends(verify_internal_api_key)])
-@app.post("/extract-email-lead", dependencies=[Depends(verify_internal_api_key)])
 async def extract_email_task(request: EmailTaskRequest):
     try:
         from agent.email_parser import strip_html_to_text, parse_forwarded_email, classify_sender, extract_entities_with_llm
@@ -2412,6 +2420,12 @@ async def extract_email_task(request: EmailTaskRequest):
         if request.files:
             all_attachments.extend(request.files)
             
+        import time
+        import asyncio
+        from db.database import save_ai_email_parsing_async
+        
+        start_time = time.time()
+        
         json_result = extract_entities_with_llm(
             text=prompt_text, 
             sender_type=sender_type, 
@@ -2419,6 +2433,35 @@ async def extract_email_task(request: EmailTaskRequest):
             attachments=all_attachments, 
             employee_id=request.employee_id
         )
+        
+        processing_time_ms = int((time.time() - start_time) * 1000)
+        
+        # Determine status and extract meta
+        meta = json_result.pop("_meta", {}) if isinstance(json_result, dict) else {}
+        total_atts = meta.get("total_attachments", 0)
+        parsed_atts = meta.get("parsed_attachments", 0)
+        model_name = meta.get("model_name")
+        if not model_name or model_name == "unknown":
+            model_name = os.getenv("PRIMARY_MODEL", "llama-3.3-70b-versatile")
+        token_tracking = meta.get("token_tracking", {})
+        
+        if not json_result or not isinstance(json_result, dict) or "intent" not in json_result:
+            processing_status = "FAILED"
+        elif total_atts > 0 and parsed_atts < total_atts:
+            processing_status = "PARTIAL_SUCCESS"
+        else:
+            processing_status = "SUCCESS"
+            
+        json_result["processing_status"] = processing_status
+        
+        # Get confidence metrics
+        conf_score_raw = json_result.get("confidence_score")
+        try:
+            conf_score = int(conf_score_raw) if conf_score_raw is not None else None
+        except:
+            conf_score = None
+            
+        # Telemetry is directly saved in agent/email_parser.py (extract_entities_with_llm)
         
         # 6. Server-side enrichments for Node.js
         json_result["sender_type"] = sender_type
@@ -2448,6 +2491,38 @@ async def extract_email_task(request: EmailTaskRequest):
         
     except Exception as e:
         print(f"Error extracting email task: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Endpoint for AI Lead Extraction via agent/lead_parser.py
+@app.post("/api/extract-email-lead", dependencies=[Depends(verify_internal_api_key)])
+@app.post("/extract-email-lead", dependencies=[Depends(verify_internal_api_key)])
+@app.post("/api/email-lead", dependencies=[Depends(verify_internal_api_key)])
+@app.post("/email-lead", dependencies=[Depends(verify_internal_api_key)])
+async def extract_email_lead(request: EmailLeadRequest):
+    try:
+        from agent.lead_parser import extract_lead_from_email
+        
+        json_result = await extract_lead_from_email(
+            subject=request.subject,
+            html_body=request.html_body,
+            text_body=request.text_body,
+            outer_from=request.outer_from,
+            outer_to=request.outer_to,
+            context=request.context,
+            employee_id=request.employee_id
+        )
+
+        return {
+            "success": True,
+            "extractedData": json_result,
+            "subject": request.subject,
+            "sender": request.outer_from
+        }
+    except Exception as e:
+        print(f"Error extracting email lead: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
