@@ -47,7 +47,6 @@ archive/
 chroma_db/
 rag/chroma_db/
 brain/
-memory/
 scratch/
 
 # AI Generated Blueprints & References

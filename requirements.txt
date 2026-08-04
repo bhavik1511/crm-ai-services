@@ -31,3 +31,4 @@ passlib[bcrypt]>=1.7.4
 python-dotenv>=1.0.1
 pydantic>=2.9.0
 PyPDF2>=3.0.0
+PyMuPDF>=1.23.0

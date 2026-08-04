@@ -83,22 +83,31 @@ except Exception:
     pass
 
 raw_origins = os.getenv("ALLOWED_ORIGINS", "")
-allowed_origins = [orig.strip() for orig in raw_origins.split(",")] if raw_origins else [
+default_origins = [
     "http://localhost:5173",
     "http://localhost:5174",
+    "http://localhost:3000",
     "http://localhost:3001",
     "http://127.0.0.1:5173",
-    "http://127.0.0.1:5174",
-    "http://192.168.1.13:5173",
+    "https://gtcrm-bh.com",
+    "https://staging.gtcrm-bh.com",
+    "https://www.gtcrm-bh.com",
 ]
+if raw_origins:
+    allowed_origins = list(set([orig.strip() for orig in raw_origins.split(",") if orig.strip()] + default_origins))
+else:
+    allowed_origins = default_origins
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
+    allow_origin_regex=r"https://.*\.gtcrm-bh\.com",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
 
 
 # --------------------------------------------------------------------------- #
@@ -736,13 +745,17 @@ def _format_kpi_report(kpi_payload: dict) -> str:
 
 
 def _call_json_api(url: str, auth_token: Optional[str]) -> dict:
-    headers = {"Accept": "application/json"}
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    }
     if auth_token:
         headers["Authorization"] = f"Bearer {auth_token}"
     req = UrlRequest(url=url, headers=headers, method="GET")
     with urlopen(req, timeout=25) as resp:
         body = resp.read().decode("utf-8")
         return json.loads(body)
+
 
 
 def _build_kpi_contract(kpi_data: dict, aging_data: dict, filters_applied: dict, period: dict) -> dict:
@@ -2384,10 +2397,6 @@ def verify_internal_api_key(api_key: str = Security(api_key_header)):
 
 @app.post("/api/extract-email-task", dependencies=[Depends(verify_internal_api_key)])
 @app.post("/extract-email-task", dependencies=[Depends(verify_internal_api_key)])
-@app.post("/api/email-lead", dependencies=[Depends(verify_internal_api_key)])
-@app.post("/email-lead", dependencies=[Depends(verify_internal_api_key)])
-@app.post("/api/extract-email-lead", dependencies=[Depends(verify_internal_api_key)])
-@app.post("/extract-email-lead", dependencies=[Depends(verify_internal_api_key)])
 async def extract_email_task(request: EmailTaskRequest):
     try:
         from agent.email_parser import strip_html_to_text, parse_forwarded_email, classify_sender, extract_entities_with_llm
@@ -2464,7 +2473,9 @@ async def extract_email_task(request: EmailTaskRequest):
         meta = json_result.pop("_meta", {}) if isinstance(json_result, dict) else {}
         total_atts = meta.get("total_attachments", 0)
         parsed_atts = meta.get("parsed_attachments", 0)
-        model_name = meta.get("model_name", "unknown")
+        model_name = meta.get("model_name")
+        if not model_name or model_name == "unknown":
+            model_name = os.getenv("PRIMARY_MODEL", "llama-3.3-70b-versatile")
         token_tracking = meta.get("token_tracking", {})
         
         if not json_result or not isinstance(json_result, dict) or "intent" not in json_result:
@@ -2483,23 +2494,7 @@ async def extract_email_task(request: EmailTaskRequest):
         except:
             conf_score = None
             
-        # Asynchronously save combined data to DB
-        asyncio.create_task(save_ai_email_parsing_async(
-            employee_id=request.employee_id,
-            document_type="email",
-            reference_id="email_task",
-            input_tokens=token_tracking.get("input_tokens", 0),
-            output_tokens=token_tracking.get("output_tokens", 0),
-            total_tokens=token_tracking.get("total_tokens", 0),
-            total_cost_usd=token_tracking.get("total_cost_usd", 0.0),
-            model_name=model_name,
-            has_attachment=token_tracking.get("has_attachment", False),
-            file_extension=token_tracking.get("file_extension", None),
-            confidence_score=conf_score,
-            confidence_level=json_result.get("confidence_level"),
-            processing_status=processing_status,
-            processing_time_ms=processing_time_ms
-        ))
+        # Telemetry is directly saved in agent/email_parser.py (extract_entities_with_llm)
         
         # 6. Server-side enrichments for Node.js
         json_result["sender_type"] = sender_type
@@ -2532,7 +2527,11 @@ async def extract_email_task(request: EmailTaskRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Endpoint for AI Lead Extraction via agent/lead_parser.py
 @app.post("/api/extract-email-lead", dependencies=[Depends(verify_internal_api_key)])
+@app.post("/extract-email-lead", dependencies=[Depends(verify_internal_api_key)])
+@app.post("/api/email-lead", dependencies=[Depends(verify_internal_api_key)])
+@app.post("/email-lead", dependencies=[Depends(verify_internal_api_key)])
 async def extract_email_lead(request: EmailLeadRequest):
     try:
         from agent.lead_parser import extract_lead_from_email

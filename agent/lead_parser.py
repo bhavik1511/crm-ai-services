@@ -50,85 +50,199 @@ def resolve_lead_source(sender_email: str) -> str:
             return "internal"
     return "external"
 
-# ─── CRM API Fuzzy Matcher (from Lambda) ──────────────────────────────────────
+def clean_and_parse_json(text: str) -> dict:
+    """Robust JSON parser that repairs common LLM glitches (Extra data, trailing commas, unescaped newlines, etc.)."""
+    if not text or not text.strip():
+        return {}
+
+    # Strip markdown backticks
+    cleaned_text = re.sub(r'```(?:json)?', '', text).replace('```', '').strip()
+
+    # 1. Attempt raw_decode from the first '{' to handle 'Extra data' (e.g. trailing text or multiple JSON objects)
+    first_brace = cleaned_text.find('{')
+    if first_brace != -1:
+        try:
+            decoder = json.JSONDecoder()
+            obj, _ = decoder.raw_decode(cleaned_text[first_brace:])
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+
+    # 2. Try non-greedy block extraction
+    matches = re.findall(r'\{[\s\S]*?\}', cleaned_text)
+    for m in matches:
+        try:
+            return json.loads(m)
+        except Exception:
+            try:
+                fixed = re.sub(r',\s*([\}\]])', r'\1', m)
+                return json.loads(fixed)
+            except Exception:
+                continue
+
+    # 3. Greedy match as fallback
+    match = re.search(r'\{[\s\S]*\}', cleaned_text)
+    if not match:
+        return {}
+    raw_json = match.group(0)
+
+    try:
+        return json.loads(raw_json)
+    except json.JSONDecodeError:
+        pass
+
+    # 4. Remove trailing commas before } or ]
+    cleaned = re.sub(r',\s*([\}\]])', r'\1', raw_json)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # 5. Escape literal unescaped newlines inside JSON strings
+    try:
+        def _fix_newlines(m):
+            return m.group(0).replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+        cleaned_nl = re.sub(r'"[^"\\]*(?:\\.[^"\\]*)*"', _fix_newlines, cleaned)
+        return json.loads(cleaned_nl)
+    except json.JSONDecodeError:
+        pass
+
+    # 6. Fallback: Python literal evaluation
+    try:
+        import ast
+        val = ast.literal_eval(cleaned)
+        if isinstance(val, dict):
+            return val
+    except Exception:
+        pass
+
+    return {}
+
+# ─── CRM DB / API Fuzzy Matcher ──────────────────────────────────────────────
 async def resolve_client_type(
     company_name: str,
     contact_name: str,
     contact_email: str
 ) -> dict:
+    import asyncio
     debug_info = []
 
-    crm_api_base = os.environ.get("CRM_API_BASE", "http://localhost:3001/api/v1")
-    token = os.environ.get("CRM_JWT_SECRET", "dummy_token")
+    def _db_lookup():
+        n_email = (contact_email or "").lower().strip()
+        n_comp = (company_name or "").strip()
+        n_cont = (contact_name or "").strip()
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-
-    n_email = (contact_email or "").lower().strip()
-    is_existing = False
-    found_customer_id = None
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        # ── Check contacts table ─────────────────────────────────────────────
         try:
-            c_resp = await client.get(f"{crm_api_base}/contact/all", headers=headers)
-            if c_resp.status_code == 200:
-                c_json = c_resp.json()
-                contacts = c_json if isinstance(c_json, list) else (c_json.get('data') or c_json.get('rows') or [])
-                debug_info.append(f"Fetched {len(contacts)} contacts")
+            from db.database import get_db_engine
+            from sqlalchemy import text
+            engine = get_db_engine()
+            with engine.connect() as conn:
+                # 1. Search customer_contact_details by email
+                if n_email:
+                    row = conn.execute(
+                        text("SELECT customer_id, id FROM customer_contact_details WHERE LOWER(TRIM(email_id)) = :email AND customer_id IS NOT NULL LIMIT 1"),
+                        {"email": n_email}
+                    ).fetchone()
+                    if row:
+                        return {"client_type": "existing", "customer_id": row[0], "contact_id": row[1], "debug": "Matched email in customer_contact_details"}
 
-                for c in contacts:
-                    db_email = (c.get("email") or "").lower().strip()
-                    db_full_name = f"{c.get('first_name') or ''} {c.get('last_name') or ''}".strip()
-                    customer_obj = c.get("customer") or {}
-                    db_company = c.get("cd_company_name") or customer_obj.get("customer_name") or ""
+                    # Search contacts by email
+                    row = conn.execute(
+                        text("SELECT id, cd_company_name, first_name, last_name, email FROM contacts WHERE LOWER(TRIM(email)) = :email AND is_active = 1 LIMIT 1"),
+                        {"email": n_email}
+                    ).fetchone()
+                    if row:
+                        return {"client_type": "existing", "customer_id": None, "contact_id": row[0], "debug": "Matched email in contacts table"}
 
-                    if (n_email and db_email and n_email == db_email) or \
-                       names_match(contact_name, db_full_name) or \
-                       names_match(company_name, db_company):
+                # 2. Search customers table by email or company name
+                if n_email:
+                    row = conn.execute(
+                        text("SELECT id FROM customers WHERE LOWER(TRIM(cust_email)) = :email AND is_active = 1 LIMIT 1"),
+                        {"email": n_email}
+                    ).fetchone()
+                    if row:
+                        return {"client_type": "existing", "customer_id": row[0], "contact_id": None, "debug": "Matched cust_email in customers table"}
 
-                        is_existing = True
-                        if c.get("customer_id") or customer_obj.get("id"):
-                            found_customer_id = c.get("customer_id") or customer_obj.get("id")
-                            break
-            else:
-                debug_info.append(f"contact/all failed: {c_resp.status_code}")
+                if n_comp and len(n_comp) > 2:
+                    row = conn.execute(
+                        text("SELECT id FROM customers WHERE LOWER(customer_name) LIKE :comp AND is_active = 1 LIMIT 1"),
+                        {"comp": f"%{n_comp.lower()}%"}
+                    ).fetchone()
+                    if row:
+                        return {"client_type": "existing", "customer_id": row[0], "contact_id": None, "debug": "Matched company_name in customers table"}
+
         except Exception as e:
-            debug_info.append(f"contact/all fetch error: {str(e)}")
+            debug_info.append(f"DB lookup error: {str(e)}")
 
-        if is_existing and found_customer_id:
-            return {"client_type": "existing", "customer_id": found_customer_id, "debug": " | ".join(debug_info)}
+        return None
 
-        # ── Check customers table ────────────────────────────────────────────
-        try:
-            k_resp = await client.get(f"{crm_api_base}/customer/all", headers=headers)
-            if k_resp.status_code == 200:
-                k_json = k_resp.json()
-                customers = k_json if isinstance(k_json, list) else (k_json.get('data') or k_json.get('rows') or [])
-                debug_info.append(f"Fetched {len(customers)} customers")
+    # Try direct DB lookup
+    db_res = await asyncio.to_thread(_db_lookup)
+    if db_res:
+        return db_res
 
-                for c in customers:
-                    db_email = (c.get("cust_email") or "").lower().strip()
-                    db_cust_name = c.get("customer_name") or ""
-
-                    if (n_email and db_email and n_email == db_email) or \
-                       names_match(company_name, db_cust_name) or \
-                       names_match(contact_name, db_cust_name):
-
-                        return {"client_type": "existing", "customer_id": c.get("id"), "debug": " | ".join(debug_info)}
-            else:
-                debug_info.append(f"customer/all failed: {k_resp.status_code}")
-        except Exception as e:
-            debug_info.append(f"customer/all fetch error: {str(e)}")
-
-    debug_info.append("No matches found in DB")
+    # If DB lookup finds no existing match, return as new client
     return {
-        "client_type": "existing" if is_existing else "new",
-        "customer_id": found_customer_id,
-        "debug": " | ".join(debug_info)
+        "client_type": "new",
+        "customer_id": None,
+        "contact_id": None,
+        "debug": " | ".join(debug_info) if debug_info else "No existing client match found in DB"
     }
+
+# ─── Master Data Helper ───────────────────────────────────────────────────────
+def load_db_master_data_if_needed(context: dict) -> dict:
+    """
+    Ensure all master lists exist in context. If any are missing or empty,
+    fetch them directly from the MySQL database.
+    """
+    ctx = dict(context or {})
+
+    # Check key variations
+    if 'service_lines' in ctx and 'serviceLines' not in ctx:
+        ctx['serviceLines'] = ctx['service_lines']
+    if 'industry_types' in ctx and 'industryTypes' not in ctx:
+        ctx['industryTypes'] = ctx['industry_types']
+    elif 'industries' in ctx and 'industryTypes' not in ctx:
+        ctx['industryTypes'] = ctx['industries']
+    if 'service_types' in ctx and 'serviceTypes' not in ctx:
+        ctx['serviceTypes'] = ctx['service_types']
+    if 'sub_service_types' in ctx and 'subServiceTypes' not in ctx:
+        ctx['subServiceTypes'] = ctx['sub_service_types']
+
+    has_sl = bool(ctx.get('serviceLines'))
+    has_ind = bool(ctx.get('industryTypes'))
+    has_st = bool(ctx.get('serviceTypes'))
+    has_sst = bool(ctx.get('subServiceTypes'))
+
+    if has_sl and has_ind and has_st and has_sst:
+        return ctx
+
+    # Auto-load missing lists from MySQL DB
+    try:
+        from db.database import get_db_engine
+        from sqlalchemy import text
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            if not has_sl:
+                sl_rows = conn.execute(text("SELECT id, name FROM m_serviceline WHERE is_active = 1")).fetchall()
+                ctx['serviceLines'] = [{"id": r[0], "name": r[1]} for r in sl_rows]
+
+            if not has_ind:
+                ind_rows = conn.execute(text("SELECT id, name FROM m_industry_type WHERE is_active = 1")).fetchall()
+                ctx['industryTypes'] = [{"id": r[0], "name": r[1]} for r in ind_rows]
+
+            if not has_st:
+                st_rows = conn.execute(text("SELECT id, name, service_line_id FROM m_servicetype WHERE is_active = 1")).fetchall()
+                ctx['serviceTypes'] = [{"id": r[0], "name": r[1], "service_line_id": r[2]} for r in st_rows]
+
+            if not has_sst:
+                sst_rows = conn.execute(text("SELECT id, name, service_type_id FROM m_sub_servicetype WHERE is_active = 1")).fetchall()
+                ctx['subServiceTypes'] = [{"id": r[0], "name": r[1], "service_type_id": r[2]} for r in sst_rows]
+    except Exception as e:
+        print(f"[Lead Parser] Master Data Auto-load Error: {e}")
+
+    return ctx
 
 # ─── Main Extraction Method ───────────────────────────────────────────────────
 async def extract_lead_from_email(
@@ -143,7 +257,7 @@ async def extract_lead_from_email(
     import asyncio
     import time
     from agent.email_parser import strip_html_to_text, parse_forwarded_email
-    from config.llm_factory import get_llm                    # ✅ correct import path
+    from config.llm_factory import get_llm
     from langchain_core.messages import HumanMessage, SystemMessage
 
     # 1. Clean HTML
@@ -156,7 +270,15 @@ async def extract_lead_from_email(
     sender_email = parsed_email.get("originalFromEmail") if is_forwarded else outer_from
     sender_name  = parsed_email.get("originalFrom")      if is_forwarded else outer_from
 
-    # 3. AI Context Lists (STEP 1: High-Level Taxonomy only)
+    # Parse out email address if sender_email contains "<...>"
+    if sender_email and "<" in sender_email and ">" in sender_email:
+        m = re.search(r'<([^>]+)>', sender_email)
+        if m:
+            sender_email = m.group(1).strip()
+
+    # 3. Auto-load master data from DB if context is missing/partial
+    context = load_db_master_data_if_needed(context)
+
     sl_list  = "\n".join([f"ID {s.get('id')}: {s.get('name')}" for s in context.get('serviceLines', [])])
     ind_list = "\n".join([f"ID {i.get('id')}: {i.get('name')}" for i in context.get('industryTypes', [])])
 
@@ -173,14 +295,14 @@ SERVICE LINES:
 INDUSTRIES:
 {ind_list or "(none)"}
 
-Return ONLY a valid JSON object with these EXACT keys (no extra text before or after):
+Return ONLY a valid JSON object with these EXACT keys (no extra text before or after, no raw newlines inside string values):
 {{
   "company_name": "Company or organization name, or null",
   "contact_name": "Full name of the person who sent the email",
   "contact_email": "Email address of the contact",
   "contact_phone": "Phone number as string (digits only), or null",
   "budget_value": null or a plain number (no currency symbols),
-  "summary": "Brief 1-2 sentence summary of the inquiry",
+  "summary": "Brief 1-2 sentence summary of the inquiry (on a single line)",
   "serviceline_id": null or numeric ID from SERVICE LINES,
   "serviceline_name": "matching service line name or null",
   "industry_id": null or numeric ID from INDUSTRIES,
@@ -198,7 +320,6 @@ Return ONLY a valid JSON object with these EXACT keys (no extra text before or a
     # Token Tracking state
     in_tok = 0
     out_tok = 0
-    
     def add_tokens(resp):
         nonlocal in_tok, out_tok
         if hasattr(resp, 'usage_metadata') and resp.usage_metadata:
@@ -219,16 +340,21 @@ Return ONLY a valid JSON object with these EXACT keys (no extra text before or a
         )
         add_tokens(response_1)
         raw_text_1 = response_1.content if hasattr(response_1, "content") else str(response_1)
-        json_match_1 = re.search(r'\{[\s\S]*\}', raw_text_1)
-        parsed = json.loads(json_match_1.group(0)) if json_match_1 else {}
+        parsed = clean_and_parse_json(raw_text_1)
 
         # --- STEP 2: Deep-Dive Service Types (ONLY if Service Line is identified) ---
         sl_id = parsed.get("serviceline_id")
         if sl_id:
-            # Filter huge Service Types list down to a few items
-            filtered_st = [st for st in context.get('serviceTypes', []) if str(st.get('service_line_id')) == str(sl_id)]
+            # Filter Service Types list down to matching service line
+            filtered_st = [
+                st for st in context.get('serviceTypes', [])
+                if str(st.get('service_line_id') or st.get('serviceLineId') or (st.get('serviceLine') if isinstance(st.get('serviceLine'), dict) else {}).get('id')) == str(sl_id)
+            ]
             filtered_st_ids = [str(st.get('id')) for st in filtered_st]
-            filtered_sst = [sst for sst in context.get('subServiceTypes', []) if str(sst.get('service_type_id')) in filtered_st_ids]
+            filtered_sst = [
+                sst for sst in context.get('subServiceTypes', [])
+                if str(sst.get('service_type_id') or sst.get('serviceTypeId') or (sst.get('serviceType') if isinstance(sst.get('serviceType'), dict) else {}).get('id')) in filtered_st_ids
+            ]
 
             st_list_2 = "\n".join([f"ID {s.get('id')}: {s.get('name')}" for s in filtered_st])
             sst_list_2 = "\n".join([f"ID {s.get('id')}: {s.get('name')}" for s in filtered_sst])
@@ -256,9 +382,8 @@ Return ONLY a valid JSON object with these EXACT keys:
                 )
                 add_tokens(response_2)
                 raw_text_2 = response_2.content if hasattr(response_2, "content") else str(response_2)
-                json_match_2 = re.search(r'\{[\s\S]*\}', raw_text_2)
-                if json_match_2:
-                    parsed_2 = json.loads(json_match_2.group(0))
+                parsed_2 = clean_and_parse_json(raw_text_2)
+                if parsed_2:
                     parsed.update(parsed_2)
 
         extracted_obj = LeadExtraction(**{k: parsed.get(k) for k in LeadExtraction.model_fields})
@@ -270,10 +395,15 @@ Return ONLY a valid JSON object with these EXACT keys:
     # --- Cost & Analytics ---
     tot_tok = in_tok + out_tok
     cost = 0.0
-    model_name_used = getattr(llm, 'model_name', getattr(llm, 'model', os.getenv("PRIMARY_MODEL", "unknown")))
+    model_name_used = (
+        getattr(llm, 'model_name', None) or 
+        getattr(llm, 'model', None) or 
+        getattr(getattr(llm, 'bound', None), 'model_name', None) or 
+        getattr(getattr(llm, 'bound', None), 'model', None) or 
+        os.getenv("PRIMARY_MODEL", "llama-3.3-70b-versatile")
+    )
 
-    # Basic cost calculation logic
-    model_lower = model_name_used.lower()
+    model_lower = str(model_name_used).lower()
     if "llama-3.3-70b" in model_lower:
         cost = (in_tok / 1_000_000 * 0.59) + (out_tok / 1_000_000 * 0.79)
     elif "llama-3.1-8b" in model_lower:
@@ -287,17 +417,16 @@ Return ONLY a valid JSON object with these EXACT keys:
 
     execution_time_ms = int((time.time() - start_time) * 1000)
 
-    # Extract confidence score from LLM, fallback to 0 (NOT 90) if it fails
     try:
         confidence_score_val = int(parsed.get("confidence_score", 0))
     except (TypeError, ValueError):
         confidence_score_val = 0
     confidence_level_val = str(parsed.get("confidence_level", "high")).lower()
 
-    # 6. Save Telemetry — matches the REAL save_ai_email_parsing_async signature in .py
+    # 6. Save Telemetry — unified DB sink ai_email_parsing
     from db.database import save_ai_email_parsing_async
     asyncio.create_task(save_ai_email_parsing_async(
-        employee_id=employee_id,
+        employee_id=employee_id if employee_id != 0 else None,
         document_type="email_lead",
         reference_id=subject[:50],
         input_tokens=in_tok,
@@ -318,14 +447,14 @@ Return ONLY a valid JSON object with these EXACT keys:
     # 7. Lead Source
     lead_source = resolve_lead_source(sender_email)
 
-    # 8. Client Type (fuzzy match via CRM API)
+    # 8. Client Type (fuzzy match via DB/API)
     company = extracted_dict.get('company_name') or ""
     contact = extracted_dict.get('contact_name') or sender_name or ""
     c_email  = extracted_dict.get('contact_email') or sender_email or ""
 
     client_type_result = await resolve_client_type(company, contact, c_email)
 
-    # 9. Final Response (mirrors Lambda finalExtracted shape exactly)
+    # 9. Final Response
     return {
         "company_name":         extracted_dict.get("company_name"),
         "contact_name":         extracted_dict.get("contact_name") or sender_name,
@@ -343,6 +472,8 @@ Return ONLY a valid JSON object with these EXACT keys:
         "industry_name":        extracted_dict.get("industry_name"),
         "client_type":          client_type_result.get("client_type"),
         "customer_id":          client_type_result.get("customer_id"),
+        "contact_id":           client_type_result.get("contact_id"),
         "lead_source":          lead_source,
         "debug_info":           client_type_result.get("debug")
     }
+

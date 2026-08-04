@@ -14,7 +14,10 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-CRM_API_BASE = 'http://localhost:3001/api/v1'
+import os
+
+CRM_API_BASE = os.getenv('CRM_API_BASE', 'http://localhost:3001/api/v1').rstrip('/')
+
 
 # Entity to API Mapping
 ENTITY_API_MAP = {
@@ -284,7 +287,11 @@ async def fetch_entity_from_api(entity_type: str, search_query: str, jwt_token: 
     logger.info(f"[EntityResolver DEBUG] Outgoing Params: {search_param}={safe_query}&pageSize={limit}")
 
     def _sync_fetch():
-        req = urllib.request.Request(url, headers={'Authorization': f'Bearer {jwt_token}'})
+        headers = {
+            'Authorization': f'Bearer {jwt_token}',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        }
+        req = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(req) as response:
                 status = response.status
