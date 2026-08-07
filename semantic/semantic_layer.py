@@ -2,7 +2,7 @@ import json
 import asyncio
 from decimal import Decimal
 from datetime import datetime, date
-from typing import Optional
+from typing import Optional, Any, List, Dict
 from langchain_core.tools import tool
 from sqlalchemy import text
 from db.database import get_db_engine
@@ -26,18 +26,25 @@ _CURRENT_USER_CONTEXT = contextvars.ContextVar("_CURRENT_USER_CONTEXT", default=
 def set_user_context(user_ctx: dict):
     """Set the current user context for RBAC enforcement in semantic layer tools.
     Called by main.py and chat_routes.py before each request."""
+    global _CRM_AUTH_TOKEN
     _CURRENT_USER_CONTEXT.set(user_ctx or {})
     ctx = _CURRENT_USER_CONTEXT.get()
+    token = ctx.get('jwt_token') or ctx.get('token')
+    if token:
+        _CRM_AUTH_TOKEN = token
     emp_id = ctx.get('employee_id', 'N/A')
     tier = ctx.get('user_tier', 'N/A')
-    print(f"[RBAC SemanticLayer] User context set: employee_id={emp_id}, user_tier={tier}")
+    print(f"[RBAC SemanticLayer] User context set: employee_id={emp_id}, user_tier={tier}, token_present={bool(_CRM_AUTH_TOKEN)}")
 
 def _resolve_rbac_params(employee_id, user_tier):
     """Resolve employee_id and user_tier from explicit params or _CURRENT_USER_CONTEXT.
     The SQL layer will handle restricting aggregate requests (employee_id=None) to the user's branch."""
-    ctx = _CURRENT_USER_CONTEXT.get()
+    ctx = _CURRENT_USER_CONTEXT.get() or {}
     resolved_emp_id = employee_id if employee_id is not None else ctx.get('employee_id')
     resolved_tier = user_tier if user_tier is not None else ctx.get('user_tier')
+
+    if resolved_tier is None:
+        resolved_tier = 1
 
     # If LLM passed an ID, use it. Otherwise, leave it as None for aggregate requests.
     if employee_id is not None:
@@ -82,6 +89,11 @@ async def _run_query(query: str, params: dict = None, as_dict: bool = True):
         print(f"[_run_query DB ERROR]: {e}")
         return []
 def _build_ownership_sql(employee_id: int, user_tier: int, table_alias: str = "i", check_service_line: bool = True, owner_col: str = "project_in_charge_id", sl_col: str = "service_line_id") -> str:
+    try:
+        user_tier_int = int(user_tier) if user_tier is not None else None
+    except Exception:
+        user_tier_int = 1 if str(user_tier).upper() in ("SUPER_ADMIN", "ADMIN", "MANAGEMENT") else 99
+
     if not employee_id:
         # If no employee_id is provided, the LLM is requesting aggregate data.
         ctx_dept_id = _CURRENT_USER_CONTEXT.get().get('department_id')
@@ -99,7 +111,7 @@ def _build_ownership_sql(employee_id: int, user_tier: int, table_alias: str = "i
                     print(f"[_build_ownership_sql] Error fetching department: {e}")
                     
         # Tier 1 or top management department gets full company data (only if tier <= 4)
-        if user_tier == 1 or (ctx_dept_id == 17 and user_tier is not None and user_tier <= 4):
+        if user_tier_int == 1 or (ctx_dept_id == 17 and user_tier_int is not None and user_tier_int <= 4):
             return "1=1"
             
         # ALL other tiers get aggregate data scoped strictly to their department's Service Line
@@ -111,7 +123,7 @@ def _build_ownership_sql(employee_id: int, user_tier: int, table_alias: str = "i
                     return f"({table_alias}.{sl_col} = {sl_res[0]})"
                     
         # Fallback if no specific service line is found for Tier <= 4
-        if user_tier is not None and user_tier <= 4:
+        if user_tier_int is not None and user_tier_int <= 4:
             return "1=1"
             
         # Strict fail closed if no identity is found or tier >= 5 without a service line
@@ -174,6 +186,7 @@ async def get_revenue_metrics(start_date: Optional[str] = None, end_date: Option
         total_q = f"SELECT ROUND(SUM(total_amt_ex_vat), 2) AS revenue FROM invoice i WHERE i.is_active = 1 AND i.created_at BETWEEN '{start_date}' AND '{end_date}' AND {ownership_sql}"
         month_q = f"SELECT DATE_FORMAT(i.created_at, '%b-%Y') AS month, ROUND(SUM(i.total_amt_ex_vat), 2) AS amount FROM invoice i WHERE i.is_active = 1 AND i.created_at BETWEEN '{start_date}' AND '{end_date}' AND {ownership_sql} GROUP BY DATE_FORMAT(i.created_at, '%b-%Y') ORDER BY MIN(i.created_at)"
         gp_perf_q = f"SELECT sl.name, sl.short_code, ROUND(COALESCE(SUM(i.total_amt_ex_vat), 0), 2) AS performing, COALESCE((SELECT ROUND(SUM(km.target_value), 2) FROM kpi_master km JOIN serviceline_department sd ON km.department_id = sd.department_id WHERE sd.serviceline_id = sl.id), 0) AS target FROM m_serviceline sl LEFT JOIN invoice i ON i.service_line_id = sl.id AND i.is_active = 1 AND i.created_at BETWEEN '{start_date}' AND '{end_date}' AND {ownership_sql} WHERE sl.is_active = 1 GROUP BY sl.id, sl.name, sl.short_code HAVING performing > 0 OR target > 0"
+        top_cust_q = f"SELECT COALESCE(c.customer_name, CONCAT('Customer #', i.client_name_id)) AS customer_name, ROUND(SUM(i.total_amt_ex_vat), 2) AS revenue FROM invoice i LEFT JOIN customers c ON i.client_name_id = c.id WHERE i.is_active = 1 AND i.created_at BETWEEN '{start_date}' AND '{end_date}' AND {ownership_sql} GROUP BY c.id, customer_name ORDER BY revenue DESC LIMIT 5"
 
         # Force 12 months for the fiscal year (Oct-Sep)
         # We parse the start year and build the 12 month list
@@ -181,6 +194,10 @@ async def get_revenue_metrics(start_date: Optional[str] = None, end_date: Option
         start_year = s_date.year
         next_year = start_year + 1
         
+        prev_start = f"{start_year - 1}-10-01"
+        prev_end = f"{start_year}-09-30 23:59:59"
+        prev_fy_q = f"SELECT ROUND(SUM(total_amt_ex_vat), 2) AS revenue FROM invoice i WHERE i.is_active = 1 AND i.created_at BETWEEN '{prev_start}' AND '{prev_end}' AND {ownership_sql}"
+
         fiscal_months = [
             f"Oct-{start_year}", f"Nov-{start_year}", f"Dec-{start_year}",
             f"Jan-{next_year}", f"Feb-{next_year}", f"Mar-{next_year}",
@@ -206,14 +223,17 @@ async def get_revenue_metrics(start_date: Optional[str] = None, end_date: Option
         team_billing_q = f"SELECT sl.name, sl.short_code, ROUND(COALESCE(SUM(i.total_amt_ex_vat), 0), 2) AS performing FROM m_serviceline sl LEFT JOIN invoice i ON i.service_line_id = sl.id AND i.is_active = 1 AND i.created_at >= '{cp_start_m}' AND {ownership_sql} WHERE sl.is_active = 1 GROUP BY sl.id, sl.name, sl.short_code HAVING performing > 0"
 
         # Execute queries concurrently
-        total_res, by_month, gp_perf_ytd, team_billing_cp = await asyncio.gather(
+        total_res, by_month, gp_perf_ytd, team_billing_cp, top_cust_res, prev_fy_res = await asyncio.gather(
             _run_query(total_q),
             _run_query(month_q),
             _run_query(gp_perf_q),
-            _run_query(team_billing_q)
+            _run_query(team_billing_q),
+            _run_query(top_cust_q),
+            _run_query(prev_fy_q),
         )
 
         total = total_res[0]['revenue'] if total_res and total_res[0]['revenue'] else 0
+        prev_fy_total = prev_fy_res[0]['revenue'] if prev_fy_res and prev_fy_res[0]['revenue'] else 0
         
         # Map DB results to valid months up to current
         db_month_map = {row['month']: row['amount'] for row in by_month}
@@ -225,6 +245,8 @@ async def get_revenue_metrics(start_date: Optional[str] = None, end_date: Option
 
         return json.dumps({
             "total_revenue_ytd": total,
+            "previous_fy_revenue": prev_fy_total,
+            "top_5_customers": top_cust_res,
             "gp_performance_ytd_breakdown": gp_perf_ytd,
             "current_team_billing_period_total": round(current_period_billing, 2),
             "current_team_billing_breakdown": team_billing_cp,
@@ -486,7 +508,7 @@ async def get_job_estimation_metrics(start_date: Optional[str] = None, end_date:
         return f"Error retrieving job estimation metrics: {str(e)}"
 
 @tool
-async def get_active_projects_metrics(start_date: Optional[str] = None, end_date: Optional[str] = None, employee_id: int = None, is_active: Optional[bool] = True) -> str:
+async def get_active_projects_metrics(start_date: Optional[str] = None, end_date: Optional[str] = None, employee_id: int = None, is_active: Optional[bool] = True, customer_name: Optional[str] = None, employee_name: Optional[str] = None) -> str:
     """Useful for answering questions about projects, active projects, WIP projects, completed projects, non-active projects, task overview, overdue tasks, Overall Completion, Actual Recoverability, and Estimated Recoverability.
     This tool calls the same CRM backend API that the dashboard uses, so the numbers will always match the dashboard exactly.
     Always pass the user's Employee ID from the system prompt to get results scoped to the logged-in user.
@@ -495,6 +517,8 @@ async def get_active_projects_metrics(start_date: Optional[str] = None, end_date
         end_date: End of the period (defaults to CURRENT Fiscal Year end: Sep 30)
         employee_id: The Employee ID of the logged-in user. ALWAYS pass this from the system prompt if the user asks for "my" data.
         is_active: Set to False if the user asks for non-active, completed, or inactive projects. Defaults to True.
+        customer_name: Optional customer / client name to filter projects specifically for that customer.
+        employee_name: Optional employee / incharge name to filter projects under that employee.
     """
     try:
         # RBAC: resolve from server-side context if LLM omits params
@@ -506,6 +530,14 @@ async def get_active_projects_metrics(start_date: Optional[str] = None, end_date
         ownership_sql = _build_ownership_sql(employee_id, _CURRENT_USER_CONTEXT.get().get('user_tier'), "p", True, "incharge")
         is_active_val = "1" if is_active else "0"
 
+        entity_sql = ""
+        if customer_name and customer_name.strip().lower() not in ("all", ""):
+            safe_cust = customer_name.replace("'", "''").strip()
+            entity_sql += f" AND p.client IN (SELECT id FROM customers WHERE customer_name LIKE '%{safe_cust}%' OR cust_code = '{safe_cust}')"
+        if employee_name and employee_name.strip().lower() not in ("all", ""):
+            safe_emp = employee_name.replace("'", "''").strip()
+            entity_sql += f" AND (p.main_incharge IN (SELECT id FROM employees WHERE employee_name LIKE '%{safe_emp}%') OR p.partner IN (SELECT id FROM employees WHERE employee_name LIKE '%{safe_emp}%'))"
+
         # -----------------------------------------------------------------------
         # STEP 1: Count active projects. To match the CRM UI perfectly, we must filter
         # by 'created_at' since the backend Projects List API uses date_field='created_at'.
@@ -516,6 +548,7 @@ async def get_active_projects_metrics(start_date: Optional[str] = None, end_date
             WHERE p.is_active = {is_active_val}
               AND p.created_at BETWEEN '{start_date}' AND '{end_date}'
               AND {ownership_sql}
+              {entity_sql}
         """
 
         # -----------------------------------------------------------------------
@@ -529,6 +562,7 @@ async def get_active_projects_metrics(start_date: Optional[str] = None, end_date
              AND p.is_active = {is_active_val}
              AND p.created_at BETWEEN '{start_date}' AND '{end_date}'
              AND {ownership_sql}
+             {entity_sql}
             GROUP BY ps.id, ps.name
         """
 
@@ -559,6 +593,7 @@ async def get_active_projects_metrics(start_date: Optional[str] = None, end_date
                 WHERE p.is_active = {is_active_val}
                   AND p.created_at BETWEEN '{start_date}' AND '{end_date}'
                   AND {ownership_sql}
+                  {entity_sql}
                 GROUP BY p.id
             ) AS proj_data
         """
@@ -1426,6 +1461,145 @@ async def get_total_estimation_report(
         return f"Error retrieving total estimation report: {str(e)}"
 
 
+def _resolve_summary_metrics(
+    api_raw: Any,
+    normalised_rows: List[Dict[str, Any]],
+    is_sql_fallback: bool = False
+) -> Dict[str, Any]:
+    """
+    Summary Metric Resolver for Recoverability.
+    Resolution priority:
+    1. Backend Summary Payload
+    2. Backend Metadata
+    3. Backend Aggregate Fields
+    4. Only then calculate from row data if absolutely necessary using Backend Formula:
+       (Total Approved Fees / Total Actual Cost) * 100
+    """
+    api_data = api_raw.get('data', api_raw) if isinstance(api_raw, dict) else {}
+    if not isinstance(api_data, dict):
+        api_data = {}
+
+    summary_obj = api_data.get('summary') or api_data.get('totals') or api_data.get('kpis')
+    meta_obj = api_data.get('meta') or api_data.get('metadata')
+
+    # --- 1. PROJECT COUNT ---
+    calc_projects = len(normalised_rows)
+    b_count_val = None
+    count_source = "Row Calculation (Fallback)"
+
+    if isinstance(summary_obj, dict) and ('total_projects' in summary_obj or 'count' in summary_obj or 'totalRecords' in summary_obj):
+        b_count_val = summary_obj.get('total_projects') or summary_obj.get('count') or summary_obj.get('totalRecords')
+        count_source = "Backend Summary Payload"
+    elif isinstance(meta_obj, dict) and ('total' in meta_obj or 'count' in meta_obj or 'totalRecords' in meta_obj):
+        b_count_val = meta_obj.get('total') or meta_obj.get('count') or meta_obj.get('totalRecords')
+        count_source = "Backend Metadata"
+    elif 'count' in api_data or 'totalRecords' in api_data or 'total' in api_data:
+        b_count_val = api_data.get('count') or api_data.get('totalRecords') or api_data.get('total')
+        count_source = "Backend Aggregate Fields"
+
+    if b_count_val not in (None, "", "null") and not is_sql_fallback:
+        selected_projects = int(b_count_val)
+    else:
+        selected_projects = calc_projects
+
+    print(
+        f"[METRIC RESOLVER DEBUG]\n"
+        f"Metric Name: Project Count\n"
+        f"Metric Source: {count_source if b_count_val is not None else 'Row Calculation (Fallback)'}\n"
+        f"Backend Value: {b_count_val}\n"
+        f"Calculated Value: {calc_projects}\n"
+        f"Selected Value: {selected_projects}\n"
+    )
+
+    # --- 2. TOTAL APPROVED FEES / ESTIMATED COST ---
+    calc_est_cost = sum(float(r.get('estimated_cost') or r.get('approved_fees') or 0) for r in normalised_rows)
+    b_est_val = None
+    est_source = "Row Calculation (Fallback)"
+
+    if isinstance(summary_obj, dict) and ('total_approved_fees' in summary_obj or 'totalApprovedFees' in summary_obj or 'total_estimated_cost' in summary_obj):
+        b_est_val = summary_obj.get('total_approved_fees') or summary_obj.get('totalApprovedFees') or summary_obj.get('total_estimated_cost')
+        est_source = "Backend Summary Payload"
+    elif 'totalApprovedFees' in api_data or 'approvedFees' in api_data or 'total_estimated_cost' in api_data:
+        b_est_val = api_data.get('totalApprovedFees') or api_data.get('approvedFees') or api_data.get('total_estimated_cost')
+        est_source = "Backend Aggregate Fields"
+
+    if b_est_val not in (None, "", "null") and not is_sql_fallback:
+        selected_est_cost = round(float(b_est_val), 2)
+    else:
+        selected_est_cost = round(calc_est_cost, 2)
+
+    print(
+        f"[METRIC RESOLVER DEBUG]\n"
+        f"Metric Name: Total Approved Fees\n"
+        f"Metric Source: {est_source if b_est_val is not None else 'Row Calculation (Fallback)'}\n"
+        f"Backend Value: {b_est_val}\n"
+        f"Calculated Value: {calc_est_cost:.2f}\n"
+        f"Selected Value: {selected_est_cost:.2f}\n"
+    )
+
+    # --- 3. TOTAL ACTUAL COST ---
+    calc_act_cost = sum(float(r.get('total_actual_cost') or r.get('actualCost') or 0) for r in normalised_rows)
+    b_act_val = None
+    act_source = "Row Calculation (Fallback)"
+
+    if isinstance(summary_obj, dict) and ('total_actual_cost' in summary_obj or 'totalActualCost' in summary_obj):
+        b_act_val = summary_obj.get('total_actual_cost') or summary_obj.get('totalActualCost')
+        act_source = "Backend Summary Payload"
+    elif 'totalActualCost' in api_data or 'actualCost' in api_data or 'total_actual_cost' in api_data:
+        b_act_val = api_data.get('totalActualCost') or api_data.get('actualCost') or api_data.get('total_actual_cost')
+        act_source = "Backend Aggregate Fields"
+
+    if b_act_val not in (None, "", "null") and not is_sql_fallback:
+        selected_act_cost = round(float(b_act_val), 2)
+    else:
+        selected_act_cost = round(calc_act_cost, 2)
+
+    print(
+        f"[METRIC RESOLVER DEBUG]\n"
+        f"Metric Name: Total Actual Cost\n"
+        f"Metric Source: {act_source if b_act_val is not None else 'Row Calculation (Fallback)'}\n"
+        f"Backend Value: {b_act_val}\n"
+        f"Calculated Value: {calc_act_cost:.2f}\n"
+        f"Selected Value: {selected_act_cost:.2f}\n"
+    )
+
+    # --- 4. PORTFOLIO RECOVERABILITY ---
+    # Formula per Backend Business Rule: (Total Approved Fees / Total Actual Cost) * 100
+    calc_rec_pct = round((selected_est_cost / selected_act_cost * 100), 2) if selected_act_cost > 0 else 0.0
+    b_rec_val = None
+    rec_source = "Backend Ratio Formula"
+
+    if isinstance(summary_obj, dict) and ('total_actual_recoverability_percentage' in summary_obj or 'actual_recoverability' in summary_obj or 'recoverability' in summary_obj):
+        b_rec_val = summary_obj.get('total_actual_recoverability_percentage') or summary_obj.get('actual_recoverability') or summary_obj.get('recoverability')
+        rec_source = "Backend Summary Payload"
+    elif 'totalActualRecoverability' in api_data or 'recoverabilityPercentage' in api_data or 'overallRecoverability' in api_data:
+        b_rec_val = api_data.get('totalActualRecoverability') or api_data.get('recoverabilityPercentage') or api_data.get('overallRecoverability')
+        rec_source = "Backend Aggregate Fields"
+
+    if b_rec_val not in (None, "", "null") and not is_sql_fallback:
+        selected_rec_pct = round(float(b_rec_val), 2)
+    else:
+        selected_rec_pct = calc_rec_pct
+
+    print(
+        f"[METRIC RESOLVER DEBUG]\n"
+        f"Metric Name: Portfolio Recoverability\n"
+        f"Metric Source: {rec_source if b_rec_val is not None else 'Backend Ratio Formula'}\n"
+        f"Backend Value: {b_rec_val}\n"
+        f"Calculated Value: {calc_rec_pct:.2f}%\n"
+        f"Selected Value: {selected_rec_pct:.2f}%\n"
+    )
+
+    return {
+        "total_projects": selected_projects,
+        "total_estimated_cost": selected_est_cost,
+        "total_actual_cost": selected_act_cost,
+        "total_actual_recoverability_percentage": selected_rec_pct,
+        "actual_recoverability_pct": selected_rec_pct,
+        "portfolio_recoverability_pct": selected_rec_pct,
+        "source": "CRM_DATABASE_SQL" if is_sql_fallback else "CRM_API_RECOVERABILITY_REPORT"
+    }
+
 @tool
 async def get_project_recoverability_report(
     start_date: Optional[str] = None,
@@ -1475,11 +1649,10 @@ async def get_project_recoverability_report(
         incharge_filter = f" AND e.employee_name LIKE '%{incharge_employee}%'" if incharge_employee else ""
 
         # PRIMARY PATH: Call the CRM's own /reports/project-recoverability-report API
-        # (same endpoint the CRM report page uses, confirmed from browser DevTools).
-        # This guarantees 100% data parity with the CRM UI.
         if _CRM_AUTH_TOKEN:
             try:
                 import urllib.parse
+
                 safe_start = urllib.parse.quote(str(start_date))
                 safe_end = urllib.parse.quote(str(end_date))
 
@@ -1489,7 +1662,6 @@ async def get_project_recoverability_report(
                     f"&start_date={safe_start}&end_date={safe_end}"
                 )
                 print(f"[AI DEBUG] Recoverability report URL: {rec_url}")
-                print(f"[AI DEBUG] Auth token present: {bool(_CRM_AUTH_TOKEN)}, length: {len(_CRM_AUTH_TOKEN) if _CRM_AUTH_TOKEN else 0}")
                 if customer_name:
                     rec_url += f"&customerName={urllib.parse.quote(customer_name)}"
                 if project_name:
@@ -1503,23 +1675,16 @@ async def get_project_recoverability_report(
                 })
 
                 def _fetch_rec():
-                    with urllib.request.urlopen(req, timeout=15) as resp:
+                    with urllib.request.urlopen(req, timeout=3.0) as resp:
                         return json.loads(resp.read())
 
                 api_raw = await asyncio.to_thread(_fetch_rec)
                 api_data = api_raw.get('data', api_raw)
 
-                # Normalise the rows — the API may return { rows: [...], count: N } or a plain list
                 rows = api_data.get("rows", []) if isinstance(api_data, dict) else api_data
                 if not isinstance(rows, list): rows = []
-                
-                # Use the exact logic from the CRM UI
-                total_projects = int(api_data.get("count", len(rows))) if isinstance(api_data, dict) else len(rows)
 
-                # The API row shape can vary — normalise field names
                 normalised_rows = []
-                total_estimated_cost = 0.0
-                total_actual_cost = 0.0
 
                 for r in rows:
                     def extract_deep(d, target_keys):
@@ -1574,12 +1739,16 @@ async def get_project_recoverability_report(
                         r.get('recoverability') or p_detail.get('recoverability') or 
                         r.get('estimatedRecoverability') or r.get('estimated_recoverability') or 0
                     )
-                    act_rec = round((est / act) * 100, 3) if act > 0 else 0.0
+                    
+                    raw_act_rec = r.get('actualRecoverability') or r.get('actual_recoverability') or r.get('actual_recoverability_percentage')
+                    if raw_act_rec not in (None, "", "N/A", "null"):
+                        try:
+                            act_rec = round(float(raw_act_rec), 2)
+                        except Exception:
+                            act_rec = round((est / act) * 100, 2) if act > 0 else 0.0
+                    else:
+                        act_rec = round((est / act) * 100, 2) if act > 0 else 0.0
 
-                    total_estimated_cost += est
-                    total_actual_cost += act
-
-                    # Extract the missing fields
                     r_customer_group = extract_deep(r, ['customerGroup', 'groupName']) or ""
                     if isinstance(r_customer_group, dict): r_customer_group = r_customer_group.get('name') or ""
                     
@@ -1589,16 +1758,13 @@ async def get_project_recoverability_report(
                     r_end_date = r.get('end_date') or r.get('endDate') or ""
                     if r_end_date and 'T' in str(r_end_date): r_end_date = str(r_end_date).split('T')[0]
                     
-                    # Project Partner
                     r_partner = extract_deep(r, ['partnerInventory', 'projectPartner', 'partner']) or ""
                     if isinstance(r_partner, dict): r_partner = r_partner.get('employee_name') or r_partner.get('name') or ""
-                    elif isinstance(r_partner, int): r_partner = str(r_partner) # fallback if ID
+                    elif isinstance(r_partner, int): r_partner = str(r_partner)
                     
-                    # Customer Relation
                     r_cust_relation = extract_deep(r, ['clientRelation', 'customerRelation', 'client_relation']) or ""
                     if isinstance(r_cust_relation, dict): r_cust_relation = r_cust_relation.get('employee_name') or r_cust_relation.get('name') or ""
                     
-                    # Project Status
                     r_status = extract_deep(r, ['projectStatus', 'status']) or ""
                     if isinstance(r_status, dict): r_status = r_status.get('name') or ""
                     elif r.get('statusName'): r_status = r.get('statusName')
@@ -1627,15 +1793,9 @@ async def get_project_recoverability_report(
                         "actual_recoverability": act_rec,
                     })
 
-                total_projects = len(normalised_rows)
+                summary = _resolve_summary_metrics(api_raw, normalised_rows, is_sql_fallback=False)
 
-                valid_recoverabilities = [r['actual_recoverability'] for r in normalised_rows if r.get('actual_recoverability', 0) > 0]
-                total_actual_recoverability = (
-                    round(sum(valid_recoverabilities) / len(valid_recoverabilities), 3)
-                    if valid_recoverabilities else 0.0
-                )
-
-                if total_projects == 0:
+                if summary["total_projects"] == 0:
                     return json.dumps({
                         "summary": {
                             "total_projects": 0,
@@ -1646,14 +1806,7 @@ async def get_project_recoverability_report(
                     })
 
                 return json.dumps({
-                    "summary": {
-                        "total_projects": total_projects,
-                        "total_estimated_cost": round(total_estimated_cost, 2),
-                        "total_actual_cost": round(total_actual_cost, 2),
-                        "total_actual_recoverability_percentage": total_actual_recoverability,
-                        "note": "Recoverability = Average of Actual Recoverability for projects for logged work hours. ",
-                        "source": "CRM_API_RECOVERABILITY_REPORT"
-                    },
+                    "summary": summary,
                     "projects": normalised_rows,
                     "date_range": {"start": start_date, "end": end_date}
                 }, default=str)
@@ -1698,7 +1851,7 @@ async def get_project_recoverability_report(
             LEFT JOIN employees te ON tp.employee_id = te.id
             LEFT JOIN designation_rates dr ON te.emp_designation_id = dr.designation_id
             WHERE p.is_active = 1
-              AND p.created_at BETWEEN '{start_date}' AND '{end_date}'
+              AND p.created_at BETWEEN '{start_date} 00:00:00' AND '{end_date} 23:59:59'
               AND {ownership_sql}
               {customer_filter}
               {project_filter}
@@ -1711,28 +1864,18 @@ async def get_project_recoverability_report(
 
         rows = await _run_query(query)
 
-        # Compute actual recoverability for each row and aggregates
-        total_estimated_cost = 0.0
-        total_actual_cost = 0.0
-
         for r in rows:
             est_cost = float(r.get('estimated_cost') or 0)
             act_cost = float(r.get('total_actual_cost') or 0)
-            total_estimated_cost += est_cost
-            total_actual_cost += act_cost
             
             if act_cost > 0:
                 r['actual_recoverability'] = round((est_cost / act_cost) * 100, 3)
             else:
                 r['actual_recoverability'] = 0.0
 
-        valid_recoverabilities = [r['actual_recoverability'] for r in rows if r.get('actual_recoverability', 0) > 0]
-        if valid_recoverabilities:
-            total_actual_recoverability = round(sum(valid_recoverabilities) / len(valid_recoverabilities), 3)
-        else:
-            total_actual_recoverability = 0.0
+        summary = _resolve_summary_metrics(rows, rows, is_sql_fallback=True)
 
-        if len(rows) == 0:
+        if summary["total_projects"] == 0:
             return json.dumps({
                 "summary": {
                     "total_projects": 0,
@@ -1743,13 +1886,7 @@ async def get_project_recoverability_report(
             })
 
         return json.dumps({
-            "summary": {
-                "total_projects": len(rows),
-                "total_estimated_cost": round(total_estimated_cost, 2),
-                "total_actual_cost": round(total_actual_cost, 2),
-                "total_actual_recoverability_percentage": total_actual_recoverability,
-                "note": "Recoverability = Average of Actual Recoverability for projects with actual cost > 0 (SQL fallback)"
-            },
+            "summary": summary,
             "projects": rows,
             "date_range": {"start": start_date, "end": end_date}
         }, default=str)

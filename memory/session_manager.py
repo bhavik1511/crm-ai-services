@@ -15,6 +15,11 @@ from db.database_redis import get_redis
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+MAX_MESSAGES = 20  # Rolling message window per session
+
+# ---------------------------------------------------------------------------
 # TTL mapping by hierarchy level
 # ---------------------------------------------------------------------------
 _TTL_MAP = {
@@ -61,7 +66,6 @@ def _deserialize_doc(raw: str) -> dict:
 async def create_session(user_context: dict) -> str:
     """
     Create a new session for a user.
-    Invalidates any existing active sessions first (1 active per user).
 
     user_context must contain:
         user_id, employee_id, role, hierarchy_level,
@@ -69,11 +73,6 @@ async def create_session(user_context: dict) -> str:
     """
     user_id = user_context["user_id"]
     hierarchy_level = user_context.get("hierarchy_level", 4)
-
-    # Invalidate existing active sessions for this user
-    active_sessions = await get_active_sessions_for_user(user_id)
-    for old_sid in active_sessions:
-        await invalidate_session(old_sid)
 
     session_id = str(uuid.uuid4())
     ttl = await get_ttl_seconds(hierarchy_level)
@@ -92,6 +91,17 @@ async def create_session(user_context: dict) -> str:
         "last_active": now,
         "ttl_expires": now + timedelta(seconds=ttl),
         "is_expired": False,
+        # --- Executive Memory Context (Phase 3.1.10) ---
+        "executive_memory": {
+            "active_topic": None,
+            "active_reports": [],
+            "active_filters": {},
+            "active_entities": [],
+            "presentation_mode": None,
+            "comparison_baseline": None,
+            "discussion_focus": None,
+            "last_capability_ids": [],
+        },
     }
 
     # Write to MongoDB
@@ -120,10 +130,104 @@ async def create_session(user_context: dict) -> str:
     return session_id
 
 
-async def get_session(session_id: str) -> Optional[dict]:
+async def restore_session_from_history(
+    session_id: str,
+    user_id: Optional[int] = None,
+    user_context: Optional[dict] = None,
+) -> Optional[dict]:
+    """
+    Auto-restore and reactivate an expired or missing session from permanent MongoDB chat_history.
+    Reconstructs rolling message history and upserts into active sessions (MongoDB + Redis).
+    Enforces user_id matching if user_id is provided.
+    """
+    try:
+        from db.database_mongo import get_chat_history_collection
+        history_col = get_chat_history_collection()
+        query = {"session_id": session_id}
+        if user_id is not None:
+            query["user_id"] = user_id
+
+        cursor = history_col.find(query).sort("timestamp", 1)
+        history_entries = await cursor.to_list(length=500)
+
+        if not history_entries:
+            return None
+
+        messages = []
+        for entry in history_entries:
+            q = entry.get("question")
+            a = entry.get("answer")
+            ts = entry.get("timestamp")
+            if q:
+                messages.append({"role": "user", "content": q, "timestamp": ts})
+            if a:
+                messages.append({"role": "assistant", "content": a, "timestamp": ts})
+
+        if len(messages) > MAX_MESSAGES:
+            messages = messages[-MAX_MESSAGES:]
+
+        last_entry = history_entries[-1]
+        resolved_user_id = user_id if user_id is not None else last_entry.get("user_id", 0)
+        user_ctx = user_context or {}
+        hierarchy_level = user_ctx.get("hierarchy_level", 4)
+        ttl = await get_ttl_seconds(hierarchy_level)
+        now = datetime.utcnow()
+
+        session_doc = {
+            "_id": session_id,
+            "user_id": resolved_user_id,
+            "employee_id": user_ctx.get("employee_id", resolved_user_id),
+            "role": user_ctx.get("role", "Staff"),
+            "hierarchy_level": hierarchy_level,
+            "department_id": user_ctx.get("department_id"),
+            "service_line_id": user_ctx.get("service_line_id"),
+            "messages": messages,
+            "created_at": now,
+            "last_active": now,
+            "ttl_expires": now + timedelta(seconds=ttl),
+            "is_expired": False,
+            # --- Executive Memory Context (Phase 3.1.10) ---
+            "executive_memory": {
+                "active_topic": None,
+                "active_reports": [],
+                "active_filters": {},
+                "active_entities": [],
+                "presentation_mode": None,
+                "comparison_baseline": None,
+                "discussion_focus": None,
+                "last_capability_ids": [],
+            },
+        }
+
+        col = get_sessions_collection()
+        await col.replace_one({"_id": session_id}, session_doc, upsert=True)
+
+        try:
+            redis = get_redis()
+            await redis.setex(
+                f"session:{session_id}",
+                ttl,
+                _serialize_doc(session_doc),
+            )
+        except Exception as e:
+            logger.warning(f"[Session] Redis write during restore failed: {e}")
+
+        logger.info(f"[Session] Restored session {session_id} from chat history ({len(messages)} messages restored)")
+        return session_doc
+    except Exception as e:
+        logger.error(f"[Session] Failed to restore session {session_id} from history: {e}")
+        return None
+
+
+async def get_session(
+    session_id: str,
+    user_id: Optional[int] = None,
+    user_context: Optional[dict] = None,
+) -> Optional[dict]:
     """
     Retrieve a session. Checks Redis first, then MongoDB fallback.
-    Returns None if session is expired or not found.
+    If session is missing or expired, attempts auto-restoration from permanent chat_history.
+    Returns None if session cannot be retrieved or restored.
     """
     redis = get_redis()
 
@@ -132,11 +236,14 @@ async def get_session(session_id: str) -> Optional[dict]:
         cached = await redis.get(f"session:{session_id}")
         if cached:
             doc = _deserialize_doc(cached)
-            # Refresh TTL on access
-            hierarchy_level = doc.get("hierarchy_level", 4)
-            ttl = await get_ttl_seconds(hierarchy_level)
-            await redis.expire(f"session:{session_id}", ttl)
-            return doc
+            if user_id is not None and doc.get("user_id") != user_id:
+                logger.warning(f"[Session] User mismatch for session {session_id}")
+                return None
+            if not doc.get("is_expired", False):
+                hierarchy_level = doc.get("hierarchy_level", 4)
+                ttl = await get_ttl_seconds(hierarchy_level)
+                await redis.expire(f"session:{session_id}", ttl)
+                return doc
     except Exception as e:
         logger.warning(f"[Session] Redis read failed (falling back to Mongo): {e}")
 
@@ -149,9 +256,12 @@ async def get_session(session_id: str) -> Optional[dict]:
             "ttl_expires": {"$gt": datetime.utcnow()},
         })
         if doc:
-            # Re-warm Redis with remaining TTL
+            if user_id is not None and doc.get("user_id") != user_id:
+                logger.warning(f"[Session] User mismatch for session {session_id}")
+                return None
+
             remaining = (doc["ttl_expires"] - datetime.utcnow()).total_seconds()
-            remaining = max(int(remaining), 60)  # at least 60s
+            remaining = max(int(remaining), 60)
             try:
                 await redis.setex(
                     f"session:{session_id}",
@@ -164,7 +274,8 @@ async def get_session(session_id: str) -> Optional[dict]:
     except Exception as e:
         logger.error(f"[Session] MongoDB read failed: {e}")
 
-    return None
+    # --- Tier 3: Auto-restore from chat history ---
+    return await restore_session_from_history(session_id, user_id=user_id, user_context=user_context)
 
 
 async def append_message(
@@ -273,3 +384,237 @@ async def get_session_messages(session_id: str) -> list[dict]:
     if session:
         return session.get("messages", [])
     return []
+
+
+# ---------------------------------------------------------------------------
+# Clarification state management
+# ---------------------------------------------------------------------------
+async def save_clarification_state(session_id: str, clar_dto: dict) -> bool:
+    """Save clarification state DTO in Redis and MongoDB."""
+    try:
+        redis = get_redis()
+        await redis.setex(
+            f"clarification:{session_id}",
+            3600,  # 1 hour TTL for pending clarification
+            _serialize_doc(clar_dto)
+        )
+    except Exception as e:
+        logger.warning(f"[Session] Redis save clarification failed: {e}")
+
+    try:
+        col = get_sessions_collection()
+        await col.update_one(
+            {"_id": session_id},
+            {"$set": {"clarification_state": clar_dto}}
+        )
+        return True
+    except Exception as e:
+        logger.error(f"[Session] MongoDB save clarification failed: {e}")
+        return False
+
+
+async def get_clarification_state(session_id: str) -> Optional[dict]:
+    """Get clarification state DTO for session."""
+    try:
+        redis = get_redis()
+        cached = await redis.get(f"clarification:{session_id}")
+        if cached:
+            return _deserialize_doc(cached)
+    except Exception as e:
+        logger.warning(f"[Session] Redis get clarification failed: {e}")
+
+    try:
+        col = get_sessions_collection()
+        doc = await col.find_one({"_id": session_id})
+        if doc:
+            return doc.get("clarification_state")
+    except Exception as e:
+        logger.error(f"[Session] MongoDB get clarification failed: {e}")
+    return None
+
+
+async def clear_clarification_state(session_id: str) -> bool:
+    """Clear clarification state DTO for session."""
+    try:
+        redis = get_redis()
+        await redis.delete(f"clarification:{session_id}")
+    except Exception as e:
+        logger.warning(f"[Session] Redis clear clarification failed: {e}")
+
+    try:
+        col = get_sessions_collection()
+        await col.update_one(
+            {"_id": session_id},
+            {"$unset": {"clarification_state": ""}}
+        )
+        return True
+    except Exception as e:
+        logger.error(f"[Session] MongoDB clear clarification failed: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Entity-Aware Cache Functions
+# ---------------------------------------------------------------------------
+def build_entity_cache_key(
+    user_id: int,
+    capability: str,
+    resolved_entities: list = None,
+    financial_year: str = "",
+    filters: dict = None
+) -> str:
+    """
+    Build a deterministic cache key for entity-aware queries based on:
+    user_id, capability, resolved entities, financial_year, and extra filters.
+    """
+    import hashlib
+    ent_parts = []
+    for ent in (resolved_entities or []):
+        if isinstance(ent, dict):
+            e_type = str(ent.get("entity_type") or ent.get("type") or "").lower()
+            e_id = str(ent.get("entity_id") or ent.get("id") or ent.get("value") or "").lower()
+            ent_parts.append(f"{e_type}:{e_id}")
+    ent_str = "|".join(sorted(ent_parts))
+
+    filter_parts = []
+    if filters and isinstance(filters, dict):
+        for k, v in sorted(filters.items()):
+            if v and k not in ("raw_tool_results", "previous_execution_plan"):
+                filter_parts.append(f"{k}:{v}")
+    filter_str = "|".join(filter_parts)
+
+    raw_key = f"u:{user_id}|cap:{capability}|fy:{financial_year}|ent:{ent_str}|flt:{filter_str}"
+    digest = hashlib.md5(raw_key.encode("utf-8")).hexdigest()
+    return f"entity_cache:{digest}"
+
+
+async def get_entity_cache(cache_key: str) -> Optional[dict]:
+    """Retrieve cached response from Redis for an entity-aware query."""
+    try:
+        redis = get_redis()
+        cached = await redis.get(cache_key)
+        if cached:
+            doc = _deserialize_doc(cached)
+            if isinstance(doc, dict):
+                content = str(doc.get("content", "")).lower()
+                if any(phrase in content for phrase in [
+                    "currently unavailable", "please try again later", "failed", 
+                    "does not include", "not available", "customer-specific"
+                ]):
+                    logger.info(f"[EntityCache] Ignoring stale error/incomplete cached response for key={cache_key}")
+                    return None
+                if "recoverability" in cache_key and not any(p in content for p in ["actual recoverability", "portfolio recoverability", "recoverability percentage"]):
+                    logger.info(f"[EntityCache] Ignoring stale cached response missing recoverability percentage for key={cache_key}")
+                    return None
+            return doc
+    except Exception as e:
+        logger.warning(f"[EntityCache] Redis read failed for key={cache_key}: {e}")
+    return None
+
+
+async def set_entity_cache(cache_key: str, response: dict, ttl_seconds: int = 1800) -> bool:
+    """Store query response in Redis entity cache (default 30 min TTL)."""
+    if not response or not isinstance(response, dict):
+        return False
+    content = str(response.get("content", "")).lower()
+    if "currently unavailable" in content or "please try again later" in content:
+        logger.info(f"[EntityCache] Skipping caching of error/unavailable response for key={cache_key}")
+        return False
+    try:
+        redis = get_redis()
+        await redis.setex(
+            cache_key,
+            ttl_seconds,
+            _serialize_doc(response)
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"[EntityCache] Redis write failed for key={cache_key}: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Executive Memory Helpers (Phase 3.1.10)
+# ---------------------------------------------------------------------------
+
+async def get_session_memory(session_id: str) -> dict:
+    """
+    Returns the executive_memory dict from the active session.
+    Used by the Planner to inherit active filters/entities for follow-up queries.
+    Returns an empty dict if session or memory is unavailable.
+    """
+    session = await get_session(session_id)
+    if session and isinstance(session.get("executive_memory"), dict):
+        return session["executive_memory"]
+    return {}
+
+
+async def update_session_memory(
+    session_id: str,
+    execution_plan: dict,
+    tool_results: list = None,
+) -> bool:
+    """
+    Persists business context from the current turn into executive_memory.
+    The Planner reads this on the next turn to auto-inherit filters/entities
+    for follow-up queries like 'only Audit', 'compare with last year', 'why'.
+    """
+    if not execution_plan or not isinstance(execution_plan, dict):
+        return False
+
+    caps = execution_plan.get("business_capabilities", [])
+    cap_ids = [c.get("id") for c in caps if c.get("id")]
+
+    merged_filters: dict = {}
+    PERSISTENT_KEYS = {"financial_year", "service_line", "department", "office"}
+    for cap in caps:
+        ctx = cap.get("context") or {}
+        for k, v in ctx.items():
+            if v and k in PERSISTENT_KEYS:
+                merged_filters[k] = v
+
+    for filter_key in PERSISTENT_KEYS:
+        val = execution_plan.get(filter_key)
+        if val:
+            merged_filters[filter_key] = val
+
+    new_memory = {
+        "active_topic": execution_plan.get("business_goal") or None,
+        "active_reports": cap_ids,
+        "active_filters": merged_filters,
+        "active_entities": execution_plan.get("resolved_entities", []),
+        "presentation_mode": execution_plan.get("presentation_mode"),
+        "comparison_baseline": execution_plan.get("comparison"),
+        "last_capability_ids": cap_ids,
+        "discussion_focus": None,
+    }
+
+    try:
+        col = get_sessions_collection()
+        await col.update_one(
+            {"_id": session_id},
+            {"$set": {"executive_memory": new_memory}}
+        )
+    except Exception as e:
+        logger.error(f"[ExecutiveMemory] MongoDB update failed: {e}")
+        return False
+
+    try:
+        session = await get_session(session_id)
+        if session:
+            session["executive_memory"] = new_memory
+            redis = get_redis()
+            hierarchy_level = session.get("hierarchy_level", 4)
+            ttl = await get_ttl_seconds(hierarchy_level)
+            await redis.setex(f"session:{session_id}", ttl, _serialize_doc(session))
+    except Exception as e:
+        logger.warning(f"[ExecutiveMemory] Redis update failed (non-fatal): {e}")
+
+    logger.info(
+        f"[ExecutiveMemory] Updated session {session_id}: "
+        f"caps={cap_ids}, filters={list(merged_filters.keys())}"
+    )
+    return True
+
+
+

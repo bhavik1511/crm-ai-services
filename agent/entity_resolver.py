@@ -221,11 +221,17 @@ def parse_scope_time_filter(time_str: str) -> Dict[str, str]:
             res["end_date"] = f"{base_y2}-09-30 23:59:59"
 
     # 3. Single Month or Month Range Matcher
-    m_between = re.search(r'between\s+([a-z]+)\s+and\s+([a-z]+)(?:\s+(\d{4}))?', ts)
+    curr_year = datetime.now().year
+    m_between = re.search(r'between\s+([a-z]+)\s+and\s+([a-z]+)(?:\s+([0-9]{2,4}))?', ts)
     if m_between:
         m1_name = m_between.group(1)
         m2_name = m_between.group(2)
-        year_val = int(m_between.group(3)) if m_between.group(3) else 2025
+        raw_y = m_between.group(3)
+        if raw_y:
+            y_num = int(raw_y)
+            year_val = 2000 + y_num if y_num < 100 else y_num
+        else:
+            year_val = curr_year
         if m1_name in MONTH_NAMES and m2_name in MONTH_NAMES:
             m1_num = MONTH_NAMES[m1_name]
             m2_num = MONTH_NAMES[m2_name]
@@ -233,10 +239,15 @@ def parse_scope_time_filter(time_str: str) -> Dict[str, str]:
             res["start_date"] = f"{year_val}-{m1_num:02d}-01"
             res["end_date"] = f"{year_val}-{m2_num:02d}-{last_day:02d} 23:59:59"
     else:
-        m_single = re.search(r'\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b(?:\s+(\d{4}))?', ts)
+        m_single = re.search(r'\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b(?:\s+([0-9]{2,4}))?', ts)
         if m_single:
             m_name = m_single.group(1)
-            year_val = int(m_single.group(2)) if m_single.group(2) else 2025
+            raw_y = m_single.group(2)
+            if raw_y:
+                y_num = int(raw_y)
+                year_val = 2000 + y_num if y_num < 100 else y_num
+            else:
+                year_val = curr_year
             m_num = MONTH_NAMES[m_name]
             last_day = calendar.monthrange(year_val, m_num)[1]
             res["start_date"] = f"{year_val}-{m_num:02d}-01"
@@ -330,11 +341,22 @@ EMPLOYEE_TRIGGERS = {
 }
 
 def has_employee_trigger(query: str) -> bool:
-    """Check if the user query explicitly contains an employee trigger phrase."""
+    """Check if the user query explicitly contains an employee trigger phrase or matches an active employee name."""
     if not query:
         return False
     q_lower = query.lower()
-    return any(trigger in q_lower for trigger in EMPLOYEE_TRIGGERS)
+    if any(trigger in q_lower for trigger in EMPLOYEE_TRIGGERS):
+        return True
+    # Check if query contains "for <name>", "of <name>", or "by <name>" matching an active employee
+    m = re.search(r'\b(?:for|of|by)\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)*)\b', query, re.IGNORECASE)
+    if m:
+        try:
+            from agent.query_parser import _lookup_employee_by_name
+            if _lookup_employee_by_name(m.group(1)):
+                return True
+        except Exception:
+            pass
+    return False
 
 async def resolve_entities(extracted_entities: List[Dict[str, str]], jwt_token: str, full_query: str = "") -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
@@ -682,23 +704,49 @@ async def _resolve_single_entity(e_type: str, e_value: str, jwt_token: str) -> D
 
 def extract_entities_from_text(query: str) -> List[Dict[str, str]]:
     """
-    Dynamically extracts candidate entity references (customer name, project code, FY) from prompt text.
+    Dynamically extracts candidate entity references (customer name, project code, employee, FY) from prompt text.
     Delegates entity validation and resolution to backend API matching.
     """
     if not query or not isinstance(query, str):
         return []
 
     entities = []
-    # 1. Customer reference pattern (e.g., 'for Grove Resort', 'customer Grove Resort')
-    cust_match = re.search(r'(?:for|customer)\s+([A-Za-z0-9\s\.\-_&]+)', query, re.IGNORECASE)
+    
+    # 0. Explicit Employee reference pattern (e.g. 'employee Shashank', 'staff John', 'kpi report for Shashank Arya')
+    emp_match = re.search(r'(?:employee|staff|consultant|partner|manager|person|resource|by)\s+([A-Za-z0-9\s\.\-_&]+)', query, re.IGNORECASE)
+    if emp_match:
+        val = emp_match.group(1).strip()
+        val = re.sub(r'\s+(?:in|for|fy\d+|20\d{2}|what|how|show|get|run|status|got\s+it|please|download|give|button|thanks|ok|okay).*', '', val, flags=re.IGNORECASE).strip()
+        val = re.sub(r'[^a-zA-Z0-9\s]', '', val).strip()
+        if val and len(val) > 1 and val.lower() not in ["customer", "projects", "proposals", "revenue", "receivables", "all", "the"]:
+            entities.append({"type": "employee", "value": val})
+
+    # 1. Customer/Project/Person 'for <name>' reference pattern
+    cust_match = re.search(r'(?:for|customer|project)\s+([A-Za-z0-9\s\.\-_&]+)', query, re.IGNORECASE)
     if cust_match:
         val = cust_match.group(1).strip()
-        val = re.sub(r'\s+(?:in|for|fy\d+|20\d{2}).*', '', val, flags=re.IGNORECASE).strip()
-        if val and len(val) > 1 and val.lower() not in ["customer", "projects", "proposals", "revenue", "receivables", "all", "the"]:
-            entities.append({"type": "customer", "value": val})
+        val = re.sub(r'\s+(?:in|for|fy\d+|20\d{2}|what|how|show|get|run|status|got\s+it|please|download|give|button|thanks|ok|okay).*', '', val, flags=re.IGNORECASE).strip()
+        clean_val = re.sub(r'[^a-zA-Z0-9\s]', '', val).strip()
+        if clean_val and len(clean_val) > 1 and clean_val.lower() not in ["customer", "projects", "proposals", "revenue", "receivables", "all", "the"]:
+            val = clean_val
+            # If 2 words with no company suffixes, candidate could be an employee or customer
+            biz_suffixes = ["ltd", "inc", "corp", "solutions", "group", "holdings", "services", "audit", "tax", "advisory", "co", "llc", "wll", "w.l.l"]
+            is_company = any(s in val.lower() for s in biz_suffixes)
+            words = val.split()
+            if not is_company and len(words) == 2 and not any(e["value"].lower() == val.lower() for e in entities if e["type"] == "employee"):
+                entities.append({"type": "employee", "value": val})
+            elif not any(e["value"].lower() == val.lower() for e in entities if e["type"] == "customer"):
+                entities.append({"type": "customer", "value": val})
 
-    # 2. Financial Year pattern (e.g. FY25, FY24)
-    fy_match = re.search(r'(FY\d{2}|FY\d{4}|20\d{2})', query, re.IGNORECASE)
+    # 2. Prompt Prefix Entity Pattern (e.g. "DOO Technology Solutions - Audit 2025 what is the status of tis project")
+    prefix_match = re.search(r'^([A-Za-z0-9\s\.\-_&]+?)(?:\s*(?:what|how|show|get|run|status|is the|which|where|\?))', query, re.IGNORECASE)
+    if prefix_match:
+        val = prefix_match.group(1).strip()
+        if val and len(val) >= 3 and val.lower() not in ["customer", "projects", "proposals", "revenue", "receivables", "all", "the", "show", "get", "what"]:
+            entities.append({"type": "project", "value": val})
+
+    # 3. Financial Year pattern (e.g. FY25, FY24)
+    fy_match = re.search(r'\b(FY\d{2}|FY\d{4}|20\d{2})\b', query, re.IGNORECASE)
     if fy_match:
         entities.append({"type": "financial_year", "value": fy_match.group(1)})
 

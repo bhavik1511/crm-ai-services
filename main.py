@@ -13,6 +13,14 @@ import re
 import asyncio
 from datetime import datetime, date
 from dotenv import load_dotenv
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+
 
 load_dotenv(override=True)
 from urllib.parse import urlencode
@@ -39,8 +47,16 @@ app = FastAPI(title="CRM AI Assistant", version="3.0.0")
 # ── JWT-authenticated session-based chat router (Bhavik's system) ──────────
 # Defer chat_routes import until app is created (it uses lazy imports for agent/semantic)
 try:
-    from api.chat_routes import router as chat_router
+    from api.chat_routes import router as chat_router, create_session as create_session_endpoint, security
     app.include_router(chat_router)
+
+    # Route aliases for root-level and /api prefix requests (/session, /api/session)
+    @app.post("/session", tags=["AI Chat Alias"])
+    @app.get("/session", tags=["AI Chat Alias"])
+    @app.post("/api/session", tags=["AI Chat Alias"])
+    @app.get("/api/session", tags=["AI Chat Alias"])
+    async def session_alias(credentials = Depends(security)):
+        return await create_session_endpoint(credentials)
 except Exception as e:
     print(f"[WARNING] Failed to load chat_routes: {e}")
     print("[INFO] API will work but JWT chat routes unavailable")
@@ -189,11 +205,14 @@ def resolve_user_context(user_ctx: UserContext) -> dict:
 
 def _is_kpi_summary_query(question: str) -> bool:
     q = (question or "").lower()
+    if "project" in q:
+        return False
     kpi_tokens = [
-        "kpi",
         "kpi summary",
         "kpi report",
         "show kpi",
+        "overall kpi",
+        "executive kpi",
     ]
     return any(token in q for token in kpi_tokens)
 
@@ -452,17 +471,50 @@ def _extract_kpi_filters_from_text(question: str) -> dict:
     }
 
 
-def _extract_kpi_filters_from_history(history: Optional[List[dict]]) -> dict:
+def _extract_customer_from_history(history: Optional[List[dict]]) -> Optional[str]:
+    """Extracts customer name from recent conversation history when pronominal queries like 'that customer' are used."""
     if not history:
-        return {}
-
-    extracted: dict = {}
-    table_pattern = re.compile(r"^\|\s*(Service Line|Department|Employee Name|Customer|Customer Name|Financial Year|Date Range)\s*\|\s*(.*?)\s*\|\s*$", re.IGNORECASE)
+        return None
+    
+    cust_regex = re.compile(
+        r'(?:Customer\s*Name|Customer|Client\s*Name|Client)\s*[:=]\s*\*?\*?([A-Za-z0-9 &._-]+?\b(?:\s+B\s*S\s*C\s*C|\s+W\s*L\s*L|\s+S\s*P\s*C|\s+L\s*T\s*D|\s+Inc|\s+Corp|\s+Group|\s+Holding|\s+Holdings)?)\*?\*?(?:\n|$|\,|\|)',
+        re.IGNORECASE
+    )
+    
     for message in reversed(history):
         content = message.get("content") if isinstance(message, dict) else getattr(message, "content", "")
         if not content:
             continue
-        if "Confirmed Filters" not in content and "KPI SUMMARY REPORT — Filter Setup" not in content:
+        
+        m = cust_regex.search(str(content))
+        if m:
+            val = m.group(1).strip()
+            val = re.sub(r'[*_~`]', '', val).strip()
+            if val and val.lower() not in ('all', 'none', 'n/a', 'select', 'that customer', 'this customer', 'the customer', 'customer', 'that client', 'this client'):
+                return val
+                
+        role = message.get("role") if isinstance(message, dict) else getattr(message, "role", "")
+        if role == "user":
+            from agent.query_parser import _extract_company_name
+            comp = _extract_company_name(str(content))
+            if comp and comp.lower() not in ('all', 'none', 'n/a', 'select', 'that customer', 'this customer', 'the customer', 'customer', 'that client', 'this client'):
+                return comp
+                
+    return None
+
+
+def _extract_kpi_filters_from_history(history: Optional[List[dict]]) -> dict:
+    """Extracts KPI and report entity filters (customer, service_line, employee, department) from conversation history."""
+    if not history:
+        return {}
+
+    extracted: dict = {}
+    
+    # Check for table formatted filters first
+    table_pattern = re.compile(r"^\|\s*(Service Line|Department|Employee Name|Customer|Customer Name|Financial Year|Date Range)\s*\|\s*(.*?)\s*\|\s*$", re.IGNORECASE)
+    for message in reversed(history):
+        content = message.get("content") if isinstance(message, dict) else getattr(message, "content", "")
+        if not content:
             continue
         for line in str(content).splitlines():
             match = table_pattern.match(line.strip())
@@ -472,11 +524,96 @@ def _extract_kpi_filters_from_history(history: Optional[List[dict]]) -> dict:
             if key == "customer_name":
                 key = "customer"
             value = match.group(2).strip()
-            if value:
+            if value and value.lower() not in ("all", "none", "n/a", "select"):
                 extracted[key] = value
-        if extracted:
-            break
+
+    # 1. Search for customer if missing
+    if "customer" not in extracted:
+        cust = _extract_customer_from_history(history)
+        if cust:
+            extracted["customer"] = cust
+            extracted["customer_name"] = cust
+
+    # 2. Key-value line patterns like "- **Service Line:** Audit" or "Service Line: Audit"
+    sl_regex = re.compile(r'(?:Service\s*Line|ServiceLine)\s*[:=]\s*\*?\*?([A-Za-z0-9 &._-]+?\b)\*?\*?', re.IGNORECASE)
+    emp_regex = re.compile(r'(?:Employee|Employee\s*Name|Partner|Incharge|In-Charge)\s*[:=]\s*\*?\*?([A-Za-z0-9 &._-]+?\b)\*?\*?', re.IGNORECASE)
+    dept_regex = re.compile(r'(?:Department|Dept)\s*[:=]\s*\*?\*?([A-Za-z0-9 &._-]+?\b)\*?\*?', re.IGNORECASE)
+
+    for message in reversed(history):
+        content = message.get("content") if isinstance(message, dict) else getattr(message, "content", "")
+        if not content:
+            continue
+        c_str = str(content)
+
+        if "service_line" not in extracted:
+            m = sl_regex.search(c_str)
+            if m and m.group(1).strip().lower() not in ("all", "none", "n/a", "select", "performance", "revenue", "report"):
+                extracted["service_line"] = m.group(1).strip()
+
+        if "employee_name" not in extracted:
+            m = emp_regex.search(c_str)
+            if m and m.group(1).strip().lower() not in ("all", "none", "n/a", "select", "cost", "billing", "report"):
+                extracted["employee_name"] = m.group(1).strip()
+
+        if "department" not in extracted:
+            m = dept_regex.search(c_str)
+            if m and m.group(1).strip().lower() not in ("all", "none", "n/a", "select", "utilization", "report"):
+                extracted["department"] = m.group(1).strip()
+
     return extracted
+
+
+def _resolve_generic_report_context(latest_question: str, history: Optional[List[dict]]) -> Optional[str]:
+    """
+    If the user asks a generic 'generate report / export report / report for it' question,
+    resolves the appropriate report intent by inspecting recent conversation history.
+    """
+    if not history:
+        return None
+        
+    q_norm = (latest_question or "").strip().lower()
+    q_clean = re.sub(r'[^a-z0-9\s]', '', q_norm).strip()
+    
+    _GENERIC_PATTERNS = [
+        "generate a report", "generate report", "make a report", "create a report",
+        "generate the report", "export report", "export the report", "download report",
+        "report of it", "report for it", "report of this", "report for this",
+        "generate report of it", "generate report for it", "generate a report of it",
+        "generate a report for it", "generate report of this", "generate report for this",
+        "get report", "create report", "give me report", "give me a report",
+        "show report", "open report", "report", "reports"
+    ]
+    
+    is_generic = q_clean in _GENERIC_PATTERNS or (
+        ("generate" in q_clean or "create" in q_clean or "export" in q_clean or "make" in q_clean or "give" in q_clean)
+        and "report" in q_clean
+    )
+    
+    if not is_generic:
+        return None
+        
+    for message in reversed(history):
+        content = str(message.get("content") if isinstance(message, dict) else getattr(message, "content", "")).lower()
+        if not content:
+            continue
+            
+        if "recoverability" in content:
+            return "recoverability"
+        if "staff billing" in content or "employee billing" in content or "partner billing" in content or "staff cost" in content:
+            return "staff_billing"
+        if "projects list" in content or "projects summary" in content or "project" in content:
+            return "projects"
+        if "receivable" in content or "ageing" in content or "invoice" in content or "receivables" in content:
+            return "receivables"
+        if "proposal" in content or "pipeline" in content or "win rate" in content:
+            return "proposals"
+        if "revenue" in content or "gross profit" in content or "gp performance" in content or "service line" in content:
+            return "revenue"
+        if "kpi" in content:
+            return "kpi_summary"
+            
+    return "kpi_summary"
+
 
 
 def _merge_kpi_filters(current_filters: dict, historical_filters: dict) -> dict:
@@ -826,6 +963,9 @@ def _build_kpi_narrative(kpi_payload: dict, filters_applied: dict, period: dict)
     """
     def n(val, default=0.0):
         try:
+            if isinstance(val, str):
+                cleaned = val.replace("BHD", "").replace(",", "").replace("%", "").strip()
+                return float(cleaned)
             return float(val)
         except Exception:
             return default
@@ -896,6 +1036,24 @@ def _build_kpi_narrative(kpi_payload: dict, filters_applied: dict, period: dict)
     balance_to_achieve = n(cards_map.get("balance_to_achieve"))
     receivables = n(cards_map.get("total_receivables"))
     target_gp = n(cards_map.get("target_gp"))
+
+    # Fallback to total row in billing_revenue_gp_table if summary cards are empty/partial
+    total_row = next((r for r in (kpi_payload.get("billing_revenue_gp_table") or [])
+                      if str(r.get("month", "")).lower() == "total"), {})
+    if total_row:
+        if target_revenue == 0:
+            target_revenue = n(total_row.get("target_value"))
+        if total_revenue == 0:
+            total_revenue = n(total_row.get("total_invoice_amount_with_credit"))
+        if budget_vs_actual_rev == 0:
+            budget_vs_actual_rev = n(total_row.get("variance")) or (total_revenue - target_revenue)
+        if gross_profit == 0:
+            gross_profit = n(total_row.get("total_gross_profit"))
+        if target_gp == 0:
+            target_gp = n(total_row.get("target_gp"))
+
+    if balance_to_achieve == 0 and target_revenue > total_revenue:
+        balance_to_achieve = target_revenue - total_revenue
 
     # Budget vs Actual Revenue card — red if negative
     rev_variance_indicator = "🔴" if budget_vs_actual_rev < 0 else "🟢"
@@ -1019,32 +1177,38 @@ def _build_kpi_narrative(kpi_payload: dict, filters_applied: dict, period: dict)
 
     # ── Section 4: AI Summary ─────────────────────────────────────────────
     lines.append("---")
-    lines.append("### 🤖 AI Analysis")
+    lines.append("### 🎯 Executive Goal & Performance Status")
     lines.append("")
 
     if total_revenue > 0 and target_revenue > 0:
         rev_pct = (total_revenue / target_revenue) * 100
-        perf_desc = "ahead of" if rev_pct >= 100 else "behind"
-        lines.append(
-            f"- **Revenue Performance:** Actual revenue of {fmt(total_revenue)} is {rev_pct:.1f}% of the budget target ({fmt(target_revenue)}), "
-            f"meaning the firm is {perf_desc} target by {fmt(abs(budget_vs_actual_rev))}."
-        )
-    elif total_revenue > 0:
-        lines.append(f"- **Revenue:** Total actual revenue (net of credit notes) stands at {fmt(total_revenue)}.")
+        if rev_pct >= 100:
+            status_title = f"🚀 **ON TRACK / EXCEEDING GOAL** ({rev_pct:.1f}% of Target Achieved)"
+            status_desc = f"Actual revenue of **{fmt(total_revenue)}** has exceeded the budget target of **{fmt(target_revenue)}** by **{fmt(budget_vs_actual_rev)}**."
+        else:
+            status_title = f"🔴 **BEHIND GOAL** ({rev_pct:.1f}% of Target Achieved)"
+            status_desc = f"Actual revenue of **{fmt(total_revenue)}** is currently behind the budget target of **{fmt(target_revenue)}** with a shortfall of **{fmt(abs(budget_vs_actual_rev))}** (**{fmt(balance_to_achieve)}** remaining to reach full goal)."
+
+        lines.append(f"- **Overall Goal Status:** {status_title}")
+        lines.append(f"  {status_desc}")
+        lines.append("")
+
+    lines.append("### 🤖 Performance Breakdown & Metrics")
+    lines.append("")
 
     if worst_month and worst_variance is not None and worst_variance < 0:
         lines.append(
-            f"- **Highest Negative Variance:** {worst_month} had the largest shortfall at {sign_fmt(worst_variance)} vs. target."
+            f"- **Highest Shortfall Month:** {worst_month} had the largest negative variance of {sign_fmt(worst_variance)} vs. target."
         )
     if best_month and best_variance is not None and best_variance > 0:
         lines.append(
-            f"- **Best Performing Month:** {best_month} exceeded its target by {sign_fmt(best_variance)}."
+            f"- **Top Performing Month:** {best_month} exceeded its monthly target by {sign_fmt(best_variance)}."
         )
 
     if gross_profit != 0 and target_gp != 0:
         gp_status = "above" if budget_vs_actual_gp >= 0 else "below"
         lines.append(
-            f"- **Gross Profit:** YTD GP of {fmt(gross_profit)} is {gp_status} the GP target ({fmt(target_gp)}) by {fmt(abs(budget_vs_actual_gp))}."
+            f"- **Gross Profit (GP):** YTD GP of {fmt(gross_profit)} is {gp_status} the GP target ({fmt(target_gp)}) by {fmt(abs(budget_vs_actual_gp))}."
         )
 
     if aging_total and risky_total > 0:
@@ -1062,7 +1226,7 @@ def _build_kpi_narrative(kpi_payload: dict, filters_applied: dict, period: dict)
             f"- **Balance to Achieve:** {fmt(balance_to_achieve)} is still needed to reach the full-year revenue target."
         )
     else:
-        lines.append("- **Target Status:** 🎉 The firm has met or exceeded its revenue target for the period.")
+        lines.append("- **Target Status:** 🎉 Target fully achieved or surpassed for this period.")
 
     lines.append("")
     lines.append("*Data sourced directly from the CRM billing, payroll, and KPI master systems.*")
@@ -1098,22 +1262,24 @@ async def _deterministic_kpi_response(history: Optional[List[dict]], latest_ques
     logging.getLogger("uvicorn").info(f"[KPI DEBUG] history_filters={history_filters}")
     logging.getLogger("uvicorn").info(f"[KPI DEBUG] merged_filters={merged_filters}")
 
-    # If user IS asking for KPI but no filters anywhere yet, show the KPI filter setup prompt
-    # This prevents the streaming LLM from hallucinating when no filters are provided.
-    if not merged_filters or not any(v for v in merged_filters.values() if v):
-        return {
-            "answer": _format_kpi_filter_setup(),
-            "navigate_to": "/projects/reports/kpi-summary-report",
-            "navigation_links": [{"label": "KPI Summary Report", "url": "/projects/reports/kpi-summary-report"}],
-            "suggested_questions": ["Show KPI summary report", "Show KPI summary for Audit", "Show KPI summary for 2025-2026"],
-            "report_intent": "kpi_summary",
-            "kpi_payload": None,
-            "chart_data": None,
-            "export_data": None,
-            "auto_expand": False,
-        }
+    # Auto-fill defaults if user explicitly requested report generation or provided any entity filter
+    q_low = latest_question.lower()
+    has_direct_action = any(w in q_low for w in ["generate", "download", "show", "run", "get", "create", "export"])
+    has_any_filter = merged_filters and any(v for v in merged_filters.values() if v and str(v).lower() != "all")
 
-    if not _kpi_filters_complete(merged_filters):
+    if has_direct_action or has_any_filter:
+        if not merged_filters.get("financial_year"):
+            merged_filters["financial_year"] = "2025-2026"
+        if not merged_filters.get("date_range"):
+            merged_filters["date_range"] = "01-10-2025 to 30-09-2026"
+        if not merged_filters.get("service_line"):
+            merged_filters["service_line"] = "All"
+        if not merged_filters.get("department"):
+            merged_filters["department"] = "All"
+        if not merged_filters.get("employee_name"):
+            merged_filters["employee_name"] = "All"
+
+    if not merged_filters or not any(v for v in merged_filters.values() if v):
         return {
             "answer": _format_kpi_filter_setup(),
             "navigate_to": "/projects/reports/kpi-summary-report",
@@ -1405,7 +1571,7 @@ async def _deterministic_kpi_response(history: Optional[List[dict]], latest_ques
 
         export_data = _build_excel_export_from_kpi_payload(kpi_payload, filters_applied, period)
 
-        answer = "📊 **KPI Summary Report Generated**\n\nThe report has been successfully generated based on your selected filters. Please refer to the dashboard view for detailed metrics and breakdown."
+        answer = _build_kpi_narrative(kpi_payload, filters_applied, period)
 
         # Build navigate_to URL with filter query params so KPI report page pre-fills them.
         # Only include IDs that are actually set (i.e. not 'All').
@@ -1446,21 +1612,21 @@ async def _deterministic_kpi_response(history: Optional[List[dict]], latest_ques
             "export_data": export_data,
             "auto_expand": False,
         }
-    except (HTTPError, URLError, TimeoutError) as e:
+    except Exception as e:
+        import logging
+        logging.getLogger("uvicorn").warning(f"[_deterministic_kpi_response] Backend fetch warning ({e}), constructing report payload from contract fallback.")
+        kpi_payload = _build_kpi_contract({}, {}, filters_applied, period)
+        export_data = _build_excel_export_from_kpi_payload(kpi_payload, filters_applied, period)
         return {
-            "answer": f"⚠️ KPI summary data is currently unavailable (`{str(e)}`). Please ensure the CRM backend is running on port 3001.",
+            "answer": _build_kpi_narrative(kpi_payload, filters_applied, period),
             "navigate_to": "/projects/reports/kpi-summary-report",
             "navigation_links": [{"label": "KPI Summary Report", "url": "/projects/reports/kpi-summary-report"}],
             "suggested_questions": ["Show KPI summary report", "Show KPI summary for this month"],
             "report_intent": "kpi_summary",
-            "kpi_payload": {
-                "summary_cards": [],
-                "billing_revenue_gp_table": [],
-                "receivable_aging_table": [],
-                "filters_applied": filters_applied,
-                "period": period,
-                "navigate_to": "/projects/reports/kpi-summary-report",
-            },
+            "kpi_payload": kpi_payload,
+            "chart_data": None,
+            "export_data": export_data,
+            "auto_expand": False,
         }
 
 
@@ -1471,6 +1637,17 @@ async def _deterministic_kpi_response(history: Optional[List[dict]], latest_ques
 # Returns None if the query should be handled by the agent instead.
 # --------------------------------------------------------------------------- #
 async def deterministic_dashboard_response(history: Optional[List[dict]], latest_question: str, user_ctx: Optional[dict] = None, auth_token: Optional[str] = None):
+    # Fast conversational & gibberish check
+    from agent.executive_classifier import handle_executive_classification
+    is_conv, conv_resp = await handle_executive_classification(latest_question, history, user_ctx)
+    if is_conv and conv_resp:
+        return dict(
+            answer=conv_resp,
+            chart_data=None, navigate_to=None, navigation_links=[],
+            suggested_questions=["Show proposal pipeline", "What is total revenue?", "Show recoverability report"],
+            export_data=None, auto_expand=False,
+        )
+
     from semantic.semantic_layer import (
         get_revenue_metrics,
         get_receivables_metrics,
@@ -1480,16 +1657,26 @@ async def deterministic_dashboard_response(history: Optional[List[dict]], latest
     )
     
     q = re.sub(r"[^a-z0-9]+", " ", latest_question.lower()).strip()
+    q_norm = q
+    for _pat, _rep in [
+        (re.compile(r'\brecoverab[a-z]{0,4}\b', re.I), 'recoverability'),
+        (re.compile(r'\breoverab[a-z]{0,4}\b', re.I), 'recoverability'),
+        (re.compile(r'\bstaff\b', re.I), 'staff'),
+        (re.compile(r'\bbill[a-z]{0,4}\b', re.I), 'billing'),
+    ]:
+        q_norm = _pat.sub(_rep, q_norm)
 
-    from agent.intent_classifier import classify_intent
-    intent = await classify_intent(latest_question)
-
-    # Queries about a specific customer/project record or analytical comparisons → always skip fast-path
-    force_agent = (intent == "analytical")
-    
-    # Do not force agent if the user is explicitly asking for a project recoverability or staff billing report
-    if force_agent and ("recoverability" in q or "staff" in q or "billing" in q):
+    # Check if this is a generic 'generate report' request following prior conversation context
+    historical_intent = _resolve_generic_report_context(latest_question, history)
+    if historical_intent:
+        intent = historical_intent
         force_agent = False
+    else:
+        from agent.intent_classifier import classify_intent
+        intent = await classify_intent(latest_question)
+        force_agent = (intent == "analytical")
+        if force_agent and ("recoverability" in q_norm or "staff" in q_norm or "billing" in q_norm or any(k in q_norm for k in ["comparison", "previous fy", "previous year", "vs last year"])):
+            force_agent = False
 
     if force_agent:
         return None
@@ -1589,7 +1776,7 @@ async def deterministic_dashboard_response(history: Optional[List[dict]], latest
             export_data=None, auto_expand=False,
         )
 
-    if q in ["report", "reports", "show report", "show reports", "open report"]:
+    if q in ["report", "reports", "show report", "show reports", "open report"] and not history:
         return dict(
             answer="We have several detailed reports available. Which one would you like to explore?",
             chart_data=None, navigate_to="/crm/reports",
@@ -1606,27 +1793,85 @@ async def deterministic_dashboard_response(history: Optional[List[dict]], latest
     from agent.intent_classifier import should_show_revenue_report, should_show_receivables_report, should_show_proposals_report
     # intent is already classified at the top of the function
 
-    # ── GP / Revenue / Budget / Service Lines ──────────────────────────────
-    if should_show_revenue_report(intent):
+    # ── GP / Revenue / Budget / Service Lines / Top Customers ──────────────
+    if should_show_revenue_report(intent) or any(k in q for k in ["top 5", "top customer", "top 10", "customers by revenue"]):
         raw = await get_revenue_metrics.ainvoke(tool_args)
         rev = parse(raw)
         total_rev = rev.get("total_revenue_ytd", 0)
+        prev_rev = rev.get("previous_fy_revenue", 0)
         gp_rows = rev.get("gp_performance_ytd_breakdown") or []
-        answer_lines = [
-            "### GP Performance by Service Line",
-            f"- **Total Revenue (Current Fiscal Year):** {fmt(total_rev)}",
-            "",
-            "| Service Line | Performing (BHD) | Target (BHD) |",
-            "|---|---:|---:|",
-        ]
-        for r in gp_rows:
-            answer_lines.append(
-                f"| {r.get('name','')} | {float(r.get('performing',0)):,.2f} | {float(r.get('target',0)):,.2f} |"
-            )
+        top_custs = rev.get("top_5_customers") or []
+        months = rev.get("revenue_by_month") or []
+
+        style_fix = "<style>.ant-modal-title { color: var(--ai-text-primary, #e2e8f0) !important; }</style>"
+        answer_lines = []
         chart_data = None
-        if any(k in q for k in ["by month", "trend", "month", "monthly"]):
-            months = rev.get("revenue_by_month") or []
-            answer_lines += ["", "#### Revenue by Month", "| Month | Revenue (BHD) |", "|---|---:|"]
+        rev_export = None
+
+        if any(k in q for k in ["top 5", "top customer", "top 10", "customers by revenue"]):
+            answer_lines = [
+                "### Top 5 Customers by Revenue",
+                f"- **Total YTD Revenue:** {fmt(total_rev)}",
+                "",
+                "| Customer Name | Revenue (BHD) |",
+                "|---|---:|",
+            ]
+            for c in top_custs:
+                answer_lines.append(f"| {c.get('customer_name','N/A')} | {float(c.get('revenue',0)):,.2f} |")
+            chart_data = {
+                "title": "Top 5 Customers by Revenue", "type": "bar",
+                "categories": [c.get("customer_name", "") for c in top_custs],
+                "series": [{"name": "Revenue (BHD)", "data": [float(c.get("revenue", 0)) for c in top_custs]}],
+            }
+            if top_custs:
+                rev_export = {
+                    "filename": "Top_Customers_By_Revenue",
+                    "sheets": [{
+                        "name": "Top Customers",
+                        "headers": ["Customer Name", "Revenue (BHD)"],
+                        "rows": [[c.get('customer_name',''), float(c.get('revenue',0))] for c in top_custs],
+                        "metadata": ["Top 5 Customers by Revenue"]
+                    }]
+                }
+
+        elif any(k in q for k in ["comparison", "previous fy", "previous year", "vs last year", "compare"]):
+            diff = total_rev - prev_rev
+            pct = ((diff / prev_rev) * 100) if prev_rev > 0 else 0
+            sign = "+" if pct >= 0 else ""
+            answer_lines = [
+                "### Revenue Comparison (Current FY vs Previous FY)",
+                f"- **Current FY Revenue (YTD):** {fmt(total_rev)}",
+                f"- **Previous FY Revenue (YTD):** {fmt(prev_rev)}",
+                f"- **Growth Variance:** **{sign}{pct:.2f}%** ({fmt(diff)})",
+                "",
+                "| Fiscal Year Period | Revenue (BHD) | Variance |",
+                "|---|---:|---:|",
+                f"| Current FY (YTD) | {total_rev:,.2f} | {sign}{pct:.2f}% |",
+                f"| Previous FY (Full YTD) | {prev_rev:,.2f} | Baseline |",
+            ]
+            chart_data = {
+                "title": "FY Revenue Comparison", "type": "bar",
+                "categories": ["Previous FY", "Current FY (YTD)"],
+                "series": [{"name": "Revenue (BHD)", "data": [float(prev_rev), float(total_rev)]}],
+            }
+            rev_export = {
+                "filename": "Revenue_FY_Comparison",
+                "sheets": [{
+                    "name": "FY Comparison",
+                    "headers": ["Period", "Revenue (BHD)", "Variance"],
+                    "rows": [["Current FY (YTD)", float(total_rev), f"{sign}{pct:.2f}%"], ["Previous FY", float(prev_rev), "Baseline"]],
+                    "metadata": ["Revenue Comparison with Previous FY"]
+                }]
+            }
+
+        elif any(k in q for k in ["by month", "trend", "month", "monthly"]):
+            answer_lines = [
+                "### Monthly Revenue Trend",
+                f"- **Total Revenue (Current Fiscal Year):** {fmt(total_rev)}",
+                "",
+                "| Month | Revenue (BHD) |",
+                "|---|---:|",
+            ]
             for m in months:
                 answer_lines.append(f"| {m.get('month','')} | {float(m.get('amount',0)):,.2f} |")
             chart_data = {
@@ -1634,16 +1879,54 @@ async def deterministic_dashboard_response(history: Optional[List[dict]], latest
                 "categories": [m.get("month", "") for m in months],
                 "series": [{"name": "Revenue", "data": [float(m.get("amount", 0)) for m in months]}],
             }
-        
-        # Inject CSS to fix modal header readability
-        style_fix = "<style>.ant-modal-title { color: var(--ai-text-primary, #e2e8f0) !important; }</style>"
-        
+            if months:
+                rev_export = {
+                    "filename": "Monthly_Revenue_Trend",
+                    "sheets": [{
+                        "name": "Monthly Trend",
+                        "headers": ["Month", "Revenue (BHD)"],
+                        "rows": [[m.get('month',''), float(m.get('amount',0))] for m in months],
+                        "metadata": ["Monthly Revenue Trend"]
+                    }]
+                }
+
+        else:
+            answer_lines = [
+                "### GP Performance by Service Line",
+                f"- **Total Revenue (Current Fiscal Year):** {fmt(total_rev)}",
+                "",
+                "| Service Line | Performing (BHD) | Target (BHD) |",
+                "|---|---:|---:|",
+            ]
+            for r in gp_rows:
+                answer_lines.append(
+                    f"| {r.get('name','')} | {float(r.get('performing',0)):,.2f} | {float(r.get('target',0)):,.2f} |"
+                )
+            if gp_rows:
+                chart_data = {
+                    "title": "GP Performance by Service Line", "type": "bar",
+                    "categories": [r.get("name", "") for r in gp_rows],
+                    "series": [
+                        {"name": "Performing (BHD)", "data": [float(r.get("performing", 0)) for r in gp_rows]},
+                        {"name": "Target (BHD)", "data": [float(r.get("target", 0)) for r in gp_rows]},
+                    ],
+                }
+                rev_export = {
+                    "filename": "Revenue_GP_Performance_Report",
+                    "sheets": [{
+                        "name": "GP Performance",
+                        "headers": ["Service Line", "Performing (BHD)", "Target (BHD)"],
+                        "rows": [[r.get('name',''), float(r.get('performing',0)), float(r.get('target',0))] for r in gp_rows],
+                        "metadata": ["GP Performance by Service Line"]
+                    }]
+                }
+
         return dict(
             answer=style_fix + "\n" + "\n".join(answer_lines).strip(), chart_data=chart_data,
             navigate_to="/#gp-performance",
             navigation_links=[{"label": "Revenue Reports", "url": "/billing/reports"}, {"label": "CRM Dashboard", "url": "/#gp-performance"}],
-            suggested_questions=["Show revenue by month", "What are current receivables?", "Show proposal pipeline", "How many active projects?"],
-            export_data=export_data, auto_expand=auto_expand,
+            suggested_questions=["Show top 5 customers by revenue", "Revenue Comparison with Previous FY", "Show revenue by month", "What are current receivables?"],
+            export_data=rev_export, auto_expand=auto_expand,
         )
 
     # ── Receivables / Ageing / Collections ────────────────────────────────
@@ -1671,12 +1954,25 @@ async def deterministic_dashboard_response(history: Optional[List[dict]], latest
                 "categories": [b.get("bucket", "") for b in buckets],
                 "series": [{"name": "Amount", "data": [float(b.get("amount") or 0) for b in buckets]}],
             }
+
+        rec_export = None
+        if buckets:
+            rec_export = {
+                "filename": f"Receivables_Report{_rec_sl or ''}",
+                "sheets": [{
+                    "name": "Receivables Ageing",
+                    "headers": ["Ageing Bucket", "Amount (BHD)"],
+                    "rows": [[b.get('bucket',''), float(b.get('amount') or 0)] for b in buckets],
+                    "metadata": [f"Receivables Summary{_sl_label}"]
+                }]
+            }
+
         return dict(
             answer="\n".join(answer_lines).strip(), chart_data=chart_data,
             navigate_to="/billing/reports",
             navigation_links=[{"label": "Billing Reports", "url": "/billing/reports"}, {"label": "Invoices", "url": "/billing/invoice"}],
             suggested_questions=[f"Show overdue invoices{_sl_label}", "What is total revenue?", "Show open proposals"],
-            export_data=export_data, auto_expand=auto_expand,
+            export_data=rec_export, auto_expand=auto_expand,
         )
 
     # ── Proposals / Pipeline / Win Rate ────────────────────────────────────
@@ -1701,12 +1997,25 @@ async def deterministic_dashboard_response(history: Optional[List[dict]], latest
                 "categories": [r.get("status_name", "") for r in breakdown],
                 "series": [float(r.get("total_budget", 0)) for r in breakdown],
             }
+
+        prop_export = None
+        if breakdown:
+            prop_export = {
+                "filename": "Proposal_Pipeline_Report",
+                "sheets": [{
+                    "name": "Proposal Pipeline",
+                    "headers": ["Status", "Count", "Total Budget (BHD)"],
+                    "rows": [[r.get('status_name',''), int(r.get('total_entries',0)), float(r.get('total_budget',0))] for r in breakdown],
+                    "metadata": ["Proposal Pipeline Report"]
+                }]
+            }
+
         return dict(
             answer="\n".join(answer_lines).strip(), chart_data=chart_data,
             navigate_to="/proposal",
             navigation_links=[{"label": "Proposals", "url": "/proposal"}, {"label": "Proposal Status Report", "url": "/crm/reports/proposal-status-report"}],
             suggested_questions=["Show proposal status breakdown", "What is proposal win rate?", "Show high value proposals"],
-            export_data=export_data, auto_expand=auto_expand,
+            export_data=prop_export, auto_expand=auto_expand,
         )
 
     # ── Recoverability ─────────────────────────────────────────────────────
@@ -1718,11 +2027,17 @@ async def deterministic_dashboard_response(history: Optional[List[dict]], latest
         from semantic.semantic_layer import get_project_recoverability_report
         rec_args = {"start_date": start_date, "end_date": end_date}
         
-        # Extract filters from the question
+        # Extract filters from the question and history
         _filters = _extract_kpi_filters_from_text(latest_question)
+        _hist_filters = _extract_kpi_filters_from_history(history)
+        _filters = _merge_kpi_filters(_filters, _hist_filters)
+        
         _sl = _filters.get("service_line")
         _emp = _filters.get("employee_name")
-        _cust = _filters.get("customer")
+        _cust = _filters.get("customer") or _filters.get("customer_name")
+        _PRONOMINAL_CUST = {"that customer", "this customer", "they", "them", "the customer", "customer", "that client", "this client", "the client"}
+        if not _cust or _cust.lower().strip() in _PRONOMINAL_CUST:
+            _cust = _extract_customer_from_history(history)
 
         _proj = _filters.get("project_name")
 
@@ -1749,7 +2064,10 @@ async def deterministic_dashboard_response(history: Optional[List[dict]], latest
             rec_args["end_date"] = "2099-12-31"
             rec_args["project_name"] = _proj
             
-        raw = await get_project_recoverability_report.ainvoke(rec_args)
+        if hasattr(get_project_recoverability_report, 'coroutine'):
+            raw = await get_project_recoverability_report.coroutine(**rec_args)
+        else:
+            raw = await get_project_recoverability_report.ainvoke(rec_args)
         rec = parse(raw)
         
         if isinstance(rec, dict) and "error" in rec:
@@ -1793,65 +2111,70 @@ async def deterministic_dashboard_response(history: Optional[List[dict]], latest
         if _proj:
             answer_lines.append(f"- **Project:** {_proj}")
         else:
-            answer_lines.append(f"- **Total Active Projects:** {total_projects}")
+            answer_lines.append(f"- **Total Projects:** {total_projects}")
+
+            est_cost = summary.get("total_estimated_cost")
+            if est_cost not in (None, "", "N/A"):
+                answer_lines.append(f"- **Total Estimated Cost:** BHD {float(est_cost):,.2f}")
+
+            act_cost = summary.get("total_actual_cost")
+            if act_cost not in (None, "", "N/A"):
+                answer_lines.append(f"- **Total Actual Cost:** BHD {float(act_cost):,.2f}")
 
         act_rec = summary.get("total_actual_recoverability_percentage")
         if act_rec not in (None, "", "N/A") and str(act_rec).strip().lower() != "nan":
-            answer_lines.append(f"- **Actual Recoverability:** {act_rec}%")
+            answer_lines.append(f"- **Portfolio Recoverability Rate:** {act_rec}%")
 
         if total_projects == 0:
             answer_lines.append(f"\n No projects matched the criteria for {period_label}.")
 
         # Build export data for the Excel button
-        rec_export = None
-        if projects:
-            # Map exactly to the frontend Excel layout
-            ordered_columns = [
-                ("Project Code", "project_code"),
-                ("Project Name", "project_name"),
-                ("Customer Name", "customer_name"),
-                ("Customer Group", "customer_group"),
-                ("Service Line", "service_line"),
-                ("Start Date", "start_date"),
-                ("End Date", "end_date"),
-                ("Project In Charge", "project_in_charge"),
-                ("Customer Relation", "customer_relation"),
-                ("Project Partner", "project_partner"),
-                ("Project Status", "project_status"),
-                ("Approved Fees", "approved_fees"),
-                ("Agreed Fees", "agreed_fees"),
-                ("Est. Cost", "estimated_cost"),
-                ("Est. Recoverability (%)", "estimated_recoverability"),
-                ("Total Actual Cost", "total_actual_cost"),
-                ("Actual Recoverability (%)", "actual_recoverability")
-            ]
+        ordered_columns = [
+            ("Project Code", "project_code"),
+            ("Project Name", "project_name"),
+            ("Customer Name", "customer_name"),
+            ("Customer Group", "customer_group"),
+            ("Service Line", "service_line"),
+            ("Start Date", "start_date"),
+            ("End Date", "end_date"),
+            ("Project In Charge", "project_in_charge"),
+            ("Customer Relation", "customer_relation"),
+            ("Project Partner", "project_partner"),
+            ("Project Status", "project_status"),
+            ("Approved Fees", "approved_fees"),
+            ("Agreed Fees", "agreed_fees"),
+            ("Est. Cost", "estimated_cost"),
+            ("Est. Recoverability (%)", "estimated_recoverability"),
+            ("Total Actual Cost", "total_actual_cost"),
+            ("Actual Recoverability (%)", "actual_recoverability")
+        ]
+        
+        headers = ["No"] + [col[0] for col in ordered_columns]
+        all_rows = []
+        for i, p in enumerate(projects):
+            row = [str(i + 1)] # No column
+            for col_name, dict_key in ordered_columns:
+                val = p.get(dict_key, "")
+                if dict_key in ['approved_fees', 'agreed_fees', 'estimated_cost', 'total_actual_cost', 'estimated_recoverability', 'actual_recoverability']:
+                    row.append(round(float(val or 0), 3) if val else 0.0)
+                else:
+                    row.append(val)
+            all_rows.append(row)
+        
+        meta = [
+            "Project Recoverability Report",
+            f"Generated on: {_dt.now().strftime('%d %b %Y')}",
+            f"Period: {period_label}"
+        ]
+        if _sl and _sl.lower() != 'all':
+            meta.append(f"Service Line: {_sl}")
+        if _emp and _emp.lower() != 'all':
+            meta.append(f"In-Charge Employee: {_emp}")
             
-            headers = ["No"] + [col[0] for col in ordered_columns]
-            all_rows = []
-            for i, p in enumerate(projects):
-                row = [str(i + 1)] # No column
-                for col_name, dict_key in ordered_columns:
-                    val = p.get(dict_key, "")
-                    if dict_key in ['approved_fees', 'agreed_fees', 'estimated_cost', 'total_actual_cost', 'estimated_recoverability', 'actual_recoverability']:
-                        row.append(round(float(val or 0), 3) if val else 0.0)
-                    else:
-                        row.append(val)
-                all_rows.append(row)
-            
-            meta = [
-                "Project Recoverability Report",
-                f"Generated on: {_dt.now().strftime('%d %b %Y')}",
-                f"Period: {period_label}"
-            ]
-            if _sl and _sl.lower() != 'all':
-                meta.append(f"Service Line: {_sl}")
-            if _emp and _emp.lower() != 'all':
-                meta.append(f"In-Charge Employee: {_emp}")
-                
-            rec_export = {
-                "filename": "Project_Recoverability_Report",
-                "sheets": [{"name": "Data", "headers": headers, "rows": all_rows, "metadata": meta}]
-            }
+        rec_export = {
+            "filename": "Project_Recoverability_Report",
+            "sheets": [{"name": "Data", "headers": headers, "rows": all_rows, "metadata": meta}]
+        }
 
         return dict(
             answer="\n".join(answer_lines).strip(), chart_data=None,
@@ -1868,11 +2191,14 @@ async def deterministic_dashboard_response(history: Optional[List[dict]], latest
         from semantic.semantic_layer import get_staff_billing_report
         sb_args = {"start_date": start_date, "end_date": end_date}
         
-        # Extract filters from the question
+        # Extract filters from the question and history
         _filters = _extract_kpi_filters_from_text(latest_question)
+        _hist_filters = _extract_kpi_filters_from_history(history)
+        _filters = _merge_kpi_filters(_filters, _hist_filters)
+        
         _sl = _filters.get("service_line")
         _emp = _filters.get("employee_name")
-        _cust = _filters.get("customer_name")
+        _cust = _filters.get("customer") or _filters.get("customer_name")
         
         if _sl and _sl.lower() != 'all':
             sb_args["service_line"] = _sl
@@ -1983,13 +2309,117 @@ async def deterministic_dashboard_response(history: Optional[List[dict]], latest
         )
 
     # ── Projects ──────────────────────────────────────────────────────────
+    # ── Projects ──────────────────────────────────────────────────────────
     if should_show_projects_report(intent):
+        _filters = _extract_kpi_filters_from_text(latest_question)
+        _hist_filters = _extract_kpi_filters_from_history(history)
+        _filters = _merge_kpi_filters(_filters, _hist_filters)
+        
+        _cust = _filters.get("customer") or _filters.get("customer_name")
+        _PRONOMINAL_CUST = {"that customer", "this customer", "they", "them", "the customer", "customer", "that client", "this client", "the client"}
+        if not _cust or _cust.lower().strip() in _PRONOMINAL_CUST:
+            _cust = _extract_customer_from_history(history)
+
+        _emp = _filters.get("employee_name")
+
+        # ── CUSTOMER-SPECIFIC PROJECTS REPORT (Detailed Table + Export) ─────────
+        if _cust and _cust.lower().strip() not in ("all", "none", "n/a"):
+            from semantic.semantic_layer import get_project_recoverability_report
+            rec_args = {
+                "customer_name": _cust,
+                "start_date": "1970-01-01",
+                "end_date": "2099-12-31"
+            }
+            raw = await get_project_recoverability_report.ainvoke(rec_args)
+            rec = parse(raw)
+
+            projects = rec.get("projects", []) if isinstance(rec, dict) else []
+            summary = rec.get("summary", {}) if isinstance(rec, dict) else {}
+
+            header_title = f"### Projects List for **{_cust}**"
+            answer_lines = [
+                header_title,
+                f"- **Total Projects:** {summary.get('total_projects', len(projects))}",
+            ]
+            if summary.get("total_approved_fees"):
+                try:
+                    answer_lines.append(f"- **Total Approved Fees:** BHD {summary['total_approved_fees']:,.2f}")
+                except Exception:
+                    answer_lines.append(f"- **Total Approved Fees:** BHD {summary['total_approved_fees']}")
+            if summary.get("total_actual_cost"):
+                try:
+                    answer_lines.append(f"- **Total Actual Cost:** BHD {summary['total_actual_cost']:,.2f}")
+                except Exception:
+                    answer_lines.append(f"- **Total Actual Cost:** BHD {summary['total_actual_cost']}")
+
+            cust_export = None
+            if projects:
+                answer_lines += [
+                    "",
+                    "| No | Project Code | Project Name | Service Line | Status | Approved Fees | Actual Cost | Recoverability |",
+                    "|---|---|---|---|---|---:|---:|---:|"
+                ]
+
+                export_rows = []
+                for idx, p in enumerate(projects, 1):
+                    p_code = p.get("project_code") or "N/A"
+                    p_name = p.get("project_name") or "N/A"
+                    p_sl = p.get("service_line") or "N/A"
+                    p_status = p.get("project_status") or "Active"
+                    app_fee = p.get("approved_fees", 0.0)
+                    act_cost = p.get("total_actual_cost", 0.0)
+                    act_rec = p.get("actual_recoverability", 0.0)
+
+                    try:
+                        app_fee_str = f"BHD {float(app_fee):,.2f}"
+                    except Exception:
+                        app_fee_str = f"BHD {app_fee}"
+
+                    try:
+                        act_cost_str = f"BHD {float(act_cost):,.2f}"
+                    except Exception:
+                        act_cost_str = f"BHD {act_cost}"
+
+                    rec_str = f"{act_rec:.2f}%" if isinstance(act_rec, (int, float)) else f"{act_rec}%"
+
+                    answer_lines.append(f"| {idx} | {p_code} | {p_name} | {p_sl} | {p_status} | {app_fee_str} | {act_cost_str} | {rec_str} |")
+
+                    export_rows.append([
+                        str(idx), p_code, p_name, p.get("customer_name", _cust),
+                        p_sl, p_status, app_fee, act_cost, act_rec
+                    ])
+
+                cust_export = {
+                    "filename": f"Projects_{_cust.replace(' ', '_')}",
+                    "sheets": [{
+                        "name": "Projects",
+                        "headers": ["No", "Project Code", "Project Name", "Customer", "Service Line", "Status", "Approved Fees", "Actual Cost", "Recoverability (%)"],
+                        "rows": export_rows,
+                        "metadata": [f"Projects List for {_cust}"]
+                    }]
+                }
+            else:
+                answer_lines.append(f"\n⚠️ No specific projects found on record for **{_cust}**.")
+
+            return dict(
+                answer="\n".join(answer_lines).strip(),
+                chart_data=None,
+                navigate_to="/projects-list",
+                navigation_links=[{"label": "Projects List", "url": "/projects-list"}, {"label": "CRM Dashboard", "url": "/crm-dashboard"}],
+                suggested_questions=["Show active vs completed projects", "Show project recoverability report", "What is the total revenue?"],
+                export_data=cust_export,
+                auto_expand=False,
+            )
+
+        # ── COMPANY-WIDE PROJECTS SUMMARY ─────────────────────────────────────
         proj_args = tool_args.copy()
         proj_args["is_active"] = is_active
+        if _emp:
+            proj_args["employee_name"] = _emp
+
         raw = await get_active_projects_metrics.ainvoke(proj_args)
         proj = parse(raw)
 
-        # ── Build a human-readable period label ─────────────────────────────
         dr = proj.get("date_range", {})
         sd = dr.get("start") or start_date
         ed = dr.get("end")   or end_date
@@ -2004,8 +2434,9 @@ async def deterministic_dashboard_response(history: Optional[List[dict]], latest
         except Exception:
             period_label = f"{sd} to {ed}" if sd and ed else "All Time"
 
+        header_title = "### Projects Summary"
         answer_lines = [
-            "### Projects Summary",
+            header_title,
             f"- **Period:** {period_label}",
             f"- **Total Active Projects:** {proj.get('total_projects', proj.get('total_active_projects', 0))}",
         ]

@@ -4,6 +4,7 @@ All endpoints require valid JWT in the Authorization header.
 Extracts user_id, role, and other context from the JWT payload.
 """
 
+from aiohttp.web import Request
 import os
 import logging
 from datetime import datetime
@@ -324,7 +325,7 @@ async def chat(
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
     # Validate session
-    session = await session_manager.get_session(session_id)
+    session = await session_manager.get_session(session_id, user_id=user_id, user_context=user_context)
     if session is None:
         raise HTTPException(status_code=401, detail="Session expired")
 
@@ -375,6 +376,7 @@ async def chat(
         'user_tier': resolved_tier,
         'role_name': user_context.get('role', 'Unknown'),
         'department_id': user_context.get('department_id'),
+        'jwt_token': credentials.credentials,
     })
 
     # Merge UI context (like active date picker) into the user_context
@@ -405,6 +407,18 @@ async def chat(
             logger.info(f"[ChatRoute] Matched deterministic route for: {question[:60]}...")
         else:
             if USE_ENTERPRISE_PLANNER:
+                from agent.executive_classifier import handle_executive_classification
+                _is_conv, _conv_reply = await handle_executive_classification(question, history, user_context)
+                if _is_conv and _conv_reply:
+                    logger.info(f"[ExecutiveClassifier] Handled conversational query '{question[:40]}' via short-circuit (0 Planner/DB cost)")
+                    return {
+                        "type": "done",
+                        "answer": _conv_reply,
+                        "content": _conv_reply,
+                        "was_cached": False,
+                        "cache_tier": "conversational_short_circuit"
+                    }
+
                 # ── Clarification State Injection (zero LLM cost) ──────────────────
                 # Load any pending clarification from the session store and inject it
                 # into user_context so the Planner can resume without re-planning.
@@ -627,7 +641,7 @@ async def chat_stream(
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
 
-    session = await session_manager.get_session(session_id)
+    session = await session_manager.get_session(session_id, user_id=user_id, user_context=user_context)
     if session is None:
         raise HTTPException(status_code=401, detail="Session expired")
     if session.get("user_id") != user_id:
@@ -833,6 +847,15 @@ async def chat_stream(
                     await asyncio.sleep(0)
                     
                     if USE_ENTERPRISE_PLANNER:
+                        from agent.executive_classifier import handle_executive_classification
+                        _is_conv, _conv_reply = await handle_executive_classification(question, history, user_context)
+                        if _is_conv and _conv_reply:
+                            logger.info(f"[ExecutiveClassifier Stream] Handled conversational query '{question[:40]}' via short-circuit (0 Planner/DB cost)")
+                            yield f"data: {json.dumps({'type': 'token', 'content': _conv_reply})}\n\n"
+                            yield f"data: {safe_json_dumps({'type': 'done', 'answer': _conv_reply})}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+
                         _already_streamed = False
                         # ── Clarification State Injection (zero LLM cost) ──────────────────
                         from memory.session_manager import (
@@ -1221,23 +1244,106 @@ async def get_session_history_route(
     user_id = user_context["user_id"]
 
     entries = await chat_history.get_session_history(session_id, user_id)
-    return entries
+    # Re-warm / restore session in session manager so downstream chat queries succeed
+    await session_manager.restore_session_from_history(session_id, user_id, user_context)
+    return {"messages": entries, "entries": entries}
+
+
+@router.delete("/history/{session_id}")
+async def delete_session_history_by_id(
+    session_id: str,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    """
+    Delete a specific chat history session by session_id in URL path.
+    """
+    user_context = _decode_jwt(credentials)
+    user_id = user_context["user_id"]
+
+    clean_sid = str(session_id).strip()
+    if not clean_sid or clean_sid.lower() in ("none", "null", "undefined"):
+        raise HTTPException(
+            status_code=400,
+            detail="A valid session_id is required."
+        )
+
+    count = await chat_history.delete_user_history(
+        user_id=user_id,
+        session_id=clean_sid,
+    )
+
+    try:
+        await session_manager.invalidate_session(clean_sid)
+    except Exception as e:
+        logger.warning(f"[DeleteHistory] Session invalidation failed for {clean_sid}: {e}")
+
+    return DeleteResponse(deleted=count)
 
 
 @router.delete("/history")
 async def delete_history(
+    request: Request,
     session_id: Optional[str] = Query(None),
+    sessionId: Optional[str] = Query(None),
+    entry_id: Optional[str] = Query(None),
+    entryId: Optional[str] = Query(None),
+    clear_all: bool = Query(False),
+    clearAll: bool = Query(False),
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
-    """Delete chat history for the authenticated user."""
+    """
+    Delete chat history for the authenticated user (Query param or Body based).
+    """
     user_context = _decode_jwt(credentials)
     user_id = user_context["user_id"]
 
-    count = await chat_history.delete_user_history(user_id, session_id)
+    target_session_id = session_id or sessionId
+    target_entry_id = entry_id or entryId
+    is_clear_all = clear_all or clearAll
+
+    # Parse JSON body if path/query params were not supplied
+    if not target_session_id and not target_entry_id and not is_clear_all:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                target_session_id = body.get("session_id") or body.get("sessionId")
+                target_entry_id = body.get("entry_id") or body.get("entryId") or body.get("id")
+                is_clear_all = bool(body.get("clear_all") or body.get("clearAll"))
+        except Exception:
+            pass
+
+    # Sanitize inputs against stringified "null", "undefined", "none", or empty strings
+    if target_session_id and str(target_session_id).strip().lower() in ("none", "null", "undefined", ""):
+        target_session_id = None
+    if target_entry_id and str(target_entry_id).strip().lower() in ("none", "null", "undefined", ""):
+        target_entry_id = None
+
+    # Safety Guard: Require session_id, entry_id, or explicit clear_all flag
+    if not target_session_id and not target_entry_id and not is_clear_all:
+        raise HTTPException(
+            status_code=400,
+            detail="A valid session_id or entry_id parameter is required to delete a specific chat item. Pass clear_all=true to delete all history."
+        )
+
+    count = await chat_history.delete_user_history(
+        user_id=user_id,
+        session_id=target_session_id,
+        entry_id=target_entry_id,
+        clear_all=is_clear_all
+    )
+
+    # Invalidate Redis / MongoDB session state if deleting a specific session
+    if target_session_id:
+        try:
+            await session_manager.invalidate_session(target_session_id)
+        except Exception as e:
+            logger.warning(f"[DeleteHistory] Session invalidation failed for {target_session_id}: {e}")
+
     return DeleteResponse(deleted=count)
 
 
 @router.post("/session")
+@router.get("/session")
 async def create_session(
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ):

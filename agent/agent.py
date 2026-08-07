@@ -182,9 +182,7 @@ LEADS & PROPOSALS:
 - saleslead(id, lead_date, lead_owner, industry_id, client_type, enquiry_details, code, budget_value, currency_id, lead_status_id, job_estimation_id, serviceline_id, servicetype_id, sub_servicetype_id, lead_source, lead_source_external_id, lead_source_existing_client_id, lead_source_internal_id, customer_id, contact_id, is_active, created_at, created_by)
 - m_leadstatus(id, name, is_active)
 - job_estimation(id, saleslead_id, proposal_id, from_date, to_date, remarks, total_costs, total_hours, proposed_fees, approved_fees, recoverability, contact_id, customer_id, code, ref_no, status_id, is_active, is_vendor, approved_by, created_at, created_by)
-- m_jobestimation_status(id, name, is_active) -- IDs: 1=Pending Approvals, 2=Approved, 3=Reviewed, 4=Rejected, 6=Not Submitted
-- proposal(id, job_estimation_id, organization_id, project_id, proposal_template_id, engagement_template_id, proposal_status_id, engagement_status_id, continuous_engagement_status_id, scope, proposal_year, proposed_fees, approved_fees, agreed_fees, recoverability, proposal_date, total_costs, code, ref_no, is_active, contact_id, customer_id, client_id, service_line_id, created_at, created_by)
-- m_proposal_status(id, name, is_active, sequence) -- IDs: 1=Proposal Sent, 3=Proposal Accepted (Won), 4=Proposal Rejected (Lost), 7=Proposal Created, 8=Proposal Verify, 9=Project Pending, 10=All Project Created
+- m_proposal_status(id, name, is_active, sequence) -- IDs: 1=Proposal Sent, 2=Proposal Draft/In Review, 3=Proposal Accepted (Won), 4=Proposal Rejected (Lost), 7=Proposal Created, 8=Proposal Verify, 9=Project Pending, 10=All Project Created
 - m_engagement_status(id, name, is_active, sequence) -- IDs: 1=Engagement Accepted (Won), 2=Engagement Rejected (Lost), 3=Engagement Sent, 4=Engagement Created, 5=Engagement Verify
 
 PROJECTS:
@@ -214,6 +212,7 @@ TIMESHEET & KPI:
 - ts_project_date(id, timesheet_id, project_date, task_name, hours, description)
   NOTE: ts_project_date.timesheet_id -> timesheet_project.id. project_date is the actual work date.
 - kpi_master(id, service_line_id, department_id, employee_id, target_month, target_value, target_gp, is_active)
+  NOTE: kpi_master contains target metrics ONLY for service lines, departments, and employees. It has NO project_id column and NEVER links to projects directly!
 - serviceline_department(id, serviceline_id, department_id)
 - serviceline_incharge(id, serviceline_id, incharge_id)
 
@@ -223,9 +222,9 @@ OTHER:
 - client_survey(id, service_line, project_manager, project_name, client_name, remarks, created_at)
 - assign_client_survey_question(id, client_survey_id, questions, answers)
 
-ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 KEY JOINS & RELATIONSHIPS
-ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 - invoice.client_name_id -> customers.id
 - invoice.project_id -> projects.id
 - invoice.project_in_charge_id -> employees.id
@@ -265,9 +264,9 @@ KEY JOINS & RELATIONSHIPS
 - serviceline_department.serviceline_id -> m_serviceline.id
 - serviceline_department.department_id -> m_department.id
 
-ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 EXACT SQL FOR EVERY DASHBOARD KPI
-ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 --- SERVICE PIPELINE ---
 -- Open service leads count:
@@ -292,6 +291,12 @@ SELECT COUNT(*) FROM job_estimation WHERE is_active = 1 AND created_at BETWEEN '
 --- OPEN PROPOSALS / ENGAGEMENT LETTERS ---
 -- Open proposals (status IDs 1,7,8 = proposal statuses, project_id IS NULL means pending):
 SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p WHERE p.proposal_status_id IN (1, 7, 8) AND p.project_id IS NULL AND p.created_at BETWEEN '2025-10-01' AND '2026-09-30 23:59:59'
+
+-- Rejected proposals (status ID 4 = Proposal Rejected):
+SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p WHERE p.is_active = 1 AND p.proposal_status_id = 4 AND p.created_at BETWEEN '2025-10-01' AND '2026-09-30 23:59:59'
+
+-- Accepted / Won proposals (status ID 3 = Proposal Accepted):
+SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p WHERE p.is_active = 1 AND p.proposal_status_id = 3 AND p.created_at BETWEEN '2025-10-01' AND '2026-09-30 23:59:59'
 
 -- Open engagement letters (engagement_status_id IN 3,4,5, project_id IS NULL):
 SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p WHERE p.engagement_status_id IN (3, 4, 5) AND p.project_id IS NULL AND p.created_at BETWEEN '2025-10-01' AND '2026-09-30 23:59:59'
@@ -1264,7 +1269,17 @@ Provide a clear, professional answer based ONLY on the raw data above."""
         t0 = time.time()
 
         history = inputs["messages"]
-        last_msg_content = history[-1].content if hasattr(history[-1], 'content') else history[-1]["content"]
+        if history:
+            _user_history_texts = [
+                m.content if hasattr(m, 'content') else m.get('content', '')
+                for m in (history or [])
+                if (getattr(m, 'type', '') == 'human' or (isinstance(m, dict) and m.get('role') == 'user'))
+            ]
+            full_context = "\n".join(_user_history_texts[-3:]) if _user_history_texts else ""
+            last_msg_content = history[-1].content if hasattr(history[-1], 'content') else history[-1]["content"]
+        else:
+            full_context = ""
+            last_msg_content = ""
 
         # Step 1: Fast classification (keyword heuristic first, LLM fallback)
         category = _fast_classify(last_msg_content)
@@ -1302,7 +1317,10 @@ Provide a clear, professional answer based ONLY on the raw data above."""
             is_estimation_query = any(sig in q_lower_adhoc for sig in _ESTIMATION_SIGNALS)
 
             _RECOVERABILITY_SIGNALS = [
-                "recoverability report", "project recoverability", "actual recoverability", "estimated recoverability", "recoverability", "recoverablity"
+                "recoverability report", "project recoverability", "actual recoverability",
+                "estimated recoverability", "recoverability", "recoverablity",
+                "lowest kpi", "lowest kpi scores", "lowest kpi projects", "kpi score", "kpi scores",
+                "lowest recoverability", "lowest project", "lowest performing project"
             ]
             is_recoverability_query = any(sig in q_lower_adhoc for sig in _RECOVERABILITY_SIGNALS)
 
@@ -1414,9 +1432,37 @@ Provide a clear, professional answer based ONLY on the raw data above."""
                 # Build export data for the Excel button
                 ad_hoc_export_data = None
                 if projects:
-                    columns = list(projects[0].keys())
-                    all_rows = [[r.get(c, "") for c in columns] for r in projects]
-                    
+                    ordered_columns = [
+                        ("Project Code", "project_code"),
+                        ("Project Name", "project_name"),
+                        ("Customer Name", "customer_name"),
+                        ("Customer Group", "customer_group"),
+                        ("Service Line", "service_line"),
+                        ("Start Date", "start_date"),
+                        ("End Date", "end_date"),
+                        ("Project In Charge", "project_in_charge"),
+                        ("Customer Relation", "customer_relation"),
+                        ("Project Partner", "project_partner"),
+                        ("Project Status", "project_status"),
+                        ("Approved Fees", "approved_fees"),
+                        ("Agreed Fees", "agreed_fees"),
+                        ("Est. Cost", "estimated_cost"),
+                        ("Est. Recoverability (%)", "estimated_recoverability"),
+                        ("Total Actual Cost", "total_actual_cost"),
+                        ("Actual Recoverability (%)", "actual_recoverability")
+                    ]
+                    headers = ["No"] + [col[0] for col in ordered_columns]
+                    all_rows = []
+                    for i, p in enumerate(projects):
+                        row = [str(i + 1)]
+                        for col_name, dict_key in ordered_columns:
+                            val = p.get(dict_key, "")
+                            if dict_key in ['approved_fees', 'agreed_fees', 'estimated_cost', 'total_actual_cost', 'estimated_recoverability', 'actual_recoverability']:
+                                row.append(round(float(val or 0), 3) if val else 0.0)
+                            else:
+                                row.append(val)
+                        all_rows.append(row)
+
                     try:
                         from datetime import datetime as _dt_now
                         gen_date = _dt_now.now().strftime('%d %b %Y')
@@ -1435,7 +1481,7 @@ Provide a clear, professional answer based ONLY on the raw data above."""
                         
                     ad_hoc_export_data = {
                         "filename": "Project_Recoverability_Report",
-                        "sheets": [{"name": "Data", "headers": columns, "rows": all_rows, "metadata": meta}]
+                        "sheets": [{"name": "Data", "headers": headers, "rows": all_rows, "metadata": meta}]
                     }
 
                 # Format the answer text deterministically
@@ -1448,7 +1494,7 @@ Provide a clear, professional answer based ONLY on the raw data above."""
                 if _emp and _emp.lower() != 'all':
                     answer_lines.append(f"- **In-Charge Employee:** {_emp}")
                     
-                answer_lines.append(f"- **Total Active Projects:** {total_projects}")
+                answer_lines.append(f"- **Total Projects:** {total_projects}")
 
                 est_cost = summary.get("total_estimated_cost")
                 if est_cost not in (None, "", "N/A"):
@@ -1460,13 +1506,7 @@ Provide a clear, professional answer based ONLY on the raw data above."""
 
                 act_rec = summary.get("total_actual_recoverability_percentage")
                 if act_rec not in (None, "", "N/A") and str(act_rec).strip().lower() != "nan":
-                    answer_lines.append(f"- **Actual Recoverability:** {act_rec}%")
-
-                source = summary.get("source", "")
-                if "API" in source:
-                    answer_lines.append("\n*Data sourced from CRM Recoverability Report API.*")
-                elif "SQL" in source:
-                    answer_lines.append("\n*Data sourced from CRM database (SQL fallback).*")
+                    answer_lines.append(f"- **Portfolio Recoverability Rate:** {act_rec}%")
 
                 if total_projects == 0:
                     msg = summary.get("message", "")
@@ -1696,8 +1736,9 @@ async def ask_question(history: List[Dict], user_context=None) -> Tuple[str, Opt
     try:
         # --- NEW: Semantic Cache Check ---
         import asyncio
-        
-        cached = await get_cached_answer(latest_question, scope_key)
+        from memory.memory_manager import _needs_live_data
+
+        cached = await get_cached_answer(latest_question, scope_key) if not _needs_live_data(latest_question) else None
 
         if cached:
             cached_nav = cached.get("navigate_to")
@@ -1716,12 +1757,23 @@ async def ask_question(history: List[Dict], user_context=None) -> Tuple[str, Opt
             )
         # --- End Cache Check ---
 
-        # Convert history array to LangGraph messages state
-        # NOTE: Use 'msg_role' to avoid overwriting the outer 'role' (user's actual role for cache)
+        # Convert history array to LangGraph messages state using proper Message objects
+        from langchain_core.messages import HumanMessage, AIMessage
         langchain_history = []
-        for msg in history:
-            msg_role = "user" if msg['role'] == "user" else "assistant"
-            langchain_history.append({"role": msg_role, "content": msg['content']})
+        if isinstance(history, list):
+            for msg in history:
+                if isinstance(msg, dict):
+                    role = msg.get("role", "user")
+                    content = msg.get("content", "")
+                    if role == "user":
+                        langchain_history.append(HumanMessage(content=content))
+                    else:
+                        langchain_history.append(AIMessage(content=content))
+                elif hasattr(msg, "content"):
+                    langchain_history.append(msg)
+
+        if not langchain_history or (hasattr(langchain_history[-1], "content") and langchain_history[-1].content != latest_question):
+            langchain_history.append(HumanMessage(content=latest_question))
 
         # The routed agent returns the identical state format as create_react_agent
         response = None
@@ -2191,7 +2243,27 @@ async def ask_question_streaming(history, user_context=None):
         # ── STREAMING ROUTER: classify + pre-fetch DB data before streaming ──
         # The streaming path must mirror the non-streaming routing logic:
         # classify the question first, fetch real DB data, then stream the formatted answer.
+        # Extract user-only messages from history
+        user_history_qs = [
+            m.get("content", "").strip() if isinstance(m, dict) else getattr(m, "content", "").strip()
+            for m in (history or [])
+            if (isinstance(m, dict) and m.get("role") == "user") or (hasattr(m, "type") and getattr(m, "type") == "human")
+        ]
+
         latest_q = history[-1].get("content", "") if history else ""
+        
+        # Follow-up query resolution (Anaphora resolution)
+        if len(user_history_qs) >= 2:
+            prev_user_q = user_history_qs[-2]
+            curr_user_q = user_history_qs[-1]
+            curr_words = curr_user_q.lower().strip().split()
+            is_short_followup = len(curr_words) <= 7
+            starts_with_followup = any(curr_user_q.lower().strip().startswith(prefix) for prefix in [
+                "for ", "in ", "what about", "how about", "and ", "with ", "during ", "show for", "show me for"
+            ])
+            if is_short_followup or starts_with_followup:
+                latest_q = f"{prev_user_q} {curr_user_q}"
+
         q_lower = latest_q.lower().strip()
 
         # Set RBAC context on semantic_layer so tools respect user scope
@@ -2300,6 +2372,7 @@ async def ask_question_streaming(history, user_context=None):
             "compare", "specific", "a proposal", "an invoice", "the project", "detail",
             "last", "first", "which", "who made", "when was", "when did", "single",
             "most recent", "what was the last", "which was the last",
+            "rejected", "accepted", "stalled", "draft", "lost", "won",
         ]
         is_analytical = any(marker in q_lower for marker in _ANALYTICAL_MARKERS_STRONG)
 
@@ -2321,7 +2394,7 @@ async def ask_question_streaming(history, user_context=None):
                 extracted_sl = _sl_direct_match.group(1).strip()
             else:
                 # Fallback: use LLM to extract from conversation context
-                full_context = "\n".join([m.get('content', '') for m in history[-3:]])
+                full_context = "\n".join(user_history_qs[-3:]) if user_history_qs else ""
                 check_sl_prompt = (
                     f"Extract the service line from this conversation if present "
                     f"(e.g. Audit, Tax, Advisory, BPO). If no service line is mentioned, "

@@ -44,6 +44,7 @@ def _is_kpi_summary_query(question: str) -> bool:
         "resource utilization", "utilization report", "utilisation report",
         "resource report", "resource allocation", "billable hours",
         "timesheet", "staff utilization", "staff utilisation",
+        "project", "projects",
     ]
     if any(pat in q for pat in _EXCLUSION_PATTERNS):
         return False
@@ -618,6 +619,8 @@ def _deterministic_top_customers_by_revenue(question: str) -> Optional[dict]:
 # Live-data detection — these questions must NEVER be served from cache
 # ---------------------------------------------------------------------------
 _LIVE_DATA_KEYWORDS = {
+    # KPI reports & insights
+    "kpi", "kpi summary", "kpi report", "kpi summary report", "report", "summary",
     # Financial metrics
     "revenue", "billing", "invoice", "invoices", "receivable", "receivables",
     "outstanding", "aging", "ageing", "overdue", "collection", "payment",
@@ -679,30 +682,37 @@ async def resolve_answer(
 
     # KPI Filter-First Gate (applies to both cached and fresh paths)
     if _is_kpi_summary_query(question) and not _is_kpi_filter_submission_text(question):
-        # ── Smart Gate: if the query already names a specific employee, only ask for FY ──
-        # e.g. "Generate KPI report for Damcy" → only FY clarification needed
         quick_filters = _extract_kpi_filters_from_text(question)
-        named_employee = quick_filters.get("employee_name")  # e.g. "Damcy"
+        named_employee = quick_filters.get("employee_name")  # e.g. "Shashank Arya"
+        q_low = question.lower()
+        has_direct_action = any(w in q_low for w in ["generate", "download", "show", "run", "get", "create", "export"])
 
-        if named_employee and named_employee.lower() not in ("all", ""):
-            # The user already told us WHO — just ask for the financial year
-            return {
-                "answer": f"Sure! Which Financial Year should I use for **{named_employee}**'s KPI report?",
-                "chart_data": None,
-                "navigate_to": KPI_SUMMARY_ROUTE,
-                "navigation_links": [{"label": "KPI Summary Report", "url": KPI_SUMMARY_ROUTE}],
-                "export_data": None,
-                "auto_expand": False,
-                "suggested_questions": [],
-                "report_intent": "kpi_fy_only",
-                "entity_name": named_employee,
-                "sql_executed": None,
-                "cache_tier": "fresh",
-                "was_cached": False,
-                "latency_ms": int((time.time() - start) * 1000),
-            }
+        if has_direct_action or (named_employee and named_employee.lower() not in ("all", "")):
+            # Direct report generation requested — execute _deterministic_kpi_response immediately with complete defaults
+            from main import _deterministic_kpi_response
+            question_filters = _extract_kpi_filters_from_text(question)
+            history_filters = _extract_kpi_filters_from_history(history)
+            merged_filters = _merge_kpi_filters(question_filters, history_filters)
+            if named_employee and not merged_filters.get("employee_name"):
+                merged_filters["employee_name"] = named_employee
+            if not merged_filters.get("financial_year"):
+                merged_filters["financial_year"] = "2025-2026"
+            if not merged_filters.get("date_range"):
+                merged_filters["date_range"] = "01-10-2025 to 30-09-2026"
+            if not merged_filters.get("service_line"):
+                merged_filters["service_line"] = "All"
+            if not merged_filters.get("department"):
+                merged_filters["department"] = "All"
 
-        # No specific employee → show the full filter panel
+            auth_token = user_context.get("jwt_token") if isinstance(user_context, dict) else None
+            res = await _deterministic_kpi_response(history, question, user_context, auth_token)
+            if res:
+                res["cache_tier"] = "fresh"
+                res["was_cached"] = False
+                res["latency_ms"] = int((time.time() - start) * 1000)
+                return _apply_kpi_overrides(res, question)
+
+        # No specific action or employee -> show the full filter panel
         return {
             "answer": KPI_FILTER_SETUP_PROMPT,
             "chart_data": None,

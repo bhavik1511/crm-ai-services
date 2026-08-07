@@ -139,8 +139,8 @@ async def save_token_usage_async(
                 conn.execute(
                     text("""
                         INSERT INTO ai_chatbot_usage 
-                        (employee_id, session_id, model_name, input_tokens, output_tokens, total_tokens, total_cost_usd)
-                        VALUES (:emp_id, :sess_id, :model, :in_tok, :out_tok, :tot_tok, :cost)
+                        (employee_id, session_id, model_name, input_tokens, output_tokens, total_tokens, total_cost_usd, status, error_type, error_message)
+                        VALUES (:emp_id, :sess_id, :model, :in_tok, :out_tok, :tot_tok, :cost, :status, :error_type, :error_message)
                     """),
                     {
                         "emp_id": employee_id,

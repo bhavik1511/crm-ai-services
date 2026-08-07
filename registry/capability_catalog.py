@@ -20,8 +20,9 @@ PRIORITY_AD_HOC_SQL = 5
 BUSINESS_CAPABILITIES = [
     {
         "id": "analytical_query",
+        "business_domain": "analytics",
         "fast_path_eligible": False,
-        "intent_keywords": [],
+        "intent_keywords": ['top performing projects', 'top performing project', 'top projects', 'best performing projects', 'highest revenue projects', 'top clients'],
         "description": (
             "Performs ad-hoc analysis, counts, aggregations, comparisons, or ranking across any CRM "
             "business entity (e.g. service leads, proposals, customers, projects, invoices, tasks). "
@@ -30,6 +31,22 @@ BUSINESS_CAPABILITIES = [
             "ALWAYS use this for 'top N customers by revenue', 'which client has highest revenue', "
             "and similar customer-revenue ranking questions."
         ),
+        "supported_metrics": ["count", "sum", "average", "ranking", "comparison"],
+        "supported_operations": ["count", "sum", "average", "group_by", "ranking", "comparison", "trend", "filter", "sort_order", "limit", "aggregation"],
+        "priority": PRIORITY_AD_HOC_SQL,
+        "dependencies": [],
+        "response_contract": {
+            "supports_report": False,
+            "supports_summary": True,
+            "supports_analysis": True,
+            "supports_chart": False,
+            "supports_export": False,
+            "supports_filters": True,
+            "supports_followup": True,
+            "supports_comparison": True,
+            "supports_drilldown": True,
+            "default_presentation": "INSIGHT"
+        },
         "primary_metric": "analytical_result",
         "response_schema": {
             "query": "string",
@@ -69,9 +86,26 @@ BUSINESS_CAPABILITIES = [
 
     {
         "id": "customer_resolution",
+        "business_domain": "customer",
         "fast_path_eligible": True,
         "intent_keywords": ['customer resolution', 'find customer', 'customer search'],
         "description": "Find a customer by name or code to get their ID. Always required before querying customer-specific data.",
+        "supported_metrics": ["customer_id", "customer_name"],
+        "supported_operations": ["filter", "search"],
+        "priority": PRIORITY_BUSINESS_API,
+        "dependencies": [],
+        "response_contract": {
+            "supports_report": False,
+            "supports_summary": False,
+            "supports_analysis": False,
+            "supports_chart": False,
+            "supports_export": False,
+            "supports_filters": False,
+            "supports_followup": False,
+            "supports_comparison": False,
+            "supports_drilldown": False,
+            "default_presentation": "INSIGHT"
+        },
         "primary_metric": "customer_id",
         "response_schema": {
             "customer_id": "number",
@@ -103,17 +137,33 @@ BUSINESS_CAPABILITIES = [
     },
     {
         "id": "customer_360_profile",
+        "business_domain": "customer",
         "fast_path_eligible": True,
         "intent_keywords": ['customer 360', 'customer profile', 'customer details'],
         "description": "Get a comprehensive 360-degree profile of a specific customer, including bank details, branches, and contact info.",
-        "primary_metric": "customer_profile",
+        "supported_metrics": ["customer_profile", "branches", "contacts"],
+        "supported_operations": ["filter", "summary", "drilldown"],
+        "priority": PRIORITY_BUSINESS_API,
+        "dependencies": ["customer_resolution"],
+        "response_contract": {
+            "supports_report": True,
+            "supports_summary": True,
+            "supports_analysis": False,
+            "supports_chart": False,
+            "supports_export": False,
+            "supports_filters": False,
+            "supports_followup": True,
+            "supports_comparison": False,
+            "supports_drilldown": True,
+            "default_presentation": "REPORT"
+        },
+        "primary_metric": "customer",
         "response_schema": {
-            "customer_name": "string",
-            "customer_code": "string",
-            "entity_type": "string",
-            "branches": "array",
-            "contacts": "array",
-            "identification": "object"
+            "customer": "object",
+            "contactDetails": "array",
+            "bankDetails": "array",
+            "branchDetails": "array",
+            "attachment": "array"
         },
         "default_error_message": "Customer profile information is currently unavailable.",
         "required_parameters": [],
@@ -142,9 +192,26 @@ BUSINESS_CAPABILITIES = [
     },
     {
         "id": "receivables_analysis",
+        "business_domain": "finance",
         "fast_path_eligible": True,
         "intent_keywords": ['receivables', 'receivable', 'overdue invoices', 'ageing report'],
         "description": "Full ageing breakdown of all overdue invoices. Use when asking about pending or overdue receivables.",
+        "supported_metrics": ["total_receivables", "overdue_invoices", "ageing_buckets", "total_overdue_count"],
+        "supported_operations": ["sum", "filter", "group_by", "comparison", "trend"],
+        "priority": PRIORITY_EXISTING_REPORT,
+        "dependencies": [],
+        "response_contract": {
+            "supports_report": True,
+            "supports_summary": True,
+            "supports_analysis": True,
+            "supports_chart": True,
+            "supports_export": True,
+            "supports_filters": True,
+            "supports_followup": True,
+            "supports_comparison": True,
+            "supports_drilldown": True,
+            "default_presentation": "REPORT"
+        },
         "primary_metric": "total_receivables",
         "response_schema": {
             "total_receivables": "number",
@@ -195,6 +262,7 @@ BUSINESS_CAPABILITIES = [
     },
     {
         "id": "revenue_analysis",
+        "business_domain": "finance",
         "fast_path_eligible": True,
         "intent_keywords": ['revenue', 'revenue summary', 'monthly revenue', 'total revenue'],
         "description": (
@@ -203,9 +271,28 @@ BUSINESS_CAPABILITIES = [
             "Do NOT use for ranking customers by revenue, finding the top-N clients, or comparing service-line "
             "revenues — those must use analytical_query instead."
         ),
+        "supported_metrics": ["total_revenue_ytd", "revenue_by_month", "gp_performance", "team_billing"],
+        "supported_operations": ["sum", "filter", "group_by", "comparison", "trend"],
+        "priority": PRIORITY_EXISTING_REPORT,
+        "dependencies": [],
+        "response_contract": {
+            "supports_report": True,
+            "supports_summary": True,
+            "supports_analysis": True,
+            "supports_chart": True,
+            "supports_export": True,
+            "supports_filters": True,
+            "supports_followup": True,
+            "supports_comparison": True,
+            "supports_drilldown": True,
+            "default_presentation": "REPORT"
+        },
         "primary_metric": "total_revenue_ytd",
         "response_schema": {
             "total_revenue_ytd": "number",
+            "previous_fy_revenue": "number",
+            "top_5_customers": "array",
+            "gp_performance_ytd_breakdown": "array",
             "current_team_billing_period_total": "number",
             "revenue_by_month": "array",
             "gp_performance_breakdown": "array",
@@ -280,9 +367,26 @@ BUSINESS_CAPABILITIES = [
     },
     {
         "id": "proposal_search",
+        "business_domain": "pipeline",
         "fast_path_eligible": True,
         "intent_keywords": ['proposals', 'proposal', 'open proposals', 'pending proposals'],
         "description": "Search proposals by code, customer, or status. Use when asked to show pending or open proposals.",
+        "supported_metrics": ["proposals_list", "total_count", "open_proposals"],
+        "supported_operations": ["filter", "search", "count", "summary"],
+        "priority": PRIORITY_BUSINESS_API,
+        "dependencies": [],
+        "response_contract": {
+            "supports_report": False,
+            "supports_summary": True,
+            "supports_analysis": False,
+            "supports_chart": False,
+            "supports_export": False,
+            "supports_filters": True,
+            "supports_followup": True,
+            "supports_comparison": False,
+            "supports_drilldown": True,
+            "default_presentation": "KPI_CARD"
+        },
         "primary_metric": "proposals_list",
         "response_schema": {
             "proposals": "array",
@@ -345,8 +449,8 @@ BUSINESS_CAPABILITIES = [
     {
         "id": "project_search",
         "fast_path_eligible": True,
-        "intent_keywords": ["search projects", "find project", "project search"],
-        "description": "Search projects by name, code, or customer.",
+        "intent_keywords": ["search projects", "find project", "project search", "status of project", "status of this project", "project status"],
+        "description": "Search specific projects by name, code, or customer to get status, fees, and dates.",
         "primary_metric": "projects_list",
         "response_schema": {
             "projects": "array",
@@ -364,6 +468,14 @@ BUSINESS_CAPABILITIES = [
                 "needs_confirmation": False,
                 "required_entities": [],
                 "required_parameters": ["search_term"]
+            },
+            {
+                "priority": PRIORITY_SEMANTIC_WRAPPER,
+                "type": "wrapper",
+                "function_call": "get_comprehensive_customer_report",
+                "needs_confirmation": False,
+                "required_entities": [],
+                "required_parameters": []
             },
             {
                 "priority": PRIORITY_SEMANTIC_WRAPPER,
@@ -407,9 +519,26 @@ BUSINESS_CAPABILITIES = [
     },
     {
         "id": "kpi_summary",
+        "business_domain": "kpi",
         "fast_path_eligible": True,
         "intent_keywords": ['kpi', 'kpi summary', 'executive kpi'],
         "description": "Retrieves the master KPI summary report (budget vs actuals, GP performance).",
+        "supported_metrics": ["strictly_active_projects_count", "overdue_tasks", "overdue_projects", "projects_by_status"],
+        "supported_operations": ["summary", "filter", "comparison", "trend"],
+        "priority": PRIORITY_EXISTING_REPORT,
+        "dependencies": [],
+        "response_contract": {
+            "supports_report": True,
+            "supports_summary": True,
+            "supports_analysis": True,
+            "supports_chart": True,
+            "supports_export": True,
+            "supports_filters": True,
+            "supports_followup": True,
+            "supports_comparison": True,
+            "supports_drilldown": True,
+            "default_presentation": "REPORT"
+        },
         "primary_metric": "strictly_active_projects_count",
         "response_schema": {
             "strictly_active_projects_count": "number",
@@ -460,9 +589,26 @@ BUSINESS_CAPABILITIES = [
     },
     {
         "id": "recoverability_analysis",
+        "business_domain": "finance",
         "fast_path_eligible": True,
         "intent_keywords": ['recoverability', 'project recoverability', 'recoverability report'],
         "description": "Gets recoverability metrics, estimated vs actual costs, and recoverability percentage. Use when asked about recoverability.",
+        "supported_metrics": ["actual_recoverability_pct", "total_estimated_cost", "total_actual_cost"],
+        "supported_operations": ["sum", "average", "filter", "comparison", "trend", "ranking"],
+        "priority": PRIORITY_EXISTING_REPORT,
+        "dependencies": [],
+        "response_contract": {
+            "supports_report": True,
+            "supports_summary": True,
+            "supports_analysis": True,
+            "supports_chart": True,
+            "supports_export": True,
+            "supports_filters": True,
+            "supports_followup": True,
+            "supports_comparison": True,
+            "supports_drilldown": True,
+            "default_presentation": "REPORT"
+        },
         "primary_metric": "actual_recoverability_pct",
         "response_schema": {
             "total_estimated_cost": "number",
@@ -502,7 +648,7 @@ BUSINESS_CAPABILITIES = [
             {
                 "priority": PRIORITY_EXISTING_REPORT,
                 "type": "report",
-                "endpoint": "GET /api/v1/reports/recoverability-report",
+                "endpoint": "GET /api/v1/reports/project-recoverability-report",
                 "needs_confirmation": False,
                 "required_entities": [],
                 "required_parameters": []
@@ -519,9 +665,26 @@ BUSINESS_CAPABILITIES = [
     },
     {
         "id": "pipeline_analysis",
+        "business_domain": "pipeline",
         "fast_path_eligible": True,
         "intent_keywords": ['pipeline', 'sales pipeline', 'opportunities'],
         "description": "Gets sales pipeline metrics, proposal pipeline funnel, weighted deal values, and win probabilities.",
+        "supported_metrics": ["open_proposals", "won_proposals", "proposal_win_rate", "service_pipeline_leads_summary"],
+        "supported_operations": ["sum", "count", "filter", "group_by", "comparison", "trend", "summary"],
+        "priority": PRIORITY_SEMANTIC_WRAPPER,
+        "dependencies": [],
+        "response_contract": {
+            "supports_report": True,
+            "supports_summary": True,
+            "supports_analysis": True,
+            "supports_chart": True,
+            "supports_export": True,
+            "supports_filters": True,
+            "supports_followup": True,
+            "supports_comparison": True,
+            "supports_drilldown": True,
+            "default_presentation": "REPORT"
+        },
         "primary_metric": "open_proposals",
         "response_schema": {
             "open_proposals": "object",
@@ -648,9 +811,26 @@ BUSINESS_CAPABILITIES = [
     },
     {
         "id": "staff_billing",
+        "business_domain": "billing",
         "fast_path_eligible": True,
         "intent_keywords": ["staff billing", "billing report", "employee billing", "team billing"],
         "description": "Gets the staff billing report showing employee time, billing amounts, and project-level cost recovery.",
+        "supported_metrics": ["billing_summary", "employee_billing", "project_billing"],
+        "supported_operations": ["sum", "filter", "group_by", "comparison", "trend", "ranking"],
+        "priority": PRIORITY_EXISTING_REPORT,
+        "dependencies": [],
+        "response_contract": {
+            "supports_report": True,
+            "supports_summary": True,
+            "supports_analysis": True,
+            "supports_chart": True,
+            "supports_export": True,
+            "supports_filters": True,
+            "supports_followup": True,
+            "supports_comparison": True,
+            "supports_drilldown": True,
+            "default_presentation": "REPORT"
+        },
         "primary_metric": "summary",
         "response_schema": {
             "summary": "object",
@@ -782,6 +962,7 @@ def get_capability_metadata(capability_id: str) -> dict:
 
             cap.setdefault("supports_organization_scope", True)
             cap.setdefault("supports_entity_scope", True)
+            cap.setdefault("presentation_modes", ["REPORT", "INSIGHT", "REPORT_AND_INSIGHT"])
             cap.setdefault("optional_filters", ["financial_year", "service_line", "department", "customer_id", "office"])
             return cap
     return None
@@ -806,3 +987,68 @@ def get_capability_entity_requirements(capability_id: str) -> tuple:
 
     return bool(requires_entities), list(required_types)
 
+
+# ---------------------------------------------------------------------------
+# Deterministic Capability Resolver (Phase 3.1.10)
+# ---------------------------------------------------------------------------
+
+def resolve_capabilities_from_requirements(
+    required_domains=None,
+    required_metrics=None,
+    required_operations=None,
+    required_entities=None,
+    presentation_mode=None,
+    max_results=10,
+):
+    """
+    Deterministically matches Planner business requirements against Capability Catalog metadata.
+    NEVER uses report names, capability IDs, keyword lists, hardcoded combinations, or if/else chains.
+    Adding a new capability to BUSINESS_CAPABILITIES makes it automatically discoverable here.
+    """
+    req_domains = [d.lower() for d in (required_domains or [])]
+    req_metrics = [m.lower() for m in (required_metrics or [])]
+    req_operations = [o.lower() for o in (required_operations or [])]
+
+    scored = []
+    for cap in BUSINESS_CAPABILITIES:
+        score = 0.0
+        cap_domain = (cap.get("business_domain") or "").lower()
+        cap_metrics = [m.lower() for m in (cap.get("supported_metrics") or [])]
+        cap_operations = [o.lower() for o in (cap.get("supported_operations") or [])]
+        cap_priority = cap.get("priority", PRIORITY_SEMANTIC_WRAPPER)
+        contract = cap.get("response_contract") or {}
+
+        if req_domains and cap_domain in req_domains:
+            score += 10.0
+        if req_metrics:
+            score += sum(5.0 for m in req_metrics if any(m in cm for cm in cap_metrics))
+        if req_operations:
+            score += sum(2.0 for o in req_operations if o in cap_operations)
+        if presentation_mode:
+            pm = presentation_mode.upper()
+            if pm == "REPORT" and contract.get("supports_report"):
+                score += 3.0
+            elif pm in ("INSIGHT", "EXECUTIVE_BRIEF") and contract.get("supports_analysis"):
+                score += 3.0
+            elif pm == "COMPARISON" and contract.get("supports_comparison"):
+                score += 3.0
+        score += max(0.0, (PRIORITY_AD_HOC_SQL - cap_priority) * 0.5)
+        if score > 0:
+            scored.append((score, cap))
+
+    scored.sort(key=lambda x: (-x[0], x[1].get("priority", PRIORITY_SEMANTIC_WRAPPER)))
+    return [cap for _, cap in scored[:max_results]]
+
+
+def get_capabilities_for_executive_brief():
+    """
+    Returns all capabilities that support executive-level analysis.
+    Used by the Planner for broad queries like 'How is our company performing?'.
+    Metadata-driven -- zero hardcoded capability ID lists.
+    """
+    return [
+        cap for cap in BUSINESS_CAPABILITIES
+        if (cap.get("response_contract") or {}).get("supports_analysis", False)
+        and cap.get("business_domain") not in ("customer", "analytics")
+        and cap.get("fast_path_eligible", False)
+    ]

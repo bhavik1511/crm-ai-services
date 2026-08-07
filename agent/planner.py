@@ -62,15 +62,29 @@ class CapabilityCallInfo(BaseModel):
     sort_order: Optional[str] = Field(None, description="Sort direction (e.g., ascending, descending).")
     limit: Optional[int] = Field(None, description="Limit on the number of results.")
     time_filter: Optional[str] = Field(None, description="Time filter (e.g., this month, Q3, FY 2026).")
+    # Phase 3.1.10 — Presentation metadata (determined by Planner, consumed by Synthesizer)
+    presentation_mode: Optional[str] = Field(None, description="Presentation mode: REPORT, INSIGHT, REPORT_AND_INSIGHT, KPI_CARD, TABLE, COMPARISON, EXECUTIVE_BRIEF.")
+    requires_report: Optional[bool] = Field(None, description="Whether the user explicitly requested a full report UI.")
+    requires_summary: Optional[bool] = Field(None, description="Whether an executive summary is required.")
+    requires_chart: Optional[bool] = Field(None, description="Whether chart data is required.")
+    requires_table: Optional[bool] = Field(None, description="Whether a table is required.")
+    requires_comparison: Optional[bool] = Field(None, description="Whether a comparison is required.")
+    requires_export: Optional[bool] = Field(None, description="Whether export capability is required.")
+    analysis_depth: Optional[str] = Field(None, description="Analysis depth: summary, detailed, executive_briefing.")
 
 class BusinessExecutionPlan(BaseModel):
     business_goal: str = Field(description="A short summary of the user's business objective.")
     confidence_score: float = Field(description="Confidence score between 0.0 and 1.0 that this plan perfectly addresses the user's intent.")
+    reasoning_summary: Optional[str] = Field(None, description="Brief explanation of why this plan was selected.")
+    ambiguity_detected: bool = Field(False, description="True if the user's intent is ambiguous and clarification would improve accuracy.")
     entities: list[EntityInfo] = Field(description="ONLY genuine, specific business entities (e.g., 'Phoenix Project', 'ABC Ltd'). DO NOT include broad scopes, metrics, or temporal expressions (e.g., 'January', 'Q1') here.")
     scope: list[str] = Field(description="Broad intent modifiers or query scopes (e.g., 'All Projects', 'All Customers', 'Company Wide').")
     business_capabilities: list[CapabilityCallInfo] = Field(description="The abstract business capabilities required to satisfy the goal.")
     missing_information: list[str] = Field(description="Any critical business context missing from the user's query (e.g., 'Financial Year').")
     entity_errors: list[str] = Field(description="Populated internally if entity resolution fails.")
+    # Phase 3.1.10 — Plan-level presentation intent
+    presentation_mode: Optional[str] = Field(None, description="Overall presentation mode for the response: REPORT, INSIGHT, REPORT_AND_INSIGHT, KPI_CARD, TABLE, COMPARISON, EXECUTIVE_BRIEF.")
+    analysis_depth: Optional[str] = Field(None, description="Overall analysis depth: summary, detailed, executive_briefing.")
 
 
 # ---------------------------------------------------------------------------
@@ -118,14 +132,17 @@ class EnterprisePlanner:
         if previous_plan:
             logger.info(f"[Req: {tracker.request_id}] Found previous execution plan in context.")
             
-            is_new = False
-            if not is_internal:
-                # If free-text, run Intent Gate
+            missing_info = previous_plan.get("missing_information", [])
+            has_pending_clarification = bool(missing_info or previous_plan.get("is_clarification"))
+            
+            is_new = True
+            if has_pending_clarification and not is_internal:
+                # If there's an active clarification, run Intent Gate
                 is_new = self._is_new_request(context.question, previous_plan)
                 
-            if not is_new:
+            if not is_new and has_pending_clarification:
                 # [DIAG-8] Log entering RESUME branch
-                logger.info(f"[DIAG-8] [Req: {tracker.request_id}] RESUME BRANCH ENTERED — Resuming previous execution plan deterministically.")
+                logger.info(f"[DIAG-8] [Req: {tracker.request_id}] RESUME BRANCH ENTERED — Resuming previous execution plan for pending clarification.")
                 execution_plan = previous_plan
                 
                 # Deterministic Context Injection:
@@ -139,11 +156,9 @@ class EnterprisePlanner:
                 else:
                     # Free-text answer: inject into the first pending missing field.
                     if not is_internal:
-                        missing_info = execution_plan.get("missing_information", [])
                         if missing_info:
                             first_missing = missing_info[0]
                             miss_key = first_missing if isinstance(first_missing, str) else first_missing.get("key")
-                            # Normalize aggregate responses to __ALL__ sentinel (zero LLM cost)
                             from .entity_resolver import is_aggregate_value, AGGREGATE_SENTINEL
                             resolved_value = AGGREGATE_SENTINEL if is_aggregate_value(context.question) else context.question
                             for cap in execution_plan.get("business_capabilities", []):
@@ -151,12 +166,16 @@ class EnterprisePlanner:
                         
                 execution_plan["missing_information"] = []
             else:
-                # [DIAG-8/9] Log entering NEW branch due to Intent Gate
-                logger.info(f"[DIAG-8/9] [Req: {tracker.request_id}] NEW PLANNING BRANCH ENTERED — previous_execution_plan existed, but Intent Gate classified query '{context.question[:60]}' as a NEW request.")
-                logger.info(f"[Req: {tracker.request_id}] Intent Gate detected a NEW business request. Discarding previous state.")
+                # [DIAG-8/9] Log entering NEW branch due to Intent Gate or completed previous plan
+                logger.info(f"[DIAG-8/9] [Req: {tracker.request_id}] NEW PLANNING BRANCH ENTERED — Discarding previous state.")
+                context.user_context.pop("previous_execution_plan", None)
         else:
-            # [DIAG-8/9] Log entering NEW branch due to missing plan
-            logger.info(f"[DIAG-8/9] [Req: {tracker.request_id}] NEW PLANNING BRANCH ENTERED — previous_execution_plan was None or Unavailable in user_context.")
+            logger.info(f"[DIAG-8/9] [Req: {tracker.request_id}] NEW PLANNING BRANCH ENTERED — No previous_execution_plan in user_context.")
+
+        # Purge stale context fields from previous turns if this is a new plan
+        if not execution_plan:
+            for stale_key in ["search_term", "business_goal", "question", "start_date", "end_date", "period", "date_range", "customer", "project"]:
+                context.user_context.pop(stale_key, None)
         
         if not execution_plan:
             # 0. Lightweight Router Fast-Path Check (0 Planner LLM Calls)
@@ -255,6 +274,49 @@ class EnterprisePlanner:
                     }
 
         logger.info(f"Active Business Execution Plan: {json.dumps(execution_plan, indent=2)}")
+
+        # --- Phase 3.1.10: Confidence-Based Execution Guard ---
+        conf_score = execution_plan.get("confidence_score", 1.0)
+        ambiguity = execution_plan.get("ambiguity_detected", False)
+        CONFIDENCE_THRESHOLD = 0.60
+        if conf_score < CONFIDENCE_THRESHOLD or ambiguity:
+            reasoning = execution_plan.get("reasoning_summary", "")
+            logger.warning(
+                f"[Req: {tracker.request_id}] Confidence guard triggered: "
+                f"score={conf_score:.2f}, ambiguity={ambiguity}. Requesting clarification."
+            )
+            clarification_msg = (
+                "I want to make sure I provide the right information. Could you please clarify:\n\n"
+                + (f"_{reasoning}_\n\n" if reasoning else "")
+                + "Please provide more details so I can assist you accurately."
+            )
+            tracker.dump_trace()
+            return {
+                "type": "done",
+                "content": clarification_msg,
+                "is_clarification": True,
+                "error_code": "low_confidence",
+            }
+
+        # --- Phase 3.1.10: Session Memory Context Inheritance for Follow-ups ---
+        try:
+            from memory.session_manager import get_session_memory
+            session_memory = await get_session_memory(context.session_id)
+            if session_memory:
+                prev_filters = session_memory.get("active_filters") or {}
+                prev_entities = session_memory.get("active_entities") or []
+                # Inherit previous filters into capabilities that have no overriding filter
+                for cap in execution_plan.get("business_capabilities", []):
+                    cap_ctx = cap.setdefault("context", {})
+                    for fk, fv in prev_filters.items():
+                        if fv and fk not in cap_ctx:
+                            cap_ctx[fk] = fv
+                # Inherit previous resolved entities if none in current plan
+                if not execution_plan.get("entities") and prev_entities:
+                    logger.info(f"[ExecutiveMemory] Inherited {len(prev_entities)} entities from session memory for follow-up.")
+                    execution_plan.setdefault("resolved_entities", prev_entities)
+        except Exception as mem_err:
+            logger.warning(f"[ExecutiveMemory] Session memory read failed (non-fatal): {mem_err}")
 
         # Reset entity_errors and missing_information per turn (stateless execution context)
         execution_plan["entity_errors"] = []
@@ -391,6 +453,17 @@ class EnterprisePlanner:
                     cap_ctx[k] = v
             if shared_time_filter and not cap.get("time_filter"):
                 cap["time_filter"] = shared_time_filter
+
+            # Deterministic Time Boundary Enforcement for time_filter / month mentions
+            tf = cap.get("time_filter") or cap_ctx.get("date_range") or context.question
+            if tf and isinstance(tf, str):
+                from .entity_resolver import parse_scope_time_filter
+                tf_res = parse_scope_time_filter(tf)
+                if tf_res.get("start_date") and tf_res.get("end_date"):
+                    cap.setdefault("filters", {})["start_date"] = tf_res["start_date"]
+                    cap["filters"]["end_date"] = tf_res["end_date"]
+                    cap_ctx["start_date"] = tf_res["start_date"]
+                    cap_ctx["end_date"] = tf_res["end_date"]
         
         # 3. Execution Validator
         is_valid, validation_errors = validate_execution(execution_plan)
@@ -428,6 +501,12 @@ class EnterprisePlanner:
         cache_key = build_entity_cache_key(user_id, primary_cap, resolved_entities, financial_year=fy_val, filters=cache_cap_ctx)
         cached_response = await get_entity_cache(cache_key)
         if cached_response:
+            c_str = str(cached_response.get("content", "")).lower()
+            if primary_cap == "recoverability_analysis" and not any(p in c_str for p in ["recoverability percentage", "actual recoverability", "portfolio recoverability"]):
+                logger.info(f"[Planner] Discarding stale cached response for recoverability_analysis key='{cache_key}' (missing recoverability %).")
+                cached_response = None
+
+        if cached_response:
             logger.info(f"[Req: {tracker.request_id}] Returning cached response via Entity Cache key='{cache_key}' (0 LLM/Backend calls).")
             cached_response["was_cached"] = True
             cached_response["cache_tier"] = "entity_cache"
@@ -460,31 +539,20 @@ class EnterprisePlanner:
             
         tracker.record_tool_execution(tool_results)
         
-        # 5. Response Generation (DATA MODE vs ANALYSIS MODE)
-        try:
-            from .router import ANALYSIS_KEYWORDS
-        except (ImportError, AttributeError):
-            ANALYSIS_KEYWORDS = {"why", "how", "explain", "analyse", "analyze", "comparison", "compare", "reason", "insight", "insights", "trend", "breakdown", "root cause"}
-
+        # 5. Response Generation (Presentation Mode Governed)
         from .synthesizer import format_data_response, synthesize_response
 
         q_clean = context.question.lower()
-        is_analysis_requested = any(kw in q_clean for kw in ANALYSIS_KEYWORDS)
-        mode = execution_plan.get("response_mode", "DATA" if not is_analysis_requested else "ANALYSIS")
-
-        # Token Budget Enforcement: Force DATA MODE if total token limit is tight
-        current_tokens = (context.request_metadata.get("token_usage", {}) or {}).get("total_tokens", 0)
-        if current_tokens > 3500 and mode == "ANALYSIS":
-            logger.warning(f"[TokenBudget] Token count ({current_tokens}) exceeded budget threshold -> Forcing DATA MODE.")
-            mode = "DATA"
+        pres_mode = str(execution_plan.get("presentation_mode") or "").upper()
+        is_explicit_table_query = any(phrase in q_clean for phrase in ["show table", "list all", "table format", "raw records", "export table"])
 
         with tracker.track_time("synthesizer_ms"):
-            if mode == "DATA":
-                logger.info(f"[Req: {tracker.request_id}] Executing DATA MODE Direct Formatter (0 Synthesizer LLM Calls).")
+            if pres_mode == "TABLE" and is_explicit_table_query:
+                logger.info(f"[Req: {tracker.request_id}] Executing DATA MODE Direct Formatter for explicit table query.")
                 final_response = format_data_response(context.question, tool_results)
             else:
-                logger.info(f"[Req: {tracker.request_id}] Executing ANALYSIS MODE Synthesis (LLM Call Invoked).")
-                final_response = await synthesize_response(context.question, tool_results, self.llm)
+                logger.info(f"[Req: {tracker.request_id}] Executing Executive Response Synthesis (presentation_mode='{pres_mode}').")
+                final_response = await synthesize_response(context.question, tool_results, self.llm, execution_plan=execution_plan)
             
             # Pass token usage up and attach execution plan and tool results
             if isinstance(final_response, dict):
@@ -495,6 +563,17 @@ class EnterprisePlanner:
 
             # Save to Entity Cache
             await set_entity_cache(cache_key, final_response)
+
+            # --- Phase 3.1.10: Update Executive Session Memory ---
+            try:
+                from memory.session_manager import update_session_memory
+                # Inject plan-level presentation_mode from first capability if not set
+                if not execution_plan.get("presentation_mode"):
+                    first_cap = (execution_plan.get("business_capabilities") or [{}])[0]
+                    execution_plan["presentation_mode"] = first_cap.get("presentation_mode")
+                await update_session_memory(context.session_id, execution_plan, tool_results)
+            except Exception as mem_err:
+                logger.warning(f"[ExecutiveMemory] update_session_memory failed (non-fatal): {mem_err}")
             
         # Structured Observability Telemetry Output
         planner_toks = (context.request_metadata.get("token_usage", {}) or {}).get("total_tokens", 0)
@@ -510,12 +589,12 @@ class EnterprisePlanner:
 
         logger.info(
             f"[Production Telemetry] "
-            f"Mode={mode} | "
+            f"PresentationMode={pres_mode} | "
             f"Capability={primary_cap} | "
             f"ResolvedCustomer={cust_id_resolved} | "
             f"FY={fy_val or 'Default'} | "
             f"CacheStatus={'HIT' if final_response.get('was_cached') else 'MISS'} | "
-            f"SynthesizerInvoked={mode == 'ANALYSIS'} | "
+            f"SynthesizerInvoked={pres_mode != 'TABLE' or not is_explicit_table_query} | "
             f"LLMCalls={llm_calls_cnt} | "
             f"PlannerTokens={planner_toks} | "
             f"SynthTokens={synth_toks} | "
@@ -540,9 +619,16 @@ class EnterprisePlanner:
         
         capability_schemas = json.dumps(get_planner_capabilities_schema(), indent=2)
         
+        from datetime import datetime
+        now = datetime.now()
+        curr_date_str = now.strftime("%Y-%m-%d")
+        curr_year = now.year
+
         prompt = ChatPromptTemplate.from_messages([
             ("system", 
-             "You are the Enterprise Business Analyst for a CRM system.\n"
+             f"You are the Enterprise Business Analyst for a CRM system.\n"
+             f"CURRENT SYSTEM DATE: {curr_date_str} (Current Calendar Year: {curr_year}, Current Fiscal Year: FY{str(curr_year)[2:]})\n"
+             f"TEMPORAL ANCHOR RULE: When a month name is mentioned without a year (e.g. 'Jan', 'January', 'March'), ALWAYS assume the current year ({curr_year}). NEVER use past years (like 2024 or 2025) unless explicitly requested by the user.\n\n"
              "Your ONLY job is to understand the user's goal and map it to abstract Business Capabilities.\n\n"
              "AVAILABLE BUSINESS CAPABILITIES:\n{capabilities}\n\n"
              "RULES (NATURAL LANGUAGE UNDERSTANDING & SEMANTIC INTERPRETATION):\n"
@@ -565,6 +651,8 @@ class EnterprisePlanner:
              "   - KPI / Key Indicators / Executive Summary -> 'kpi_summary'\n"
              "   - Billing / Staff Billing / Employee Billing / Resource Cost -> 'staff_billing_report'\n"
              "   - Projects / Active Projects / WIP -> 'active_projects'\n"
+             "   - Top Performing Projects / Best Projects / Highest Revenue Projects / Ranking Projects -> 'analytical_query'\n"
+             "   - Specific Customer / Specific Project / Project Status of named entity -> 'project_search' or 'customer_360_profile'\n"
              "   MULTI-REPORT MANDATE: When user requests multiple reports in one prompt (e.g. 'Revenue + Recoverability', 'Revenue and KPI', 'Receivables, Pipeline and Billing'), extract ALL matching capabilities into the 'business_capabilities' array.\n\n"
              "3. BUSINESS ENTITIES EXTRACTION (UNVALIDATED):\n"
              "   Extract named business entities into the 'entities' array without attempting database validation:\n"
@@ -584,7 +672,21 @@ class EnterprisePlanner:
              "   For organization-wide or aggregate queries ('scope' = 'organization'), DO NOT list search_term or project name as missing information. Set missing_information = [].\n\n"
              "6. INTENT CONSISTENCY:\n"
              "   Ensure distinct phrasings conveying identical business requests map to identical execution plans.\n"
-             "   Calculate a confidence_score between 0.0 and 1.0 reflecting plan accuracy.\n\n"
+             "   Calculate a confidence_score between 0.0 and 1.0 reflecting plan accuracy.\n"
+             "   Set ambiguity_detected=true if the query is ambiguous and clarification would materially improve the response.\n"
+             "   Always populate reasoning_summary with a brief explanation of why you selected this plan.\n\n"
+             "7. PRESENTATION MODE (MANDATORY — Synthesizer depends on this):\n"
+             "   Set presentation_mode on the plan AND on each capability based on user intent:\n"
+             "   - 'REPORT': User explicitly says 'Generate', 'Run', 'Show me the report', 'Get the report'.\n"
+             "   - 'REPORT_AND_INSIGHT': User requests report AND summary/analysis (e.g. 'Generate KPI Report and summarize it').\n"
+             "   - 'INSIGHT': User says 'Explain', 'Analyze', 'Tell me about', 'What is happening with'.\n"
+             "   - 'KPI_CARD': Simple scalar count/metric questions (e.g. 'How many open proposals?', 'What is total revenue?').\n"
+             "   - 'TABLE': User explicitly asks for a list or table of records.\n"
+             "   - 'COMPARISON': User says 'Compare', 'vs', 'difference between', 'versus'.\n"
+             "   - 'EXECUTIVE_BRIEF': Broad business health questions (e.g. 'How is our company performing?', 'What should management focus on?', 'Company overview').\n"
+             "   Set requires_report=true when presentation_mode is REPORT or REPORT_AND_INSIGHT.\n"
+             "   Set requires_summary=true when presentation_mode is REPORT_AND_INSIGHT, INSIGHT, or EXECUTIVE_BRIEF.\n"
+             "   Set requires_comparison=true when presentation_mode is COMPARISON.\n\n"
              "OUTPUT INSTRUCTIONS:\n"
              "You must return ONLY a raw JSON object strictly adhering to the following JSON schema.\n"
              "Do not include any markdown formatting like ```json or any other text.\n"
@@ -636,7 +738,13 @@ class EnterprisePlanner:
         q_lower = q.lower()
         words = q_lower.split()
 
-        # Rule 1: Very short responses are almost always clarification answers.
+        # Action/question verbs indicating a brand new request regardless of length
+        action_verbs = {"what", "how", "show", "generate", "get", "run", "list", "active", "total", "kpi", "report", "status", "actual", "recoverability", "revenue"}
+        if any(w in words for w in action_verbs):
+            logger.info(f"[IntentGate] Detected NEW_REQUEST via action verb: '{q[:60]}'")
+            return True  # NEW_REQUEST
+
+        # Rule 1: Very short non-verb responses are clarification answers.
         # ("FY2026", "All", "Audit", "Yes", "No", "Current FY", "Last month")
         if len(words) <= 5:
             return False  # ANSWER

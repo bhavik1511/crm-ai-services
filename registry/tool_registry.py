@@ -18,6 +18,8 @@ from agent.semantic_wrappers import SEMANTIC_TOOL_MAP
 
 logger = logging.getLogger(__name__)
 
+CRM_API_BASE = os.getenv("CRM_API_BASE", "http://localhost:3001/api/v1").rstrip("/")
+
 def format_capability_envelope(capability_id: str, result_data: Any, error_err: Any = None) -> Dict[str, Any]:
     cap_meta = get_capability_metadata(capability_id) or {}
     default_msg = cap_meta.get("default_error_message", "The requested information is currently unavailable. Please try again later.")
@@ -56,9 +58,12 @@ def format_capability_envelope(capability_id: str, result_data: Any, error_err: 
             for field in response_schema.keys():
                 if field in payload:
                     sanitized_payload[field] = payload[field]
-            for k, v in payload.items():
-                if k not in sanitized_payload and v is not None and k not in ["raw_sql", "debug"]:
-                    sanitized_payload[k] = v
+            # If whitelist filtering stripped all keys, but original payload contains valid report/data fields, preserve original payload
+            if not sanitized_payload and payload:
+                if any(k in payload for k in ["data", "rows", "summary", "count", "records", "results", "list", "items", "table", "billing", "strictly_active_projects_count"]):
+                    sanitized_payload = payload
+                elif not any(k in payload for k in ["error", "error_message"]):
+                    sanitized_payload = payload
         else:
             sanitized_payload = payload
     else:
@@ -68,6 +73,9 @@ def format_capability_envelope(capability_id: str, result_data: Any, error_err: 
     if primary_metric and isinstance(sanitized_payload, dict):
         if not sanitized_payload:
             has_primary = False
+        # If payload is non-empty, do not fail primary metric check for report responses
+        elif isinstance(payload, dict) and any(k in payload for k in ["data", "rows", "summary", "records", "results", "list", "items", "projects_by_status"]):
+            has_primary = True
 
     if not sanitized_payload or not has_primary:
         return {
@@ -379,8 +387,10 @@ class ToolRegistry:
             if fy_val and is_fiscal_year_expression(str(fy_val)):
                 fy_res = resolve_fiscal_year(str(fy_val))
                 ctx["financial_year"] = fy_res["financial_year"]
-                ctx["start_date"] = fy_res["start_date"]
-                ctx["end_date"] = fy_res["end_date"]
+                if "start_date" not in ctx or not ctx["start_date"]:
+                    ctx["start_date"] = fy_res["start_date"]
+                if "end_date" not in ctx or not ctx["end_date"]:
+                    ctx["end_date"] = fy_res["end_date"]
 
             # 2. Dynamically select the correct implementation based on context
             if "question" not in ctx and question:
@@ -411,6 +421,7 @@ class ToolRegistry:
             http_status = 200
             raw_backend_response = None
             exception_obj = None
+            is_rest_attempt = (impl_type in ["api", "report"])
 
             # Route 1: Python Semantic Wrapper
             if impl_type == "wrapper":
@@ -455,8 +466,26 @@ class ToolRegistry:
                             
                     if method == "GET":
                         import urllib.parse
-                        unused_params = {k: v for k, v in ctx.items() if k not in used_keys}
+                        NON_API_KEYS = {
+                            "business_goal", "question", "intent", "scope", "metric", 
+                            "operation", "aggregation", "ranking", "comparison", "group_by", 
+                            "sort_order", "limit", "presentation_mode", "requires_report", 
+                            "requires_summary", "requires_chart", "requires_table", 
+                            "requires_comparison", "requires_export", "analysis_depth", 
+                            "canonical_fy", "all_fiscal_years", "missing_information", 
+                            "raw_tool_results", "previous_execution_plan", "user_context", 
+                            "resolved_entities", "entity", "entity_type", "entity_id", "entity_name"
+                        }
+                        unused_params = {k: v for k, v in ctx.items() if k not in used_keys and k not in NON_API_KEYS}
                         
+                        if "/api/v1/reports/project-recoverability-report" in endpoint_url or "/reports/project-recoverability-report" in endpoint_url:
+                            if "page" not in unused_params:
+                                unused_params["page"] = 1
+                            if "pageSize" not in unused_params:
+                                unused_params["pageSize"] = 10000
+                            if "statusFilter" not in unused_params:
+                                unused_params["statusFilter"] = -1
+
                         if "/api/v1/projects" in endpoint_url or "/api/v1/project?" in endpoint_url:
                             sq = {}
                             flat_params = {}
@@ -477,7 +506,6 @@ class ToolRegistry:
                                 endpoint_url += f"?{qs}"
                                 
                     if not endpoint_url.startswith("http"):
-                        from agent.entity_resolver import CRM_API_BASE
                         if endpoint_url.startswith("/api/v1"):
                             endpoint_url = endpoint_url[7:]
                         endpoint_url = CRM_API_BASE.rstrip('/') + '/' + endpoint_url.lstrip('/')
@@ -506,7 +534,8 @@ class ToolRegistry:
                             logger.info(f"Payload:\n{json.dumps(json_data)}")
                             logger.info(f"Timestamp:\n{datetime.datetime.now().isoformat()}")
 
-                            async with session.request(method, endpoint_url, headers=headers, json=json_data, timeout=15.0) as response:
+                            import aiohttp
+                            async with session.request(method, endpoint_url, headers=headers, json=json_data, timeout=aiohttp.ClientTimeout(total=2.5)) as response:
                                 http_status = response.status
                                 body_text = await response.text()
                                 req_exec_time = round((time.time() - req_start_time) * 1000, 2)
@@ -527,24 +556,7 @@ class ToolRegistry:
                                     except Exception:
                                         raw_backend_response = {"text": body_text}
                                 else:
-                                    text_data = body_text
-                                    exception_obj = RuntimeError(f"HTTP {response.status}: {text_data}")
-                                    fallback_reason = f"REST API returned HTTP status {response.status} with body: {text_data[:200]}"
-                                    logger.warning(f"[ToolRegistry] REST API failed with HTTP {response.status}. Attempting fallback to semantic wrapper...")
-                                    for fallback_impl in sorted(implementations, key=lambda x: x.get("priority", 99)):
-                                        if fallback_impl.get("type") == "wrapper":
-                                            f_func_name = fallback_impl.get("function_call")
-                                            f_wrapper = SEMANTIC_TOOL_MAP.get(f_func_name)
-                                            if f_wrapper:
-                                                try:
-                                                    raw_backend_response = await f_wrapper(ctx)
-                                                    exception_obj = None
-                                                    impl_type = "wrapper (fallback)"
-                                                    func_name = f_func_name
-                                                    logger.info(f"[ToolRegistry Fallback Success] Cap: {target_cap_id} via {f_func_name}")
-                                                    break
-                                                except Exception as fallback_exc:
-                                                    logger.error(f"[ToolRegistry Fallback Failure] {fallback_exc}\n{traceback.format_exc()}")
+                                    exception_obj = RuntimeError(f"HTTP {response.status}: {body_text[:200]}")
                     except Exception as e:
                         exception_obj = e
                         logger.error("=" * 80)
@@ -553,27 +565,123 @@ class ToolRegistry:
                         logger.error(f"Exception Type   : {type(e).__name__}")
                         logger.error(f"Exception Message: {str(e)}")
                         logger.error(f"Full Traceback   :\n{traceback.format_exc()}")
+
+                    # Universal Fallback: If API attempt failed or returned error/empty payload, try semantic wrappers
+                    is_invalid_payload = False
+                    if not raw_backend_response:
+                        is_invalid_payload = True
+                    elif isinstance(raw_backend_response, dict):
+                        # Check top-level error indicators
+                        if raw_backend_response.get("status") in ["error", "failure", 400, 401, 403, 404, 500]:
+                            is_invalid_payload = True
+                        elif raw_backend_response.get("success") is False:
+                            is_invalid_payload = True
+                        elif "error_message" in raw_backend_response:
+                            is_invalid_payload = True
+                        elif "error" in raw_backend_response and not isinstance(raw_backend_response.get("error"), bool):
+                            is_invalid_payload = True
+                        else:
+                            # Deep-check: Node backend wraps response in 'data' key
+                            inner_data = raw_backend_response.get("data", raw_backend_response)
+                            if isinstance(inner_data, dict):
+                                if "error_message" in inner_data:
+                                    is_invalid_payload = True
+                                elif inner_data.get("status") in ["error", "failure"]:
+                                    is_invalid_payload = True
+                                elif inner_data.get("success") is False:
+                                    is_invalid_payload = True
+
+                    if exception_obj is not None or is_invalid_payload:
+                        logger.warning(f"[ToolRegistry] API attempt for cap '{target_cap_id}' failed or returned error payload (exc: {exception_obj}, invalid_payload: {is_invalid_payload}). Attempting fallback to semantic wrapper...")
+                        for fallback_impl in sorted(implementations, key=lambda x: x.get("priority", 99)):
+                            if fallback_impl.get("type") == "wrapper":
+                                f_func_name = fallback_impl.get("function_call")
+                                f_wrapper = SEMANTIC_TOOL_MAP.get(f_func_name)
+                                if f_wrapper:
+                                    try:
+                                        fallback_res = await f_wrapper(ctx)
+                                        if fallback_res:
+                                            raw_backend_response = fallback_res
+                                            exception_obj = None
+                                            impl_type = "wrapper (fallback)"
+                                            func_name = f_func_name
+                                            logger.info(f"[ToolRegistry Fallback Success] Cap: {target_cap_id} via wrapper '{f_func_name}'")
+                                            break
+                                    except Exception as fallback_exc:
+                                        logger.error(f"[ToolRegistry Fallback Failure] {fallback_exc}\n{traceback.format_exc()}")
             else:
                 exception_obj = RuntimeError(f"Unknown implementation type '{impl_type}'.")
 
             exec_time_ms = round((time.time() - start_time) * 1000, 2)
             
+            # Identify exact REST failure reason if REST was attempted & failed
+            rest_failure_reason = "None"
+            if is_rest_attempt:
+                if http_status == 401:
+                    rest_failure_reason = "Invalid JWT / Unauthorized"
+                elif http_status == 404:
+                    rest_failure_reason = "Missing endpoint (404)"
+                elif http_status >= 500:
+                    rest_failure_reason = f"Backend Internal Error ({http_status})"
+                elif exception_obj:
+                    err_str = str(exception_obj).lower()
+                    if "timeout" in err_str or "timed out" in err_str:
+                        rest_failure_reason = "Timeout"
+                    elif "refused" in err_str or "cannot connect" in err_str or "connector" in err_str:
+                        rest_failure_reason = "Backend unreachable"
+                    else:
+                        rest_failure_reason = f"Configuration / Network Issue ({exception_obj})"
+
             # Format capability envelope
             env = format_capability_envelope(target_cap_id, raw_backend_response, error_err=str(exception_obj) if exception_obj else None)
             
-            logger.info("=" * 60)
-            logger.info(f"[ToolRegistry Audit] CAPABILITY EXECUTION COMPLETED")
-            logger.info(f"  • Capability ID        : {target_cap_id}")
-            logger.info(f"  • Implementation Type  : {impl_type}")
-            logger.info(f"  • Selected Function/URL: {func_name}")
-            logger.info(f"  • Priority Score       : {priority} (Score: {score})")
-            logger.info(f"  • Execution Time       : {exec_time_ms} ms")
-            logger.info(f"  • HTTP Status Code     : {http_status}")
-            logger.info(f"  • Exception Encountered: {exception_obj or 'None'}")
-            logger.info(f"  • Envelope Status      : {env['status']} (Confidence: {env['confidence']})")
-            logger.info(f"  • Raw Backend Response : {json.dumps(raw_backend_response, default=str)[:500] if raw_backend_response else 'None'}")
-            logger.info(f"  • Final Envelope Sent  : {json.dumps(env['payload'], default=str)[:500]}")
-            logger.info("=" * 60)
+            # Secondary Failover: If envelope formatting resolved to an error/unavailable status and fallback hasn't executed yet, force semantic wrapper fallback
+            if env.get("status") != "success" and impl_type != "wrapper (fallback)":
+                logger.warning(f"[ToolRegistry] Envelope formatting returned status '{env.get('status')}'. Forcing secondary fallback to semantic wrapper...")
+                for fallback_impl in sorted(implementations, key=lambda x: x.get("priority", 99)):
+                    if fallback_impl.get("type") == "wrapper":
+                        f_func_name = fallback_impl.get("function_call")
+                        f_wrapper = SEMANTIC_TOOL_MAP.get(f_func_name)
+                        if f_wrapper:
+                            try:
+                                fallback_res = await f_wrapper(ctx)
+                                if fallback_res:
+                                    raw_backend_response = fallback_res
+                                    exception_obj = None
+                                    impl_type = "wrapper (fallback)"
+                                    func_name = f_func_name
+                                    env = format_capability_envelope(target_cap_id, raw_backend_response)
+                                    logger.info(f"[ToolRegistry Secondary Fallback Success] Cap: {target_cap_id} via wrapper '{f_func_name}'")
+                                    break
+                            except Exception as fallback_exc:
+                                logger.error(f"[ToolRegistry Secondary Fallback Failure] {fallback_exc}\n{traceback.format_exc()}")
+            
+            rest_enabled_val = os.getenv("USE_CRM_BACKEND_API", "true")
+            is_rest_enabled = rest_enabled_val.lower() in ("true", "1", "yes")
+            rest_executed = is_rest_attempt
+            fallback_used = (impl_type == "wrapper (fallback)")
+            exec_source = "Node Backend" if (rest_executed and not fallback_used and http_status == 200) else ("Semantic Wrapper" if fallback_used else "None")
+
+            logger.info("=" * 70)
+            logger.info("END-TO-END NODE BACKEND INTEGRATION VERIFICATION")
+            logger.info("=" * 70)
+            logger.info(f"  • Environment Config Resolved Value : USE_CRM_BACKEND_API={rest_enabled_val} | CRM_API_BASE={CRM_API_BASE}")
+            logger.info(f"  • Selected Execution Mode           : {'REST' if is_rest_attempt else 'Semantic Wrapper'}")
+            logger.info(f"  • Selected Endpoint                 : {func_name if is_rest_attempt else 'N/A'}")
+            logger.info(f"  • Authorization Header Present      : {bool(jwt_token)} (Token Length: {len(jwt_token) if jwt_token else 0})")
+            logger.info(f"  • HTTP Status Code                  : {http_status}")
+            logger.info(f"  • Response Time                     : {exec_time_ms} ms")
+            logger.info(f"  • Fallback Triggered                : {'YES' if fallback_used else 'NO'}")
+            if is_rest_attempt and fallback_used:
+                logger.info(f"  • REST Failure Reason               : {rest_failure_reason}")
+            logger.info("-" * 70)
+            logger.info("FINAL EXECUTION SUMMARY:")
+            logger.info(f"  REST Enabled           : {'YES' if is_rest_enabled else 'NO'}")
+            logger.info(f"  REST Executed          : {'YES' if rest_executed else 'NO'}")
+            logger.info(f"  Semantic Fallback Used : {'YES' if fallback_used else 'NO'}")
+            logger.info(f"  Backend Status         : {http_status if http_status else 'N/A'}")
+            logger.info(f"  Execution Source       : {exec_source}")
+            logger.info("=" * 70)
 
             logger.info(f"[TOOL REGISTRY RETURN] Completed execution of node for capability '{target_cap_id}'. Returning envelope payload.")
             return {

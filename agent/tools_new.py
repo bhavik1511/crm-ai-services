@@ -127,7 +127,7 @@ async def get_anomaly_alerts(user_id: int, role: str) -> list:
             SELECT COUNT(*) as cnt
             FROM proposal p
             WHERE p.is_active = 1
-              AND p.proposal_status_id IN (1, 7, 8)
+              AND p.proposal_status_id IN (1, 2, 7, 8)
               AND p.project_id IS NULL
               AND DATEDIFF(CURDATE(), p.updated_at) > 30
         """

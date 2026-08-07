@@ -289,6 +289,7 @@ CRITICAL SQL RULES:
 - For leave balance: query employee_leave_balance table (columns: employee_id, leave_type_id, balance, year).
 - For payroll: query emp_payroll table (employee_id, month, year, basic_salary, total_allowances, total_deductions, net_salary).
 - For salary: query employee_salary_details or employees (emp_basic_salary, emp_gross_salary).
+- kpi_master table contains target metrics for service_line_id, department_id, and employee_id ONLY. It has NO project_id column and CANNOT be joined to projects! For project performance/recoverability/score queries, measure recoverability (approved_fees vs actual cost from timesheet_project) or project status on projects table.
 
 --- RESOURCE UTILIZATION QUERY TEMPLATE ---
 -- The Resource Utilization Report dashboard uses timesheet_project AND ts_project_date.

@@ -25,6 +25,14 @@ FEW_SHOT_SQL_EXAMPLES: List[Dict[str, str]] = [
         "query": "SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p WHERE p.proposal_status_id IN (1, 7, 8) AND p.project_id IS NULL AND p.created_at BETWEEN '2025-10-01' AND '2026-09-30 23:59:59'"
     },
     {
+        "input": "How many rejected proposals do we have?",
+        "query": "SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p WHERE p.is_active = 1 AND p.proposal_status_id = 4 AND p.created_at BETWEEN '2025-10-01' AND '2026-09-30 23:59:59'"
+    },
+    {
+        "input": "How many accepted proposals do we have?",
+        "query": "SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p WHERE p.is_active = 1 AND p.proposal_status_id = 3 AND p.created_at BETWEEN '2025-10-01' AND '2026-09-30 23:59:59'"
+    },
+    {
         "input": "What are the high-value proposals by customer?",
         "query": "SELECT p.id AS proposal_id, COALESCE(c.customer_name, co.cd_company_name, co.first_name, 'N/A') AS client_name, p.total_costs AS budget_value, DATEDIFF(CURDATE(), p.created_at) AS age_in_days FROM proposal p LEFT JOIN customers c ON p.client_id = c.id LEFT JOIN contacts co ON p.contact_id = co.id WHERE p.is_active = 1 AND p.created_at BETWEEN '2025-10-01' AND '2026-09-30 23:59:59' ORDER BY p.total_costs DESC, p.created_at DESC LIMIT 5"
     },
@@ -34,7 +42,7 @@ FEW_SHOT_SQL_EXAMPLES: List[Dict[str, str]] = [
     },
     {
         "input": "List the total number and budget of proposals by proposal status.",
-        "query": "SELECT ps.name, COUNT(p.id) AS total, ROUND(COALESCE(SUM(p.agreed_fees),0),2) AS budget FROM m_proposal_status ps LEFT JOIN proposal p ON p.proposal_status_id = ps.id AND p.created_at BETWEEN '2025-10-01' AND '2026-09-30 23:59:59' WHERE ps.id IN (1,7,8) GROUP BY ps.id, ps.name ORDER BY ps.sequence"
+        "query": "SELECT ps.name, COUNT(p.id) AS total, ROUND(COALESCE(SUM(p.agreed_fees),0),2) AS budget FROM m_proposal_status ps LEFT JOIN proposal p ON p.proposal_status_id = ps.id AND p.created_at BETWEEN '2025-10-01' AND '2026-09-30 23:59:59' WHERE ps.id NOT IN (9,10) GROUP BY ps.id, ps.name ORDER BY ps.sequence"
     },
     {
         "input": "What is our total outstanding receivables amount?",
@@ -134,7 +142,7 @@ FEW_SHOT_SQL_EXAMPLES: List[Dict[str, str]] = [
     },
     {
         "input": "Show the proposal win rate by service line",
-        "query": "SELECT sl.name AS service_line, COUNT(p.id) AS total_proposals, SUM(CASE WHEN p.proposal_status_id = 2 THEN 1 ELSE 0 END) AS won, ROUND(SUM(CASE WHEN p.proposal_status_id = 2 THEN 1 ELSE 0 END) * 100.0 / COUNT(p.id), 1) AS win_rate_pct FROM m_serviceline sl JOIN proposal p ON p.serviceline_id = sl.id WHERE sl.is_active = 1 GROUP BY sl.id, sl.name HAVING total_proposals > 0 ORDER BY win_rate_pct DESC"
+        "query": "SELECT sl.name AS service_line, COUNT(p.id) AS total_proposals, SUM(CASE WHEN p.proposal_status_id = 3 THEN 1 ELSE 0 END) AS won, ROUND(SUM(CASE WHEN p.proposal_status_id = 3 THEN 1 ELSE 0 END) * 100.0 / COUNT(p.id), 1) AS win_rate_pct FROM m_serviceline sl JOIN proposal p ON p.serviceline_id = sl.id WHERE sl.is_active = 1 GROUP BY sl.id, sl.name HAVING total_proposals > 0 ORDER BY win_rate_pct DESC"
     },
     {
         "input": "What is the GOSI deduction for employee ID 5?",

@@ -33,6 +33,23 @@ def route_query_fast_path(question: str, user_context: Optional[Dict[str, Any]] 
     raw_q = question.strip()
     q_clean = raw_q.lower()
 
+    # ── Typo normalization (runs before ALL keyword checks) ─────────────────
+    _TYPO_SUBS = [
+        (re.compile(r'\bservice\s+li[a-z]{0,3}\b', re.IGNORECASE), 'service line'),
+        (re.compile(r'\bperform[a-z]{0,5}\b',      re.IGNORECASE), 'performance'),
+        (re.compile(r'\bserv[a-z]{0,3}\s+line\b',  re.IGNORECASE), 'service line'),
+        (re.compile(r'\bgp\s+perf[a-z]{0,7}\b',   re.IGNORECASE), 'gp performance'),
+        (re.compile(r'\bgross\s+prof[a-z]{0,2}\b', re.IGNORECASE), 'gross profit'),
+        (re.compile(r'\bdep[a-z]{0,6}\s+util[a-z]{0,6}\b', re.IGNORECASE), 'department utilization'),
+        (re.compile(r'\butili[zs]a[a-z]{0,4}\b',  re.IGNORECASE), 'utilization'),
+        (re.compile(r'\brecei[a-z]{0,6}\b',        re.IGNORECASE), 'receivables'),
+        (re.compile(r'\brevenu[a-z]{0,2}\b',        re.IGNORECASE), 'revenue'),
+        (re.compile(r'\brecoverab[a-z]{0,4}\b',   re.IGNORECASE), 'recoverability'),
+        (re.compile(r'\breoverab[a-z]{0,4}\b',    re.IGNORECASE), 'recoverability'),
+    ]
+    for _pat, _rep in _TYPO_SUBS:
+        q_clean = _pat.sub(_rep, q_clean)
+
     # 0. Prompt Injection Guard: Reject fast-path for prompts containing instruction override or exploit markers
     INJECTION_MARKERS = [
         "ignore previous", "ignore instructions", "ignore rules", "ignore context", "ignore tier",
@@ -85,11 +102,17 @@ def route_query_fast_path(question: str, user_context: Optional[Dict[str, Any]] 
                 matched_capabilities.append(cap)
                 break
 
-    # If prompt matches multiple business capabilities -> Fall back to EnterprisePlanner LLM
+    # Disambiguation: If specific domain/report capability matched along with generic project containers, prefer the specific capability
     if len(matched_capabilities) > 1:
-        cap_ids = [c["id"] for c in matched_capabilities]
-        logger.info(f"[MetadataRouter] Query matched multiple catalog capabilities ({cap_ids}) -> Delegating to EnterprisePlanner LLM.")
-        return None
+        matched_ids = [c["id"] for c in matched_capabilities]
+        generic_caps = {"project_details", "project_search"}
+        specific_caps = [c for c in matched_capabilities if c["id"] not in generic_caps]
+        if len(specific_caps) == 1:
+            logger.info(f"[MetadataRouter] Disambiguated multiple capabilities {matched_ids} -> Selected specific domain capability '{specific_caps[0]['id']}' over generic containers.")
+            matched_capabilities = specific_caps
+        else:
+            logger.info(f"[MetadataRouter] Query matched multiple catalog capabilities ({matched_ids}) -> Delegating to EnterprisePlanner LLM.")
+            return None
 
     # 3. Fast-Path Match Found
     if len(matched_capabilities) == 1:

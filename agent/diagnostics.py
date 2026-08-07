@@ -40,14 +40,28 @@ class DiagnosticsTracker:
             "request_id": self.request_id,
             "session_id": self.session_id,
             "timestamp": datetime.utcnow().isoformat(),
-            "original_question": "",
-            "context_summary": {},
-            "planner_output": {},
-            "entity_resolution": [],
-            "execution_validation": {},
-            "tool_registry_selection": [],
-            "tool_execution_results": [],
-            "final_response_metrics": {}
+            "1_original_user_query": "",
+            "2_planner_output": {
+                "selected_business_capabilities": [],
+                "confidence": 1.0,
+                "presentation_mode": "REPORT",
+                "extracted_filters": {},
+                "missing_information": []
+            },
+            "3_entity_resolver_output": {
+                "project": None,
+                "customer": None,
+                "employee": None,
+                "service_line": None,
+                "department": None,
+                "financial_year": None,
+                "month": None,
+                "date_range": None
+            },
+            "4_tool_registry_output": [],
+            "5_backend_response": [],
+            "6_synthesizer_input": [],
+            "7_final_response": {}
         }
 
     # --- Timers ---
@@ -66,101 +80,95 @@ class DiagnosticsTracker:
 
     def track_time(self, metric_name: str):
         """Context manager to easily track block execution time."""
-        if not AI_DEBUG_MODE:
-            # Dummy context manager for zero-overhead when disabled
-            class DummyTimer:
-                def __enter__(self): pass
-                def __exit__(self, *args): pass
-            return DummyTimer()
         return self._Timer(self, metric_name)
 
     # --- Data Collectors ---
     def record_request_context(self, question: str, history_len: int, role: str):
-        if not AI_DEBUG_MODE: return
-        self.replay["original_question"] = question
-        self.replay["context_summary"] = {
-            "history_messages": history_len,
-            "user_role": role
-        }
+        self.replay["1_original_user_query"] = question
 
     def record_planner_output(self, execution_plan: Dict[str, Any]):
-        if not AI_DEBUG_MODE: return
-        # Strip sensitive info if any existed, though Planner output should be abstract
-        self.replay["planner_output"] = {
-            "business_goal": execution_plan.get("business_goal"),
-            "confidence_score": execution_plan.get("confidence_score"),
-            "business_capabilities": execution_plan.get("business_capabilities", []),
+        caps = execution_plan.get("business_capabilities", [])
+        filters = {}
+        for c in caps:
+            filters.update(c.get("filters", {}))
+            filters.update(c.get("context", {}))
+        self.replay["2_planner_output"] = {
+            "selected_business_capabilities": [c.get("id") for c in caps],
+            "confidence": execution_plan.get("confidence_score", 1.0),
+            "presentation_mode": execution_plan.get("presentation_mode", "REPORT"),
+            "extracted_filters": filters,
             "missing_information": execution_plan.get("missing_information", [])
         }
 
     def record_entity_resolution(self, resolved_entities: List[Dict[str, Any]], clarifications: List[str]):
-        if not AI_DEBUG_MODE: return
-        
-        safe_entities = []
-        for ent in resolved_entities:
-            # Only keep structural metadata, strip raw payload just in case
-            safe_entities.append({
-                "status": ent.get("status"),
-                "entity_type": ent.get("entity_type"),
-                "query": ent.get("query"),
-                "entity_id": ent.get("entity_id"),
-                "confidence": ent.get("confidence")
-            })
-            
-        self.replay["entity_resolution"] = {
-            "resolved_entities": safe_entities,
-            "clarifications_issued": clarifications
+        entity_summary = {
+            "project": None,
+            "customer": None,
+            "employee": None,
+            "service_line": None,
+            "department": None,
+            "financial_year": None,
+            "month": None,
+            "date_range": None
         }
+        for ent in resolved_entities:
+            e_type = ent.get("entity_type", "").lower()
+            val = ent.get("entity_value") or ent.get("query")
+            if "project" in e_type: entity_summary["project"] = val
+            elif "customer" in e_type: entity_summary["customer"] = val
+            elif "employee" in e_type or "emp" in e_type: entity_summary["employee"] = val
+            elif "service" in e_type: entity_summary["service_line"] = val
+            elif "dept" in e_type or "department" in e_type: entity_summary["department"] = val
+            elif "year" in e_type or "fy" in e_type: entity_summary["financial_year"] = val
+            elif "month" in e_type: entity_summary["month"] = val
+            elif "date" in e_type or "range" in e_type: entity_summary["date_range"] = val
+        self.replay["3_entity_resolver_output"] = entity_summary
 
     def record_validation(self, is_valid: bool, errors: List[str]):
-        if not AI_DEBUG_MODE: return
         self.replay["execution_validation"] = {
             "is_valid": is_valid,
             "errors": errors
         }
 
     def record_registry_selection(self, execution_graph: List[Dict[str, Any]]):
-        if not AI_DEBUG_MODE: return
         selections = []
         for node in execution_graph:
             impl = node.get("implementation") or node.get("selected_implementation") or {}
             selections.append({
                 "capability_id": node.get("capability_id"),
-                "implementation_type": impl.get("type") or node.get("implementation_type"),
-                "priority": impl.get("priority") if impl.get("priority") is not None else node.get("priority"),
-                "target": impl.get("endpoint") or impl.get("function_call") or node.get("endpoint"),
-                "backend_endpoint": node.get("backend_endpoint")
+                "backend_endpoint_selected": impl.get("endpoint") or impl.get("function_call") or node.get("endpoint"),
+                "query_parameters": node.get("query_parameters") or node.get("context") or {},
+                "request_body": node.get("request_body") or {}
             })
-        self.replay["tool_registry_selection"] = selections
+        self.replay["4_tool_registry_output"] = selections
 
     def record_tool_execution(self, tool_results: List[Dict[str, Any]]):
-        if not AI_DEBUG_MODE: return
         safe_results = []
+        synthesizer_inputs = []
         for res in tool_results:
             safe_results.append({
-                "capability": res.get("capability"),
-                "success": res.get("status") == "success" and "error" not in res and not res.get("error"),
-                "error_message": res.get("error"),
-                "implementation_type": res.get("implementation_type"),
-                "endpoint": res.get("function_call"),
-                "execution_time_ms": res.get("execution_time_ms"),
-                "data_points_returned": len(res.get("result", [])) if isinstance(res.get("result"), list) else (len(res.get("result", {})) if isinstance(res.get("result"), dict) else (1 if res.get("result") else 0))
+                "http_status": res.get("http_status", 200),
+                "records_returned": len(res.get("result", [])) if isinstance(res.get("result"), list) else (len(res.get("result", {})) if isinstance(res.get("result"), dict) else 1),
+                "payload_summary": str(res.get("result"))[:300]
             })
-        self.replay["tool_execution_results"] = safe_results
+            synthesizer_inputs.append({
+                "capability": res.get("capability"),
+                "data": res.get("result")
+            })
+        self.replay["5_backend_response"] = safe_results
+        self.replay["6_synthesizer_input"] = synthesizer_inputs
 
     def record_synthesis(self, final_response: Dict[str, Any]):
-        if not AI_DEBUG_MODE: return
-        self.replay["final_response_metrics"] = {
+        self.replay["7_final_response"] = {
             "type": final_response.get("type"),
+            "content_preview": str(final_response.get("content", ""))[:300],
             "has_chart": bool(final_response.get("chart_data")),
             "is_clarification": final_response.get("is_clarification", False)
         }
 
     # --- Replay Generation ---
     def dump_trace(self):
-        """Prints the full Conversation Replay JSON if Debug Mode is enabled."""
-        if not AI_DEBUG_MODE: return
-        
+        """Prints the full 7-Stage Execution Replay JSON."""
         self.timings["total_ms"] = round((time.time() - self.start_time) * 1000, 2)
         
         trace = {
@@ -169,9 +177,8 @@ class DiagnosticsTracker:
             "CONVERSATION_REPLAY": self.replay
         }
         
-        # Log purely to stdout for developers
         print("\n" + "="*80)
         print(f"[DEBUG TRACE] AI Execution Pipeline | ID: {self.request_id}")
         print("="*80)
-        print(json.dumps(trace, indent=2))
+        print(json.dumps(trace, indent=2, default=str))
         print("="*80 + "\n")

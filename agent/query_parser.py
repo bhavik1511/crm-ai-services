@@ -93,7 +93,8 @@ def _extract_person_name(question: str) -> str:
     if m:
         candidate = m.group(1).strip()
         candidate = re.sub(r'^(the|a|an)\s+', '', candidate, flags=re.IGNORECASE).strip()
-        candidate = re.sub(r'\b(report|summary|data|details?|for|in|on|last|next|this|year|month|quarter|fy|20\d\d)\b.*$', '', candidate, flags=re.IGNORECASE).strip()
+        candidate = re.sub(r'\b(report|summary|data|details?|for|in|on|last|next|this|year|month|quarter|fy|20\d\d|got\s+it|please|download|show|give|button|thanks|ok|okay|tell|can\s+you)\b.*$', '', candidate, flags=re.IGNORECASE).strip()
+        candidate = re.sub(r'[^a-zA-Z0-9\s]', '', candidate).strip()
         if len(candidate) > 2 and not _is_company_name(candidate) and candidate.lower() not in _MONTH_NAMES_SET and candidate.lower() not in KNOWN_SERVICE_LINES:
             return candidate
 
@@ -101,10 +102,38 @@ def _extract_person_name(question: str) -> str:
     if m:
         candidate = m.group(1).strip()
         candidate = re.sub(r'^(the|a|an)\s+', '', candidate, flags=re.IGNORECASE).strip()
-        candidate = re.sub(r'\b(report|summary|data|details?|for|in|on|last|next|this|year|month|quarter|fy|20\d\d)\b.*$', '', candidate, flags=re.IGNORECASE).strip()
+        candidate = re.sub(r'\b(report|summary|data|details?|for|in|on|last|next|this|year|month|quarter|fy|20\d\d|got\s+it|please|download|show|give|button|thanks|ok|okay|tell|can\s+you)\b.*$', '', candidate, flags=re.IGNORECASE).strip()
+        candidate = re.sub(r'[^a-zA-Z0-9\s]', '', candidate).strip()
         if len(candidate) > 2 and not _is_company_name(candidate) and candidate.lower() not in _MONTH_NAMES_SET and candidate.lower() not in KNOWN_SERVICE_LINES:
             return candidate
     return ""
+
+def _extract_company_name(question: str) -> str:
+    """Extracts customer / company name from question text."""
+    if not question:
+        return ""
+    q = question.strip()
+    
+    # 1. Pattern: 'customer/client <Name>' or 'customer/client is <Name>'
+    m_cust = re.search(r'\b(?:customer|client)\s+(?:name\s+)?(?:is\s+)?([A-Za-z0-9\.\,\'\&\-\s]{3,40})', q, re.IGNORECASE)
+    if m_cust:
+        candidate = m_cust.group(1).strip()
+        candidate = re.sub(r'\b(report|summary|data|details?|active|projects?|invoices?|for|in|on|last|next|this|year|month|fy|20\d\d)\b.*$', '', candidate, flags=re.IGNORECASE).strip()
+        if len(candidate) >= 3 and candidate.lower() not in _MONTH_NAMES_SET and candidate.lower() not in KNOWN_SERVICE_LINES:
+            return candidate
+
+    # 2. Pattern: 'of <Name>' or 'for <Name>' (e.g., 'projects of Dr. Hasan Ali Radhi', 'active of Dr. Hasan Ali Radhi')
+    m_of = re.search(r'\b(?:of|for)\s+([A-Za-z0-9\.\,\'\&\-\s]{3,40})', q, re.IGNORECASE)
+    if m_of:
+        candidate = m_of.group(1).strip()
+        candidate = re.sub(r'\b(report|summary|data|details?|last|next|this|year|month|quarter|fy|20\d\d|please|download|show|give)\b.*$', '', candidate, flags=re.IGNORECASE).strip()
+        candidate = candidate.strip(" .,").strip()
+        _STOP_WORDS = {'all', 'service line', 'department', 'last month', 'this month', 'last year', 'this year', 'active projects', 'projects', 'revenue', 'receivables'}
+        if len(candidate) >= 3 and candidate.lower() not in _STOP_WORDS and candidate.lower() not in _MONTH_NAMES_SET and candidate.lower() not in KNOWN_SERVICE_LINES:
+            return candidate
+
+    return ""
+
 
 def _extract_date_range(question: str) -> tuple[Optional[str], Optional[str], bool]:
     q = question.lower()
@@ -124,16 +153,18 @@ def _extract_date_range(question: str) -> tuple[Optional[str], Optional[str], bo
 
     month_m = re.search(
         r'\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|'
-        r'jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)'
-        r'\s+(\d{4})\b', q)
+        r'jul(?:y)?|aug(?:ust)?|sep(?:tember|t)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)'
+        r'\s+(\d{2,4})\b', q)
     month_no_year_m = re.search(
         r'\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|'
-        r'jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b', q)
+        r'jul(?:y)?|aug(?:ust)?|sep(?:tember|t)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b', q)
 
     if month_m or month_no_year_m:
         if month_m:
             m_str = month_m.group(1)[:3]
             y_val = int(month_m.group(2))
+            if y_val < 100:
+                y_val += 2000
         else:
             m_str = month_no_year_m.group(1)[:3]
             y_val = now.year
@@ -284,14 +315,21 @@ def _lookup_employee_by_name(name: str) -> Optional[tuple[int, str]]:
         if not rows:
             return None
             
+        # Strip filler words & trailing non-alphanumeric noise from target name
+        cleaned_target = re.sub(r'\b(got\s+it|please|download|show|give|button|thanks|ok|okay|report|summary|kpi|the|a|an)\b.*$', '', name, flags=re.IGNORECASE).strip()
+        cleaned_target = re.sub(r'[^a-zA-Z0-9\s]', '', cleaned_target).strip()
+        if not cleaned_target:
+            cleaned_target = name.strip()
+
         # Map lowercased names to their actual data
         name_map = {str(r[1]).lower(): (int(r[0]), str(r[1])) for r in rows}
-        target_name = name.lower().strip()
+        target_name = cleaned_target.lower()
         
-        # 1. Exact match (case/space insensitive by stripping spaces)
+        # 1. Exact match (case/space insensitive by stripping spaces) — check BOTH directions
         target_no_spaces = target_name.replace(' ', '')
         for emp_name_lower, emp_data in name_map.items():
-            if target_no_spaces in emp_name_lower.replace(' ', ''):
+            emp_no_spaces = emp_name_lower.replace(' ', '')
+            if target_no_spaces in emp_no_spaces or emp_no_spaces in target_no_spaces:
                 return emp_data
                 
         # 2. Fuzzy match full name
