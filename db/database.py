@@ -94,9 +94,19 @@ def get_db_engine() -> Engine:
 
     # Safe column migration: add new columns if they don't exist yet (compatible with all MySQL versions)
     _col_migrations = [
-        ("status",        "ALTER TABLE ai_chatbot_usage ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'success'"),
-        ("error_type",    "ALTER TABLE ai_chatbot_usage ADD COLUMN error_type VARCHAR(50) NULL"),
-        ("error_message", "ALTER TABLE ai_chatbot_usage ADD COLUMN error_message VARCHAR(512) NULL"),
+        ("status",                 "ALTER TABLE ai_chatbot_usage ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'success'"),
+        ("error_type",             "ALTER TABLE ai_chatbot_usage ADD COLUMN error_type VARCHAR(50) NULL"),
+        ("error_message",          "ALTER TABLE ai_chatbot_usage ADD COLUMN error_message VARCHAR(512) NULL"),
+        ("trace_id",               "ALTER TABLE ai_chatbot_usage ADD COLUMN trace_id VARCHAR(255) NULL"),
+        ("capability_id",          "ALTER TABLE ai_chatbot_usage ADD COLUMN capability_id VARCHAR(100) NULL"),
+        ("operation",              "ALTER TABLE ai_chatbot_usage ADD COLUMN operation VARCHAR(50) NULL"),
+        ("execution_path",          "ALTER TABLE ai_chatbot_usage ADD COLUMN execution_path VARCHAR(50) NULL"),
+        ("planner_tokens",         "ALTER TABLE ai_chatbot_usage ADD COLUMN planner_tokens INT DEFAULT 0"),
+        ("synthesizer_tokens",     "ALTER TABLE ai_chatbot_usage ADD COLUMN synthesizer_tokens INT DEFAULT 0"),
+        ("clarification_required", "ALTER TABLE ai_chatbot_usage ADD COLUMN clarification_required BOOLEAN DEFAULT FALSE"),
+        ("clarification_reason",   "ALTER TABLE ai_chatbot_usage ADD COLUMN clarification_reason VARCHAR(255) NULL"),
+        ("backend_execution_ms",   "ALTER TABLE ai_chatbot_usage ADD COLUMN backend_execution_ms INT DEFAULT 0"),
+        ("total_execution_ms",     "ALTER TABLE ai_chatbot_usage ADD COLUMN total_execution_ms INT DEFAULT 0"),
     ]
     for col_name, col_sql in _col_migrations:
         with _engine.begin() as _conn:
@@ -127,10 +137,20 @@ async def save_token_usage_async(
     total_cost_usd: float,
     status: str = "success",
     error_type: str = None,
-    error_message: str = None
+    error_message: str = None,
+    trace_id: str = None,
+    capability_id: str = None,
+    operation: str = None,
+    execution_path: str = None,
+    planner_tokens: int = 0,
+    synthesizer_tokens: int = 0,
+    clarification_required: bool = False,
+    clarification_reason: str = None,
+    backend_execution_ms: int = 0,
+    total_execution_ms: int = 0
 ):
     """
-    Asynchronously saves the token usage record for chatbot to MySQL (ai_chatbot_usage).
+    Asynchronously saves the authoritative token usage & telemetry record for chatbot to MySQL (ai_chatbot_usage).
     """
     def _insert_sync():
         try:
@@ -139,8 +159,8 @@ async def save_token_usage_async(
                 conn.execute(
                     text("""
                         INSERT INTO ai_chatbot_usage 
-                        (employee_id, session_id, model_name, input_tokens, output_tokens, total_tokens, total_cost_usd, status, error_type, error_message)
-                        VALUES (:emp_id, :sess_id, :model, :in_tok, :out_tok, :tot_tok, :cost, :status, :error_type, :error_message)
+                        (employee_id, session_id, model_name, input_tokens, output_tokens, total_tokens, total_cost_usd, status, error_type, error_message, trace_id, capability_id, operation, execution_path, planner_tokens, synthesizer_tokens, clarification_required, clarification_reason, backend_execution_ms, total_execution_ms)
+                        VALUES (:emp_id, :sess_id, :model, :in_tok, :out_tok, :tot_tok, :cost, :status, :error_type, :error_message, :trace_id, :cap_id, :op, :exec_path, :p_tok, :s_tok, :clar_req, :clar_reason, :b_ms, :t_ms)
                     """),
                     {
                         "emp_id": employee_id,
@@ -152,7 +172,17 @@ async def save_token_usage_async(
                         "cost": total_cost_usd,
                         "status": status,
                         "error_type": error_type,
-                        "error_message": (error_message or "")[:512] if error_message else None
+                        "error_message": (error_message or "")[:512] if error_message else None,
+                        "trace_id": trace_id,
+                        "cap_id": capability_id,
+                        "op": operation,
+                        "exec_path": execution_path,
+                        "p_tok": planner_tokens,
+                        "s_tok": synthesizer_tokens,
+                        "clar_req": clarification_required,
+                        "clar_reason": clarification_reason,
+                        "b_ms": backend_execution_ms,
+                        "t_ms": total_execution_ms
                     }
                 )
         except Exception as e:

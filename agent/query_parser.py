@@ -136,67 +136,13 @@ def _extract_company_name(question: str) -> str:
 
 
 def _extract_date_range(question: str) -> tuple[Optional[str], Optional[str], bool]:
-    q = question.lower()
-    from datetime import datetime
-    now = datetime.now()
-
-    dd_mm_range = re.search(r'(\d{2}-\d{2}-\d{4})\s+to\s+(\d{2}-\d{2}-\d{4})', q)
-    if dd_mm_range:
-        def _dmy_to_ymd(s: str) -> str:
-            d, m, y = s.split('-')
-            return f"{y}-{m}-{d}"
-        return _dmy_to_ymd(dd_mm_range.group(1)), _dmy_to_ymd(dd_mm_range.group(2)), True
-
-    range_m = re.search(r'(\d{4}[-/]\d{2}[-/]\d{2})\s+(?:to|until|-)\s+(\d{4}[-/]\d{2}[-/]\d{2})', q)
-    if range_m:
-        return range_m.group(1).replace('/', '-'), range_m.group(2).replace('/', '-'), True
-
-    month_m = re.search(
-        r'\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|'
-        r'jul(?:y)?|aug(?:ust)?|sep(?:tember|t)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)'
-        r'\s+(\d{2,4})\b', q)
-    month_no_year_m = re.search(
-        r'\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|'
-        r'jul(?:y)?|aug(?:ust)?|sep(?:tember|t)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b', q)
-
-    if month_m or month_no_year_m:
-        if month_m:
-            m_str = month_m.group(1)[:3]
-            y_val = int(month_m.group(2))
-            if y_val < 100:
-                y_val += 2000
-        else:
-            m_str = month_no_year_m.group(1)[:3]
-            y_val = now.year
-        m_val = _MONTH_NAMES_DICT[m_str]
-        if not month_m and m_val > now.month:
-            y_val = now.year - 1
-        import calendar
-        last_day = calendar.monthrange(y_val, m_val)[1]
-        return f"{y_val}-{m_val:02d}-01", f"{y_val}-{m_val:02d}-{last_day:02d}", True
-
-    year_m = re.search(r'\b(20\d{2})\b', q)
-    if year_m:
-        yr = int(year_m.group(1))
-        return f"{yr}-10-01", f"{yr+1}-09-30", True
-
-    if 'last month' in q:
-        if now.month == 1:
-            return f"{now.year-1}-12-01", f"{now.year-1}-12-31", True
-        import calendar
-        m = now.month - 1
-        last = calendar.monthrange(now.year, m)[1]
-        return f"{now.year}-{m:02d}-01", f"{now.year}-{m:02d}-{last}", True
-
-    if any(x in q for x in ['this year', 'current year', 'fy', 'financial year', 'fiscal year']):
-        if now.month >= 10:
-            return f"{now.year}-10-01", f"{now.year+1}-09-30", True
-        else:
-            return f"{now.year-1}-10-01", f"{now.year}-09-30", True
-
-    if now.month >= 10:
-        return f"{now.year}-10-01", f"{now.year+1}-09-30", False
-    return f"{now.year-1}-10-01", f"{now.year}-09-30", False
+    """
+    Extract start_date and end_date from query text using universal canonical temporal resolver.
+    Guarantees 'current month' maps to current calendar month (start/end dates), not full FY.
+    """
+    from agent.temporal_resolver import resolve_temporal_scope
+    res = resolve_temporal_scope(question)
+    return res["start_date"], res["end_date"], res["is_explicit"]
 # ---------------------------------------------------------------------------
 # Typo / abbreviation normalizer — maps common CRM mistyping to canonical phrases
 # ---------------------------------------------------------------------------
@@ -641,13 +587,14 @@ Example: "What is Bhavik's utilization?"
         intent.date_to = parsed.date_to or current_fy_end
         intent.date_was_specified = parsed.date_was_specified
 
-        from agent.entity_resolver import is_fiscal_year_expression, resolve_fiscal_year
-        if is_fiscal_year_expression(question):
-            fy_info = resolve_fiscal_year(question)
-            intent.date_from = fy_info["start_date"]
-            intent.date_to = fy_info["end_date"]
+        from agent.temporal_resolver import resolve_temporal_scope
+        temp_info = resolve_temporal_scope(question)
+        if temp_info.get("is_explicit"):
+            intent.date_from = temp_info["start_date"]
+            intent.date_to = temp_info["end_date"]
             intent.date_was_specified = True
-            intent.extra["financial_year"] = fy_info["financial_year"]
+            intent.extra["temporal_scope"] = temp_info["temporal_scope"]
+            intent.extra["financial_year"] = temp_info["financial_year"]
     except Exception as e:
         logger.error(f"[QueryParser] LLM extraction failed, falling back to legacy: {e}")
         # Extremely basic fallback

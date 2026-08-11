@@ -17,6 +17,46 @@ _SUPPRESSED_FIELDS = frozenset({
     "tenant_id", "created_at", "updated_at", "internal_id", "_id", "source"
 })
 
+def _get_matching_breakdown_array(query: str, data: dict) -> tuple:
+    """
+    Selects the matching array, title, x_field, and y_field from multi-array tool responses based on query intent.
+    """
+    if not isinstance(data, dict):
+        return None, None, None, None
+
+    q_lower = query.lower()
+
+    # 1. GP Performance / Service Line GP
+    if ("gp" in q_lower or "gross profit" in q_lower or "performance" in q_lower) and "gp_performance_ytd_breakdown" in data:
+        arr = data.get("gp_performance_ytd_breakdown")
+        if isinstance(arr, list) and arr:
+            return ("GP Performance by Service Line", arr, "name", "performing")
+
+    # 2. Team Billing / Billing by Service Line
+    if ("billing" in q_lower or "staff" in q_lower or "team" in q_lower) and ("current_team_billing_breakdown" in data or "team_billing_breakdown" in data):
+        arr = data.get("current_team_billing_breakdown") or data.get("team_billing_breakdown")
+        if isinstance(arr, list) and arr:
+            return ("Team Billing Breakdown", arr, "name", "performing")
+
+    # 3. Top Customers
+    if ("customer" in q_lower or "client" in q_lower or "top 5" in q_lower or "top customer" in q_lower) and "top_5_customers" in data:
+        arr = data.get("top_5_customers")
+        if isinstance(arr, list) and arr:
+            return ("Top 5 Customers by Revenue", arr, "customer_name", "revenue")
+
+    # 4. Monthly Revenue Breakdown
+    if ("month" in q_lower or "monthly" in q_lower or "trend" in q_lower) and "revenue_by_month" in data:
+        arr = data.get("revenue_by_month")
+        if isinstance(arr, list) and arr:
+            return ("Revenue by Month Breakdown", arr, "month", "amount")
+
+    # Default fallback if query was generic revenue or service line
+    if "gp_performance_ytd_breakdown" in data and isinstance(data["gp_performance_ytd_breakdown"], list) and ("gp" in q_lower or "service line" in q_lower or "serviceline" in q_lower):
+        return ("GP Performance by Service Line", data["gp_performance_ytd_breakdown"], "name", "performing")
+
+    return None, None, None, None
+
+
 # ---------------------------------------------------------------------------
 # Payload Normalizer
 # ---------------------------------------------------------------------------
@@ -119,7 +159,7 @@ def trim_report_payload(capability: str, data: Any, max_list_items: int = 5) -> 
             }
             return {
                 k: v for k, v in cleaned.items()
-                if v not in (None, "", "-", "0", "0.00", "0.000", [], {})
+                if v not in (None, "", "-", [], {})
             }
         elif isinstance(val, list):
             sliced = val[:max_list_items]
@@ -317,11 +357,11 @@ async def synthesize_response(original_query: str, tool_results: List[Dict[str, 
                 "You are an Executive AI Assistant for an Enterprise CRM.\n"
                 "MANDATE: Provide a structured, executive-grade response. NEVER output plain monolithic text blocks or ugly paragraphs.\n\n"
                 "FORMATTING & TABLE MANDATE:\n"
-                "1. FOR ANY LIST, RANKING, BREAKDOWN, OR MULTI-ITEM DATA (e.g. top customers, revenue by month, service lines, aging buckets, project lists):\n"
-                "   - ALWAYS render a clean Markdown Table with bold headers (e.g. `| Rank | Name / Item | Amount (BHD) |`).\n"
+                "1. FOR ANY LIST, RANKING, BREAKDOWN, OR MULTI-ITEM DATA WITH 3 OR MORE ITEMS (e.g. top customers, revenue by month, service lines, aging buckets, project lists):\n"
+                "   - Render a clean Markdown Table with bold headers (e.g. `| Rank | Name / Item | Amount (BHD) |`).\n"
                 "   - Include a 1-line bold executive summary header above the table.\n"
-                "2. FOR SINGLE METRIC / SIMPLE QUERIES:\n"
-                "   - State the result directly in 1-2 clean bullet points or bold text.\n"
+                "2. FOR 1 OR 2 ITEMS OR SINGLE METRIC QUERIES:\n"
+                "   - DO NOT create a table for 1 or 2 items! Render directly as 1-2 clean, bold bullet points.\n"
                 "3. WHEN SPECIFIC DATA IS NOT IN THE PRE-CALCULATED REPORT:\n"
                 "   - DO NOT write long apologetic text blocks.\n"
                 "   - State available top-level metrics clearly in bold bullet points, followed by a concise 1-line note advising where to find detailed data.\n\n"
@@ -374,7 +414,18 @@ async def synthesize_response(original_query: str, tool_results: List[Dict[str, 
         
         synth_token_usage = {}
         try:
-            response = await llm_client.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=prompt)])
+            try:
+                response = await llm_client.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=prompt)])
+            except Exception as primary_err:
+                err_str = str(primary_err)
+                if "429" in err_str or "rate_limit" in err_str.lower() or "quota" in err_str.lower():
+                    logger.warning("[Synthesizer] Primary model rate-limited (429). Retrying with llama-3.1-8b-instant fallback model...")
+                    from config.llm_factory import get_llm
+                    fallback_llm = get_llm(model_name="llama-3.1-8b-instant")
+                    response = await fallback_llm.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=prompt)])
+                else:
+                    raise primary_err
+
             final_text = response.content
             # Post-process: convert any remaining $ currency symbols to BHD
             import re
@@ -387,23 +438,10 @@ async def synthesize_response(original_query: str, tool_results: List[Dict[str, 
                 }
                 logger.info(f"[Synthesizer Tokens] In: {synth_token_usage['input_tokens']} | Out: {synth_token_usage['output_tokens']} | Total: {synth_token_usage['total_tokens']}")
         except Exception as e:
-            logger.error(f"Dynamic synthesis failed: {e}")
-            final_text = "I couldn't complete the request at the moment. Please try again later."
-            return {
-                "type": "done",
-                "content": final_text,
-                "error_code": "synthesizer_error",
-                "chart_data": None,
-                "navigate_to": None,
-                "navigation_links": None,
-                "export_data": None,
-                "auto_expand": False,
-                "suggested_questions": None,
-                "report_intent": None,
-                "kpi_payload": None,
-                "raw_tool_results": tool_results,
-                "token_usage": synth_token_usage
-            }
+            logger.error(f"Dynamic synthesis failed ({e}). Falling back to 0-token DATA mode formatter.")
+            fallback_res = format_data_response(original_query, tool_results)
+            fallback_res["error_code"] = "synthesizer_fallback"
+            return fallback_res
     elif not nav_result:
         final_text = "I couldn't format the requested information at the moment. Please try again later."
     
@@ -442,23 +480,32 @@ async def synthesize_response(original_query: str, tool_results: List[Dict[str, 
             navigation_id = tool_name
 
         # Read chart_config from metadata for auto chart generation
-        chart_cfg = cap_meta.get("chart_config")
-        if chart_cfg and isinstance(data, dict):
-            data_key = chart_cfg.get("data_key")
-            x_field = chart_cfg.get("x_field")
-            y_field = chart_cfg.get("y_field")
-            chart_label = chart_cfg.get("label", tool_name.replace("_", " ").title())
+        if isinstance(data, dict):
+            dyn_title, dyn_arr, dyn_x, dyn_y = _get_matching_breakdown_array(original_query, data)
+            chart_cfg = cap_meta.get("chart_config") or {}
             chart_type = chart_cfg.get("type", "bar")
-            if data_key and x_field and y_field:
-                series = data.get(data_key)
-                if isinstance(series, list) and series:
-                    chart_data = {
-                        "type": chart_type,
-                        "labels": [item.get(x_field, "") for item in series],
-                        "datasets": [{"label": chart_label, "data": [item.get(y_field, 0) for item in series]}]
-                    }
+            
+            if dyn_arr and dyn_x and dyn_y:
+                chart_data = {
+                    "type": chart_type,
+                    "labels": [item.get(dyn_x, "") for item in dyn_arr],
+                    "datasets": [{"label": dyn_title, "data": [item.get(dyn_y, 0) for item in dyn_arr]}]
+                }
+            elif chart_cfg:
+                data_key = chart_cfg.get("data_key")
+                x_field = chart_cfg.get("x_field")
+                y_field = chart_cfg.get("y_field")
+                chart_label = chart_cfg.get("label", tool_name.replace("_", " ").title())
+                if data_key and x_field and y_field:
+                    series = data.get(data_key)
+                    if isinstance(series, list) and series:
+                        chart_data = {
+                            "type": chart_type,
+                            "labels": [item.get(x_field, "") for item in series],
+                            "datasets": [{"label": chart_label, "data": [item.get(y_field, 0) for item in series]}]
+                        }
 
-    return {
+    res = {
         "type": "done",
         "content": final_text,
         "chart_data": chart_data,
@@ -469,6 +516,8 @@ async def synthesize_response(original_query: str, tool_results: List[Dict[str, 
         "raw_tool_results": tool_results,
         "token_usage": synth_token_usage
     }
+    from registry.contract_engine import wrap_presentation_intent
+    return wrap_presentation_intent(res, original_query, primary_tool)
 
 
 def _generate_executable_suggestions(tool_name: str, intent: str = "summary") -> list:
@@ -564,86 +613,182 @@ def format_data_response(user_query: str, tool_results: List[Dict[str, Any]]) ->
         err = res.get("error")
 
         if err:
-            lines.append(f"⚠️ **{cap}**: {err}")
+            lines.append(f"⚠️ **{cap.replace('_', ' ').title()}**: {err}")
             continue
 
-        if isinstance(data, list):
-            records = data
-        elif isinstance(data, dict):
-            records = data.get("rows") or data.get("data") or data.get("projects") or data.get("proposals") or [data]
-        else:
-            records = [data]
-
-        if not records:
-            lines.append(f"No matching records were found for **{cap}**.")
+        if not data:
+            lines.append(f"No matching records were found for **{cap.replace('_', ' ').title()}**.")
             continue
 
-        # Format list of records into clean markdown table — Zero raw JSON policy
-        if isinstance(records, list) and len(records) > 0 and isinstance(records[0], dict):
-            keys = list(records[0].keys())
-            # Strip internal fields
-            display_headers = [
-                k for k in keys
-                if k.lower() not in _SUPPRESSED_FIELDS
-                and k.lower() not in {"id", "raw_record"}
-            ][:6]
-            if not display_headers:
-                display_headers = [k for k in keys if k not in _SUPPRESSED_FIELDS][:4]
-
-            # Header row
-            header_str = "| " + " | ".join([h.replace("_", " ").title() for h in display_headers]) + " |"
-            sep_str = "| " + " | ".join(["---"] * len(display_headers)) + " |"
-            lines.append(header_str)
-            lines.append(sep_str)
-
-            # Data rows
-            for row in records[:25]:  # Cap at top 25 for display
-                row_vals = []
-                for h in display_headers:
-                    val = row.get(h, "")
-                    if isinstance(val, float):
-                        val_str = f"BHD {val:,.2f}" if val > 100 else f"{val:,.4f}"
-                    elif isinstance(val, list):
-                        # Cleanly format nested list of objects without raw str(dict)
-                        items_str = []
-                        for item in val[:4]:
-                            if isinstance(item, dict):
-                                m = item.get("month") or item.get("name") or item.get("label") or ""
-                                a = item.get("amount") or item.get("value") or item.get("total")
-                                if m and a is not None:
-                                    a_str = f"BHD {a:,.2f}" if isinstance(a, (int, float)) and a > 100 else str(a)
-                                    items_str.append(f"{m}: {a_str}")
-                                else:
-                                    items_str.append(", ".join(f"{k}: {v}" for k, v in item.items() if k not in _SUPPRESSED_FIELDS))
-                            else:
-                                items_str.append(str(item))
-                        val_str = "; ".join(items_str)
-                    elif isinstance(val, dict):
-                        val_str = ", ".join(f"{k}: {v}" for k, v in val.items() if k not in _SUPPRESSED_FIELDS)
-                    elif val is None:
-                        val_str = "-"
+        if isinstance(data, dict):
+            summary_bullets = []
+            
+            for k, v in data.items():
+                if k in _SUPPRESSED_FIELDS or k in (
+                    "rows", "data", "projects", "proposals", "status_breakdown", 
+                    "Proposalstatus", "dashboard_proposal_metrics_breakdown", 
+                    "dashboard_engagement_metrics_breakdown", 
+                    "dashboard_continuous_engagement_metrics_breakdown", 
+                    "service_leads_breakdown"
+                ):
+                    continue
+                
+                label = k.replace("_", " ").title()
+                
+                if isinstance(v, (int, float)):
+                    if "rate" in k.lower() or "pct" in k.lower() or "percentage" in k.lower():
+                        summary_bullets.append(f"- **{label}:** **{v:.2f}%**")
+                    elif isinstance(v, float) and v > 100:
+                        summary_bullets.append(f"- **{label}:** **BHD {v:,.2f}**")
                     else:
-                        val_str = str(val)
-                    row_vals.append(val_str.replace("|", "/"))
-                lines.append("| " + " | ".join(row_vals) + " |")
+                        summary_bullets.append(f"- **{label}:** **{v:,}**")
+                elif isinstance(v, str):
+                    summary_bullets.append(f"- **{label}:** {v}")
+                elif isinstance(v, dict):
+                    cnt = v.get("count") if v.get("count") is not None else v.get("total_entries")
+                    bgt = v.get("total_budget") if v.get("total_budget") is not None else v.get("value")
+                    parts = []
+                    if cnt is not None:
+                        parts.append(f"**{cnt:,}** entries")
+                    if bgt is not None and isinstance(bgt, (int, float)):
+                        parts.append(f"**BHD {bgt:,.2f}**")
+                    if parts:
+                        summary_bullets.append(f"- **{label}:** " + " | ".join(parts))
 
-            # Try to get total_records count from parent dataset metadata if available
-            total_cnt = None
-            if isinstance(data, dict):
-                total_cnt = data.get("total_records") or data.get("total_count") or data.get("total_projects") or data.get("strictly_active_projects_count")
-            lines.append(f"\n*Total Records: {total_cnt if total_cnt is not None else len(records)}*")
-        else:
-            # Fallback: render as clean bullet list — NEVER as raw JSON
-            for item in records[:10]:
-                if isinstance(item, dict):
-                    clean = {k: v for k, v in item.items() if k not in _SUPPRESSED_FIELDS}
-                    lines.append("- " + ", ".join(f"**{k.replace('_',' ').title()}**: {v}" for k, v in clean.items() if v is not None))
+            if summary_bullets:
+                lines.append("### Key Summary Metrics")
+                lines.extend(summary_bullets)
+                lines.append("")
+
+            sub_lists = []
+            dyn_title, dyn_arr, _, _ = _get_matching_breakdown_array(user_query, data)
+            if dyn_title and dyn_arr:
+                sub_lists.append((dyn_title, dyn_arr))
+            elif "rows" in data and isinstance(data["rows"], list):
+                sub_lists.append(("Records", data["rows"]))
+            elif "projects" in data and isinstance(data["projects"], list):
+                sub_lists.append(("Projects", data["projects"]))
+            elif "proposals" in data and isinstance(data["proposals"], list):
+                sub_lists.append(("Proposals", data["proposals"]))
+            elif "gp_performance_ytd_breakdown" in data and isinstance(data["gp_performance_ytd_breakdown"], list):
+                sub_lists.append(("GP Performance by Service Line", data["gp_performance_ytd_breakdown"]))
+            elif "status_breakdown" in data and isinstance(data["status_breakdown"], list):
+                sub_lists.append(("Status Breakdown", data["status_breakdown"]))
+            elif "Proposalstatus" in data and isinstance(data["Proposalstatus"], list):
+                sub_lists.append(("Proposal Status Breakdown", data["Proposalstatus"]))
+            elif "revenue_by_month" in data and isinstance(data["revenue_by_month"], list):
+                sub_lists.append(("Revenue by Month Breakdown", data["revenue_by_month"]))
+
+            for title, records in sub_lists:
+                if records and isinstance(records[0], dict):
+                    clean_records = [
+                        r for r in records 
+                        if not (r.get("totalEntries") == 0 and r.get("totalBudget") is None)
+                        and not (r.get("count") == 0 and r.get("proposed_fees") == 0)
+                    ]
+                    if not clean_records:
+                        clean_records = records[:10]
+
+                    keys = list(clean_records[0].keys())
+                    display_headers = [
+                        k for k in keys 
+                        if k.lower() not in _SUPPRESSED_FIELDS 
+                        and k.lower() not in {"id", "status_id", "raw_record"}
+                    ][:6]
+
+                    if display_headers:
+                        lines.append(f"### {title}")
+                        if len(clean_records) < 3:
+                            for row in clean_records:
+                                name = row.get("name") or row.get("title") or row.get("label") or row.get("status_name")
+                                parts = []
+                                for h in display_headers:
+                                    if h.lower() in ("name", "title", "label", "status_name"):
+                                        continue
+                                    val = row.get(h)
+                                    if val is not None:
+                                        if isinstance(val, float) and val > 100:
+                                            val_str = f"BHD {val:,.2f}"
+                                        elif isinstance(val, (int, float)):
+                                            val_str = f"{val:,}"
+                                        else:
+                                            val_str = str(val)
+                                        parts.append(f"**{h.replace('_', ' ').title()}:** {val_str}")
+                                prefix = f"- **{name}:** " if name else "- "
+                                lines.append(prefix + " | ".join(parts))
+                            lines.append("")
+                        else:
+                            header_str = "| " + " | ".join([h.replace("_", " ").title() for h in display_headers]) + " |"
+                            sep_str = "| " + " | ".join(["---"] * len(display_headers)) + " |"
+                            lines.append(header_str)
+                            lines.append(sep_str)
+
+                            for row in clean_records[:25]:
+                                row_vals = []
+                                for h in display_headers:
+                                    val = row.get(h, "")
+                                    if isinstance(val, float):
+                                        val_str = f"BHD {val:,.2f}" if val > 100 else f"{val:,.2f}"
+                                    elif isinstance(val, int):
+                                        val_str = f"{val:,}"
+                                    elif val is None:
+                                        val_str = "-"
+                                    else:
+                                        val_str = str(val)
+                                    row_vals.append(val_str.replace("|", "/"))
+                                lines.append("| " + " | ".join(row_vals) + " |")
+                            lines.append("")
+
+        elif isinstance(data, list) and data and isinstance(data[0], dict):
+            keys = list(data[0].keys())
+            display_headers = [
+                k for k in keys 
+                if k.lower() not in _SUPPRESSED_FIELDS 
+                and k.lower() not in {"id", "status_id", "raw_record"}
+            ][:6]
+            if display_headers:
+                if len(data) < 3:
+                    for row in data:
+                        name = row.get("name") or row.get("title") or row.get("label") or row.get("status_name")
+                        parts = []
+                        for h in display_headers:
+                            if h.lower() in ("name", "title", "label", "status_name"):
+                                continue
+                            val = row.get(h)
+                            if val is not None:
+                                if isinstance(val, float) and val > 100:
+                                    val_str = f"BHD {val:,.2f}"
+                                elif isinstance(val, (int, float)):
+                                    val_str = f"{val:,}"
+                                else:
+                                    val_str = str(val)
+                                parts.append(f"**{h.replace('_', ' ').title()}:** {val_str}")
+                        prefix = f"- **{name}:** " if name else "- "
+                        lines.append(prefix + " | ".join(parts))
                 else:
-                    lines.append(f"- {item}")
+                    header_str = "| " + " | ".join([h.replace("_", " ").title() for h in display_headers]) + " |"
+                    sep_str = "| " + " | ".join(["---"] * len(display_headers)) + " |"
+                    lines.append(header_str)
+                    lines.append(sep_str)
 
-    final_content = "\n".join(lines) if lines else "No matching records were found."
+                    for row in data[:25]:
+                        row_vals = []
+                        for h in display_headers:
+                            val = row.get(h, "")
+                            if isinstance(val, float):
+                                val_str = f"BHD {val:,.2f}" if val > 100 else f"{val:,.2f}"
+                            elif isinstance(val, int):
+                                val_str = f"{val:,}"
+                            elif val is None:
+                                val_str = "-"
+                            else:
+                                val_str = str(val)
+                            row_vals.append(val_str.replace("|", "/"))
+                        lines.append("| " + " | ".join(row_vals) + " |")
 
-    return {
+    final_content = "\n".join(lines).strip() if lines else "No matching records were found."
+
+    res = {
         "type": "done",
         "content": final_content,
         "response_mode": "DATA",
@@ -652,3 +797,5 @@ def format_data_response(user_query: str, tool_results: List[Dict[str, Any]]) ->
         "raw_tool_results": tool_results,
         "token_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "model_name": "data_mode_formatter"}
     }
+    from registry.contract_engine import wrap_presentation_intent
+    return wrap_presentation_intent(res, user_query, primary_tool)

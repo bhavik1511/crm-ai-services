@@ -1,0 +1,93 @@
+==================================================
+DIRECT BACKEND DATA PARITY CHECK
+==================================================
+GET http://localhost:3001/api/v1/proposal/statuswise_budget -> HTTP 200
+  - Status: Project Pending      | Entries: 0      | Budget: None
+  - Status: All Project Created  | Entries: 0      | Budget: None
+  - Status: Proposal Created     | Entries: 22     | Budget: 92950
+  - Status: Proposal Verify      | Entries: 1      | Budget: 5000
+  - Status: Proposal Sent        | Entries: 520    | Budget: 1949300
+  - Status: Proposal Accepted    | Entries: 5377   | Budget: 16138020.037
+  - Status: Proposal Rejected    | Entries: 1108   | Budget: 7376759
+
+GET http://localhost:3001/api/v1/reports/billing-report -> HTTP 200
+  - Total Count: 2507
+
+--- [TEST 1] 'how many proposals were rejected?' ---
+Selected Capability: proposal_search (Score: 0.96)
+Action: INVOKE_PLANNER | Fast-Path: False
+Tokens: Planner=0, Synthesizer=0, Total=0
+Output Snippet:
+No response
+Status: WARN
+
+--- [TEST 2] 'how many proposals were accepted?' ---
+Selected Capability: proposal_search (Score: 0.96)
+Action: INVOKE_PLANNER | Fast-Path: False
+Tokens: Planner=0, Synthesizer=0, Total=0
+Output Snippet:
+No response
+Status: WARN
+
+--- [TEST 3] 'how many proposals were won?' ---
+Selected Capability: proposal_search (Score: 0.96)
+Action: INVOKE_PLANNER | Fast-Path: False
+Tokens: Planner=0, Synthesizer=0, Total=0
+Output Snippet:
+No response
+Status: WARN
+
+--- [TEST 4] 'what is the proposal win rate?' ---
+Selected Capability: proposal_search (Score: 0.96)
+Action: FAST_PATH_EXECUTE | Fast-Path: True
+Tokens: Planner=0, Synthesizer=0, Total=0
+Output Snippet:
+### 📊 Total Proposals
+
+- **Operation:** `aggregate`
+- **Dimension:** `Scope`
+- **Metric:** `Proposals`
+- **Aggregation:** `SUM`
+- **Total Records:** `8`
+
+#### Records
+| Scope | Proposals |
+| --- | --- |
+| AUP - RP 2025 | BHD 0.00 |
+| Addendum to the Principal Agreement â€“ S00455/17686/25 dated 6 November 2025: CBB Inspection Validation of Implementation Status | BHD 0.00 |
+| AUP RP 31 December 20
+Status: WARN
+
+--- [TEST 5] 'staff billing report' ---
+Selected Capability: staff_billing (Score: 0.96)
+Action: FAST_PATH_EXECUTE | Fast-Path: True
+Tokens: Planner=0, Synthesizer=0, Total=0
+Output Snippet:
+### 📊 Revenue by Employee
+
+- **Operation:** `breakdown`
+- **Dimension:** `Employee`
+- **Metric:** `Revenue`
+- **Aggregation:** `SUM`
+- **Total Records:** `10`
+
+#### Records
+| Employee | Revenue |
+| --- | --- |
+| 2026-03-26T13:33:28.000Z | BHD 3,656.00 |
+| 2026-03-26T13:28:21.000Z | BHD 1,650.00 |
+| 2026-03-26T13:14:30.000Z | BHD 1,210.00 |
+| 2026-03-26T13:27:08.000Z | BHD 770.00 |
+| 2026-03-26T13:
+Status: PASS
+
+==================================================
+FINAL VERIFICATION SUMMARY TABLE
+==================================================
+ID       | Capability           | FastPath | Tokens   | Status
+-----------------------------------------------------------------
+TEST 1   | proposal_search      | False    | 0        | WARN
+TEST 2   | proposal_search      | False    | 0        | WARN
+TEST 3   | proposal_search      | False    | 0        | WARN
+TEST 4   | proposal_search      | True     | 0        | WARN
+TEST 5   | staff_billing        | True     | 0        | PASS

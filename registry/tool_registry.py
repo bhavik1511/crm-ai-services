@@ -13,6 +13,9 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import aiohttp
+from utils.structured_logger import log_stage, log_debug_payload, log_error, mask_jwt
+
 from registry.capability_catalog import get_capability_metadata, CAPABILITY_ALIASES, BUSINESS_CAPABILITIES
 from agent.semantic_wrappers import SEMANTIC_TOOL_MAP
 
@@ -267,6 +270,17 @@ class ToolRegistry:
                 logger.info(f"[ToolRegistry Filter] Disqualified '{impl_name}' -> {reason}")
                 continue
 
+            # 1.2. HARD GATE: Required Parameters
+            # If an implementation lists required_parameters, ALL of them must be present in context
+            # or available_keys. This allows REST endpoints to be skipped when their mandatory
+            # query params (like department_id) are not resolved, falling back to wrappers.
+            missing_required_params = [p for p in req_params if p not in available_keys]
+            if missing_required_params:
+                reason = f"Candidate '{impl_name}': Missing required parameter(s) {missing_required_params}"
+                rejection_reasons.append(reason)
+                logger.info(f"[ToolRegistry Filter] Disqualified '{impl_name}' -> {reason}")
+                continue
+
             # 1.5. HARD GATE: Analytical Operations Support
             requested_ops = set()
             for op_key in ["ranking", "comparison", "group_by", "trend", "limit", "sort_order"]:
@@ -314,6 +328,20 @@ class ToolRegistry:
             "missing_parameters": missing_params_for_best,
             "score": highest_score if best_impl else 0
         }
+
+    async def execute_capability(
+        self, capability_id: str, parameters: Dict[str, Any] = None, jwt_token: str = ""
+    ) -> Dict[str, Any]:
+        """
+        Convenience method to resolve and execute a single capability by ID.
+        """
+        parameters = parameters or {}
+        nodes = self.resolve_implementations([{"id": capability_id, "context": parameters}], [], parameters)
+        results = await self.execute_resolved_implementations(nodes, [], jwt_token, parameters)
+        if results and isinstance(results, list):
+            res_dict = results[0]
+            return res_dict.get("result", res_dict)
+        return {"error": f"No execution result returned for capability '{capability_id}'."}
 
     async def execute_resolved_implementations(self, execution_graph: List[Dict[str, Any]], resolved_entities: List[Dict[str, Any]], jwt_token: str, user_context: Dict[str, Any] = None, question: str = "") -> List[Dict[str, Any]]:
         """
@@ -511,7 +539,6 @@ class ToolRegistry:
                         endpoint_url = CRM_API_BASE.rstrip('/') + '/' + endpoint_url.lstrip('/')
                         
                     try:
-                        import aiohttp
                         async with aiohttp.ClientSession() as session:
                             auth_header = jwt_token if jwt_token.startswith("Bearer ") else f"Bearer {jwt_token}"
                             headers = {
@@ -523,32 +550,14 @@ class ToolRegistry:
                             json_data = None
                             if method in ["POST", "PUT", "PATCH"] and ctx:
                                 json_data = {k: v for k, v in ctx.items() if f"{{{k}}}" not in raw_endpoint}
-                                
                             req_start_time = time.time()
-                            logger.info("=" * 80)
-                            logger.info("CALLING NODE BACKEND")
-                            logger.info("=" * 80)
-                            logger.info(f"Method:\n{method}")
-                            logger.info(f"URL:\n{endpoint_url}")
-                            logger.info(f"Headers:\n{json.dumps({k: (v[:15] + '...' if k=='Authorization' else v) for k, v in headers.items()})}")
-                            logger.info(f"Payload:\n{json.dumps(json_data)}")
-                            logger.info(f"Timestamp:\n{datetime.datetime.now().isoformat()}")
+                            log_stage(logger, "BACKEND_REQ", Method=method, Endpoint=func_name, Auth="Present" if jwt_token else "None")
 
-                            import aiohttp
                             async with session.request(method, endpoint_url, headers=headers, json=json_data, timeout=aiohttp.ClientTimeout(total=2.5)) as response:
                                 http_status = response.status
                                 body_text = await response.text()
                                 req_exec_time = round((time.time() - req_start_time) * 1000, 2)
                                 
-                                logger.info("=" * 80)
-                                logger.info("NODE BACKEND RESPONSE")
-                                logger.info("=" * 80)
-                                logger.info(f"Status Code: {response.status}")
-                                logger.info(f"Execution Time: {req_exec_time} ms")
-                                logger.info(f"Response Size: {len(body_text)} bytes")
-                                logger.info(f"First 500 characters of JSON:\n{body_text[:500]}")
-                                logger.info(f"Any Exception: None")
-
                                 if 200 <= response.status < 300:
                                     try:
                                         import json as _json
@@ -559,12 +568,7 @@ class ToolRegistry:
                                     exception_obj = RuntimeError(f"HTTP {response.status}: {body_text[:200]}")
                     except Exception as e:
                         exception_obj = e
-                        logger.error("=" * 80)
-                        logger.error("NODE BACKEND REQUEST EXCEPTION")
-                        logger.error("=" * 80)
-                        logger.error(f"Exception Type   : {type(e).__name__}")
-                        logger.error(f"Exception Message: {str(e)}")
-                        logger.error(f"Full Traceback   :\n{traceback.format_exc()}")
+                        log_error(logger, "BACKEND", str(e), Endpoint=func_name)
 
                     # Universal Fallback: If API attempt failed or returned error/empty payload, try semantic wrappers
                     is_invalid_payload = False
@@ -592,7 +596,7 @@ class ToolRegistry:
                                     is_invalid_payload = True
 
                     if exception_obj is not None or is_invalid_payload:
-                        logger.warning(f"[ToolRegistry] API attempt for cap '{target_cap_id}' failed or returned error payload (exc: {exception_obj}, invalid_payload: {is_invalid_payload}). Attempting fallback to semantic wrapper...")
+                        log_stage(logger, "BACKEND_FAIL", Capability=target_cap_id, Action="FALLBACK_WRAPPER", Reason=str(exception_obj) if exception_obj else "Invalid payload")
                         for fallback_impl in sorted(implementations, key=lambda x: x.get("priority", 99)):
                             if fallback_impl.get("type") == "wrapper":
                                 f_func_name = fallback_impl.get("function_call")
@@ -605,39 +609,20 @@ class ToolRegistry:
                                             exception_obj = None
                                             impl_type = "wrapper (fallback)"
                                             func_name = f_func_name
-                                            logger.info(f"[ToolRegistry Fallback Success] Cap: {target_cap_id} via wrapper '{f_func_name}'")
+                                            log_stage(logger, "BACKEND_FALLBACK", Capability=target_cap_id, Wrapper=f_func_name, Status="SUCCESS")
                                             break
                                     except Exception as fallback_exc:
-                                        logger.error(f"[ToolRegistry Fallback Failure] {fallback_exc}\n{traceback.format_exc()}")
+                                        log_error(logger, "BACKEND_FALLBACK", str(fallback_exc), Wrapper=f_func_name)
             else:
                 exception_obj = RuntimeError(f"Unknown implementation type '{impl_type}'.")
 
             exec_time_ms = round((time.time() - start_time) * 1000, 2)
-            
-            # Identify exact REST failure reason if REST was attempted & failed
-            rest_failure_reason = "None"
-            if is_rest_attempt:
-                if http_status == 401:
-                    rest_failure_reason = "Invalid JWT / Unauthorized"
-                elif http_status == 404:
-                    rest_failure_reason = "Missing endpoint (404)"
-                elif http_status >= 500:
-                    rest_failure_reason = f"Backend Internal Error ({http_status})"
-                elif exception_obj:
-                    err_str = str(exception_obj).lower()
-                    if "timeout" in err_str or "timed out" in err_str:
-                        rest_failure_reason = "Timeout"
-                    elif "refused" in err_str or "cannot connect" in err_str or "connector" in err_str:
-                        rest_failure_reason = "Backend unreachable"
-                    else:
-                        rest_failure_reason = f"Configuration / Network Issue ({exception_obj})"
 
             # Format capability envelope
             env = format_capability_envelope(target_cap_id, raw_backend_response, error_err=str(exception_obj) if exception_obj else None)
             
             # Secondary Failover: If envelope formatting resolved to an error/unavailable status and fallback hasn't executed yet, force semantic wrapper fallback
             if env.get("status") != "success" and impl_type != "wrapper (fallback)":
-                logger.warning(f"[ToolRegistry] Envelope formatting returned status '{env.get('status')}'. Forcing secondary fallback to semantic wrapper...")
                 for fallback_impl in sorted(implementations, key=lambda x: x.get("priority", 99)):
                     if fallback_impl.get("type") == "wrapper":
                         f_func_name = fallback_impl.get("function_call")
@@ -651,39 +636,36 @@ class ToolRegistry:
                                     impl_type = "wrapper (fallback)"
                                     func_name = f_func_name
                                     env = format_capability_envelope(target_cap_id, raw_backend_response)
-                                    logger.info(f"[ToolRegistry Secondary Fallback Success] Cap: {target_cap_id} via wrapper '{f_func_name}'")
                                     break
                             except Exception as fallback_exc:
-                                logger.error(f"[ToolRegistry Secondary Fallback Failure] {fallback_exc}\n{traceback.format_exc()}")
+                                pass
             
-            rest_enabled_val = os.getenv("USE_CRM_BACKEND_API", "true")
-            is_rest_enabled = rest_enabled_val.lower() in ("true", "1", "yes")
-            rest_executed = is_rest_attempt
             fallback_used = (impl_type == "wrapper (fallback)")
-            exec_source = "Node Backend" if (rest_executed and not fallback_used and http_status == 200) else ("Semantic Wrapper" if fallback_used else "None")
 
-            logger.info("=" * 70)
-            logger.info("END-TO-END NODE BACKEND INTEGRATION VERIFICATION")
-            logger.info("=" * 70)
-            logger.info(f"  • Environment Config Resolved Value : USE_CRM_BACKEND_API={rest_enabled_val} | CRM_API_BASE={CRM_API_BASE}")
-            logger.info(f"  • Selected Execution Mode           : {'REST' if is_rest_attempt else 'Semantic Wrapper'}")
-            logger.info(f"  • Selected Endpoint                 : {func_name if is_rest_attempt else 'N/A'}")
-            logger.info(f"  • Authorization Header Present      : {bool(jwt_token)} (Token Length: {len(jwt_token) if jwt_token else 0})")
-            logger.info(f"  • HTTP Status Code                  : {http_status}")
-            logger.info(f"  • Response Time                     : {exec_time_ms} ms")
-            logger.info(f"  • Fallback Triggered                : {'YES' if fallback_used else 'NO'}")
-            if is_rest_attempt and fallback_used:
-                logger.info(f"  • REST Failure Reason               : {rest_failure_reason}")
-            logger.info("-" * 70)
-            logger.info("FINAL EXECUTION SUMMARY:")
-            logger.info(f"  REST Enabled           : {'YES' if is_rest_enabled else 'NO'}")
-            logger.info(f"  REST Executed          : {'YES' if rest_executed else 'NO'}")
-            logger.info(f"  Semantic Fallback Used : {'YES' if fallback_used else 'NO'}")
-            logger.info(f"  Backend Status         : {http_status if http_status else 'N/A'}")
-            logger.info(f"  Execution Source       : {exec_source}")
-            logger.info("=" * 70)
+            # Calculate record count cleanly for structured log
+            rec_cnt = 0
+            if isinstance(raw_backend_response, dict):
+                rec_data = raw_backend_response.get("records") or raw_backend_response.get("data")
+                if isinstance(rec_data, list):
+                    rec_cnt = len(rec_data)
+                elif isinstance(rec_data, dict):
+                    inner_recs = rec_data.get("records") or rec_data.get("data")
+                    rec_cnt = len(inner_recs) if isinstance(inner_recs, list) else 1
+                else:
+                    rec_cnt = 1
+            elif isinstance(raw_backend_response, list):
+                rec_cnt = len(raw_backend_response)
 
-            logger.info(f"[TOOL REGISTRY RETURN] Completed execution of node for capability '{target_cap_id}'. Returning envelope payload.")
+            log_stage(
+                logger, "BACKEND",
+                Status=http_status if http_status else 200,
+                Endpoint=func_name,
+                Rows=rec_cnt,
+                LatencyMs=exec_time_ms,
+                Fallback=fallback_used
+            )
+            log_debug_payload(logger, "BACKEND", raw_backend_response, max_rows=3)
+            log_stage(logger, "EXECUTE", Capability=target_cap_id, Status=env.get("status", "success"))
             return {
                 "capability": target_cap_id,
                 "intent": node_intent,

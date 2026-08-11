@@ -4,15 +4,15 @@ All endpoints require valid JWT in the Authorization header.
 Extracts user_id, role, and other context from the JWT payload.
 """
 
-from aiohttp.web import Request
 import os
+import time
 import logging
 from datetime import datetime
 from typing import Optional
 import json
 
 import jwt
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, HTTPException, Depends, Query, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -305,7 +305,9 @@ async def chat(
     Validates session, resolves answer via 3-tier cache, logs history.
     """
     from memory.conversation_memory import memory
+    from utils.structured_logger import set_trace_id, log_stage, mask_jwt
     
+    set_trace_id()
     user_context = _decode_jwt(credentials)
     user_id = user_context["user_id"]
     question = request.question.strip()
@@ -313,12 +315,13 @@ async def chat(
 
     context_prompt = memory.get_context_prompt(session_id)
 
-    # *** DEBUG: Log exact resolved user identity ***
-    logger.info(
-        f"[ChatRoute] REQUEST START: user_id={user_id}, employee_id={user_context.get('employee_id')}, "
-        f"role={user_context.get('role')}, tier={user_context.get('hierarchy_level')}, "
-        f"dept={user_context.get('department')}, session_id={session_id}, "
-        f"q_excerpt='{question[:80]}...'"
+    log_stage(
+        logger, "REQUEST",
+        SessionId=session_id,
+        UserId=user_id,
+        Role=user_context.get("role", "Unknown"),
+        Query=question[:80],
+        Auth=mask_jwt(credentials.credentials)
     )
 
     if not question:
@@ -462,14 +465,25 @@ async def chat(
                     feature_flags={"is_stream": False}
                 )
 
-                # [DIAG-6] Confirm Planner receives previous_execution_plan
-                logger.info(
-                    f"[DIAG-6] /chat/query | RequestContext.user_context has previous_execution_plan="
-                    f"{bool(req_ctx.user_context.get('previous_execution_plan'))}"
-                )
+                # --- Phase 3.2.3: Enterprise Hybrid Retrieval Engine Hook ---
+                hybrid_result = None
+                try:
+                    from engine.hybrid_engine import get_hybrid_engine
+                    hybrid_engine = get_hybrid_engine()
+                    hybrid_result = await hybrid_engine.process_turn(
+                        question=question,
+                        jwt_token=credentials.credentials,
+                        session_id=session_id,
+                        user_context=user_context
+                    )
+                except Exception as h_err:
+                    logger.warning(f"[ChatRoute] HybridEngine check failed (non-fatal, falling back to Planner): {h_err}")
 
-                planner = EnterprisePlanner()
-                result = await planner.execute_turn(req_ctx)
+                if hybrid_result:
+                    result = hybrid_result
+                else:
+                    planner = EnterprisePlanner()
+                    result = await planner.execute_turn(req_ctx)
                 result["answer"] = result.get("content", "")
 
                 # ── Clarification State Persistence ───────────────────────────────
@@ -504,6 +518,39 @@ async def chat(
             answer=result.get("answer", ""),
             sql=result.get("sql_executed", "")
         )
+
+        # ── Telemetry Logging to MySQL Database (ai_chatbot_usage) ─────────
+        try:
+            from db.database import save_token_usage_async
+            _emp_id = (user_context or {}).get("employee_id") or user_id or 0
+            _telem = result.get("telemetry", {})
+            _model = _telem.get("model") or ("fast-path-deterministic" if _telem.get("fast_path") else (os.getenv("PRIMARY_MODEL") or "gemini-2.5-flash"))
+            _in_tok = _telem.get("input_tokens") if _telem.get("input_tokens") is not None else _telem.get("planner_tokens", 0)
+            _out_tok = _telem.get("output_tokens") if _telem.get("output_tokens") is not None else _telem.get("synthesizer_tokens", 0)
+            _tot_tok = _telem.get("total_tokens", _in_tok + _out_tok)
+            _exec_path = _telem.get("execution_path") or ("FAST_PATH" if _telem.get("fast_path") else "PLANNER_LLM")
+            await save_token_usage_async(
+                employee_id=_emp_id,
+                session_id=session_id,
+                model_name=_model,
+                input_tokens=_in_tok,
+                output_tokens=_out_tok,
+                total_tokens=_tot_tok,
+                total_cost_usd=0.0,
+                status="success",
+                trace_id=_telem.get("trace_id") or f"trc_{(session_id or 'sess')[:8]}_{int(time.time()*1000)}",
+                capability_id=_telem.get("capability_id"),
+                operation=_telem.get("operation"),
+                execution_path=_exec_path,
+                planner_tokens=_telem.get("planner_tokens", 0),
+                synthesizer_tokens=_telem.get("synthesizer_tokens", 0),
+                clarification_required=bool(_telem.get("clarification_required")),
+                clarification_reason=_telem.get("clarification_reason"),
+                backend_execution_ms=int(_telem.get("backend_ms") or 0),
+                total_execution_ms=int(_telem.get("execution_ms") or 0)
+            )
+        except Exception as _tb_err:
+            logger.error(f"[ChatRoute] Failed to save success token usage: {_tb_err}")
     except Exception as e:
         logger.error(f"[ChatRoute] resolve_answer failed: {e}")
         try:
@@ -585,20 +632,47 @@ async def chat(
     if _is_broad_receivable_query(question):
         result["report_intent"] = "receivable"
 
-    logger.info(
-        f"[ChatRoute] RESPONSE SENT: user_id={user_id}, role={user_context.get('role')}, "
-        f"tier={user_context.get('hierarchy_level')}, cache_tier={result.get('cache_tier')}, "
-        f"was_cached={result.get('was_cached')}, answer_excerpt='{result['answer'][:120]}...'"
+    from utils.structured_logger import log_summary
+    _telem = result.get("telemetry", {})
+    _tot_tok = _telem.get("total_tokens", 0)
+    _is_fast = _telem.get("fast_path", False)
+    log_summary(
+        logger,
+        SessionId=session_id,
+        User=user_context.get("name", "Unknown"),
+        Tokens=_tot_tok,
+        FastPath=_is_fast,
+        Status="SUCCESS"
     )
-    
-    print(f"\n[DEBUG RESPONSE]")
-    print(f"  user_id: {user_id}")
-    print(f"  role: {user_context.get('role')}")
-    print(f"  tier: {user_context.get('hierarchy_level')}")
-    print(f"  answer (first 200 chars): {result['answer'][:200]}...")
-    print(f"[END DEBUG RESPONSE]\n")
 
-    return result
+    def _sanitize_response_dict(obj):
+        if isinstance(obj, dict):
+            return {k: _sanitize_response_dict(v) for k, v in obj.items() if not k.startswith("_")}
+        elif isinstance(obj, (list, tuple)):
+            return [_sanitize_response_dict(v) for v in obj]
+        elif hasattr(obj, "to_dict") and callable(getattr(obj, "to_dict")):
+            try:
+                return _sanitize_response_dict(obj.to_dict())
+            except Exception:
+                return str(obj)
+        elif hasattr(obj, "__dataclass_fields__"):
+            try:
+                d = {}
+                for f_name in obj.__dataclass_fields__:
+                    val = getattr(obj, f_name, None)
+                    d[f_name] = _sanitize_response_dict(val)
+                return d
+            except Exception:
+                return str(obj)
+        elif isinstance(obj, (int, float, str, bool, type(None))):
+            return obj
+        else:
+            return str(obj)
+
+    from registry.contract_engine import wrap_presentation_intent
+    _cap_id = result.get("report_intent") or (result.get("execution_plan") or {}).get("primary_capability") or "report"
+    result = wrap_presentation_intent(result, question, _cap_id)
+    return _sanitize_response_dict(result)
 
 
 
@@ -909,6 +983,9 @@ async def chat_stream(
                             f"{bool(req_ctx.user_context.get('previous_execution_plan'))}"
                         )
 
+                        yield f"data: {json.dumps({'type': 'thinking', 'content': 'Analyzing query intent & business context...'})}\n\n"
+                        await asyncio.sleep(0)
+
                         planner = EnterprisePlanner()
                         plan_result = await planner.execute_turn(req_ctx)
                         logger.info(f"[RUNTIME INSTRUMENTATION] [ChatRoute PLANNER TURN RETURNED]:\n{json.dumps(plan_result, default=str)[:1000]}")
@@ -1032,6 +1109,10 @@ async def chat_stream(
             yield "data: [DONE]\n\n"
             return
 
+        from registry.contract_engine import wrap_presentation_intent
+        _cap_id = result.get("report_intent") or (result.get("execution_plan") or {}).get("primary_capability") or "report"
+        result = wrap_presentation_intent(result, question, _cap_id)
+
         metadata = {
             "type": "done",
             "content": full_answer,
@@ -1039,6 +1120,8 @@ async def chat_stream(
             "navigate_to": result.get("navigate_to"),
             "navigation_links": result.get("navigation_links"),
             "export_data": result.get("export_data"),
+            "presentation_intent": result.get("presentation_intent", "VIEW"),
+            "actions": result.get("actions", []),
             "auto_expand": result.get("auto_expand", False),
             "suggested_questions": result.get("suggested_questions"),
             "report_intent": result.get("report_intent"),
@@ -1081,9 +1164,10 @@ async def chat_stream(
             except Exception as _te:
                 logger.error(f"[TokenTracker] Could not log failure: {_te}")
 
-        # Calculate and track token cost (successful requests with actual token usage)
+        # Calculate and track token cost (successful AND fast-path 0-token requests)
         token_usage = result.get("token_usage", {})
-        if token_usage and token_usage.get("total_tokens", 0) > 0:
+        _is_fast_path = isinstance(token_usage, dict) and token_usage.get("model_name") == "lightweight_router_fast_path"
+        if token_usage and (token_usage.get("total_tokens", 0) > 0 or _is_fast_path):
             model = token_usage.get("model_name", "llama-3.3-70b-versatile")
             in_tok = token_usage.get("input_tokens", 0)
             out_tok = token_usage.get("output_tokens", 0)
@@ -1131,7 +1215,8 @@ async def chat_stream(
                 # Determine status from result: if error_code is set, the planner or synthesizer failed
                 _error_code = result.get("error_code")
                 _db_status = "failed" if _error_code else "success"
-                asyncio.create_task(save_token_usage_async(
+                _exec_path = "FAST_PATH" if _is_fast_path else "PLANNER_LLM"
+                _task = asyncio.create_task(save_token_usage_async(
                     employee_id=user_context.get("employee_id", user_id) or user_id,
                     session_id=session_id,
                     model_name=model or "unknown",
@@ -1141,8 +1226,14 @@ async def chat_stream(
                     total_cost_usd=cost,
                     status=_db_status,
                     error_type=_error_code,
-                    error_message=None
+                    error_message=None,
+                    execution_path=_exec_path
                 ))
+                # Attach error callback so unhandled exceptions don't silently disrupt the event loop
+                def _db_task_done(t):
+                    if not t.cancelled() and t.exception():
+                        logger.error(f"[TokenTracker] Background DB task failed: {t.exception()}")
+                _task.add_done_callback(_db_task_done)
             except Exception as e:
                 logger.error(f"[StreamEndpoint] Failed to spawn token tracking task: {e}")
 

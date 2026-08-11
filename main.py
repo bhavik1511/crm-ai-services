@@ -252,6 +252,7 @@ def _lookup_single_id(table: str, id_col: str, name_col: str, value: Optional[st
     if not value:
         return None, []
     engine = get_db_engine()
+    term = " ".join(str(value).split())
     try:
         with engine.connect() as conn:
             rows = conn.execute(
@@ -259,11 +260,11 @@ def _lookup_single_id(table: str, id_col: str, name_col: str, value: Optional[st
                     f"""
                     SELECT {id_col} AS id, {name_col} AS name
                     FROM {table}
-                    WHERE LOWER({name_col}) LIKE LOWER(:term)
+                    WHERE REPLACE(REPLACE(LOWER({name_col}), '  ', ' '), '  ', ' ') LIKE LOWER(:term)
                     LIMIT 6
                     """
                 ),
-                {"term": f"%{value}%"},
+                {"term": f"%{term}%"},
             ).fetchall()
         candidates = [{"id": int(r.id), "name": str(r.name)} for r in rows]
         if len(candidates) == 1:
@@ -1617,7 +1618,7 @@ async def _deterministic_kpi_response(history: Optional[List[dict]], latest_ques
         logging.getLogger("uvicorn").warning(f"[_deterministic_kpi_response] Backend fetch warning ({e}), constructing report payload from contract fallback.")
         kpi_payload = _build_kpi_contract({}, {}, filters_applied, period)
         export_data = _build_excel_export_from_kpi_payload(kpi_payload, filters_applied, period)
-        return {
+        res = {
             "answer": _build_kpi_narrative(kpi_payload, filters_applied, period),
             "navigate_to": "/projects/reports/kpi-summary-report",
             "navigation_links": [{"label": "KPI Summary Report", "url": "/projects/reports/kpi-summary-report"}],
@@ -1628,6 +1629,8 @@ async def _deterministic_kpi_response(history: Optional[List[dict]], latest_ques
             "export_data": export_data,
             "auto_expand": False,
         }
+        from registry.contract_engine import wrap_presentation_intent
+        return wrap_presentation_intent(res, latest_question, "kpi_summary")
 
 
 # --------------------------------------------------------------------------- #

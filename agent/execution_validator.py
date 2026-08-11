@@ -19,12 +19,12 @@ def _is_parameter_provided(param_key: str, ctx: dict, resolved_entities: list, t
     if param_key in ctx and ctx[param_key]:
         return True
         
-    if "year" in p_lower or "date" in p_lower:
-        if time_filter and any(c.isdigit() for c in str(time_filter)):
+    if any(k in p_lower for k in ["temporal", "year", "date", "period", "month", "time"]):
+        if time_filter and (any(c.isdigit() for c in str(time_filter)) or any(m in str(time_filter).lower() for m in ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec", "month", "year", "fy"])):
             return True
-        if ctx.get("financial_year") or ctx.get("start_date") or ctx.get("end_date"):
+        if ctx.get("financial_year") or ctx.get("start_date") or ctx.get("end_date") or ctx.get("date") or ctx.get("month") or ctx.get("time_filter"):
             return True
-        if user_ctx and user_ctx.get("financial_year"):
+        if user_ctx and (user_ctx.get("financial_year") or user_ctx.get("start_date")):
             return True
 
     if "service_line" in p_lower:
@@ -117,6 +117,12 @@ def validate_execution(execution_plan: Dict[str, Any]) -> Tuple[bool, List[str]]
         depends_on_entities = metadata.get("depends_on_entities", [])
         supports_org_scope = metadata.get("supports_organization_scope", True)
         param_meta = metadata.get("parameter_metadata", {})
+        required_context = metadata.get("required_context", [])
+
+        # Enforce catalog required_context (e.g. temporal_scope)
+        for req_ctx_item in required_context:
+            if not _is_parameter_provided(req_ctx_item, ctx, resolved_entities, time_filter, user_ctx):
+                missing_keys.add(req_ctx_item)
 
         # Filter out parameters that are provided or have smart defaults (e.g. current_fy)
         cleaned_missing = set()

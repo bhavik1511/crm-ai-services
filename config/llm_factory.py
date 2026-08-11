@@ -117,6 +117,7 @@ def get_llm(model_name: Optional[str] = None, temperature: Optional[float] = Non
             raise RuntimeError("LLM_API_KEY or GROQ_API_KEY missing from .env")
         kwargs["model_name"] = model_name
         kwargs["groq_api_key"] = api_key
+        kwargs["max_retries"] = 1
         if base_url:
             kwargs["base_url"] = base_url
         return ChatGroq(**kwargs)

@@ -69,18 +69,7 @@ def route_query_fast_path(question: str, user_context: Optional[Dict[str, Any]] 
         logger.error(f"[MetadataRouter] Could not import capability catalog: {e}")
         return None
 
-    # 1. Discover Analytical Intent / Complex Query indicators from catalog metadata
-    analytical_meta = get_capability_metadata("analytical_query") or {}
-    analytical_ops = (analytical_meta.get("implementations", [{}])[0]).get("supported_operations", [])
-    
-    # Generic analytical trigger verbs/ops derived from catalog
-    analytical_triggers = set(analytical_ops + ["analyze", "analysis", "compare", "comparison", "insight", "recommendation", "trend", "vs", "versus"])
-    
-    if any(re.search(r'\b' + re.escape(kw) + r'\b', q_clean) for kw in analytical_triggers):
-        logger.info(f"[MetadataRouter] Query '{raw_q[:50]}' matched analytical catalog operations -> Delegating to EnterprisePlanner LLM.")
-        return None
-
-    # 2. Discover Fast-Path Eligible Capabilities dynamically from catalog
+    # 1. Discover Fast-Path Eligible Capabilities dynamically from catalog
     fast_path_caps = []
     for cap in BUSINESS_CAPABILITIES:
         if cap.get("fast_path_eligible"):
@@ -102,17 +91,44 @@ def route_query_fast_path(question: str, user_context: Optional[Dict[str, Any]] 
                 matched_capabilities.append(cap)
                 break
 
-    # Disambiguation: If specific domain/report capability matched along with generic project containers, prefer the specific capability
-    if len(matched_capabilities) > 1:
-        matched_ids = [c["id"] for c in matched_capabilities]
-        generic_caps = {"project_details", "project_search"}
-        specific_caps = [c for c in matched_capabilities if c["id"] not in generic_caps]
-        if len(specific_caps) == 1:
-            logger.info(f"[MetadataRouter] Disambiguated multiple capabilities {matched_ids} -> Selected specific domain capability '{specific_caps[0]['id']}' over generic containers.")
-            matched_capabilities = specific_caps
-        else:
-            logger.info(f"[MetadataRouter] Query matched multiple catalog capabilities ({matched_ids}) -> Delegating to EnterprisePlanner LLM.")
+    # 2. Analytical guard — only fires if NO catalog fast-path keyword matched.
+    # This prevents legitimate chip queries like "Monthly Revenue Trend" or
+    # "Revenue Comparison with Previous FY" from being blocked by trigger words.
+    if not matched_capabilities:
+        analytical_meta = get_capability_metadata("analytical_query") or {}
+        analytical_ops = (analytical_meta.get("implementations", [{}])[0]).get("supported_operations", [])
+        analytical_triggers = set(analytical_ops + ["analyze", "analysis", "compare", "comparison", "insight", "recommendation", "trend", "vs", "versus", "lowest", "highest", "best", "worst", "bottom", "least", "most", "rank", "ranking"])
+        
+        if any(re.search(r'\b' + re.escape(kw) + r'\b', q_clean) for kw in analytical_triggers):
+            logger.info(f"[MetadataRouter] Query '{raw_q[:50]}' matched analytical catalog operations -> Delegating to EnterprisePlanner LLM.")
             return None
+
+    # Disambiguation: Prefer specific multi-word keyword matches over broad single-word hits
+    if len(matched_capabilities) > 1:
+        def get_match_score(cap):
+            kws = cap.get("intent_keywords", []) or [cap["id"].replace("_", " ")]
+            scores = [len(kw.split()) for kw in kws if re.search(r'\b' + re.escape(kw.lower()) + r'\b', q_clean)]
+            return max(scores) if scores else 0
+
+        highest_score = max(get_match_score(c) for c in matched_capabilities)
+        top_caps = [c for c in matched_capabilities if get_match_score(c) == highest_score]
+
+        if len(top_caps) == 1:
+            logger.info(f"[MetadataRouter] Disambiguated multiple capabilities {[c['id'] for c in matched_capabilities]} -> Selected highest specificity match '{top_caps[0]['id']}'.")
+            matched_capabilities = top_caps
+        else:
+            generic_caps = {"project_details", "project_search"}
+            specific_caps = [c for c in top_caps if c["id"] not in generic_caps]
+            if len(specific_caps) == 1:
+                logger.info(f"[MetadataRouter] Disambiguated multiple capabilities -> Selected specific domain capability '{specific_caps[0]['id']}'.")
+                matched_capabilities = specific_caps
+            elif len(specific_caps) > 1:
+                specific_caps.sort(key=lambda c: c.get("priority", 99))
+                logger.info(f"[MetadataRouter] Disambiguated tied capabilities {[c['id'] for c in specific_caps]} -> Selected higher priority capability '{specific_caps[0]['id']}'.")
+                matched_capabilities = [specific_caps[0]]
+            else:
+                logger.info(f"[MetadataRouter] Query matched multiple catalog capabilities ({[c['id'] for c in matched_capabilities]}) -> Delegating to EnterprisePlanner LLM.")
+                return None
 
     # 3. Fast-Path Match Found
     if len(matched_capabilities) == 1:
@@ -123,6 +139,9 @@ def route_query_fast_path(question: str, user_context: Optional[Dict[str, Any]] 
             f"[MetadataRouter] FAST-PATH HIT: Query '{raw_q[:50]}' -> "
             f"Catalog Capability '{cap_id}' (Metadata-Driven, 0 Planner LLM Calls)."
         )
+
+        from registry.contract_engine import resolve_presentation_intent
+        presentation_intent = resolve_presentation_intent(question)
 
         # Delegate ALL entity extraction & resolution to Entity Resolver (agent/entity_resolver.py)
         return {
@@ -138,6 +157,7 @@ def route_query_fast_path(question: str, user_context: Optional[Dict[str, Any]] 
             "missing_information": [],
             "confidence_score": 1.0,
             "response_mode": "DATA",
+            "presentation_intent": presentation_intent,
             "routed_by": "metadata_driven_router"
         }
 

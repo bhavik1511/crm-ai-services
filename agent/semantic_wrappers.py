@@ -17,7 +17,8 @@ from semantic.semantic_layer import (
     get_comprehensive_customer_report,
     get_project_recoverability_report,
     get_staff_billing_report,
-    get_job_estimation_metrics
+    get_job_estimation_metrics,
+    get_kpi_summary_report
 )
 
 logger = logging.getLogger(__name__)
@@ -111,6 +112,11 @@ async def call_job_estimation_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
     return await _invoke_tool(get_job_estimation_metrics, args, "get_job_estimation_metrics")
 
 
+async def call_kpi_summary_report(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Wrapper for get_kpi_summary_report."""
+    return await _invoke_tool(get_kpi_summary_report, args, "get_kpi_summary_report")
+
+
 async def call_analytical_query(args: Dict[str, Any]) -> Dict[str, Any]:
     """Wrapper for ad_hoc_sql_query."""
     logger.info(f"Calling ad_hoc_sql_query via wrapper with args: {args}")
@@ -158,6 +164,8 @@ SEMANTIC_TOOL_MAP = {
     "call_staff_billing_report": call_staff_billing_report,
     "get_job_estimation_metrics": call_job_estimation_metrics,
     "call_job_estimation_metrics": call_job_estimation_metrics,
+    "get_kpi_summary_report": call_kpi_summary_report,
+    "call_kpi_summary_report": call_kpi_summary_report,
     "call_analytical_query": call_analytical_query,
     "call_ui_navigation": call_ui_navigation
 }

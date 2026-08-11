@@ -499,7 +499,7 @@ async def get_entity_cache(cache_key: str) -> Optional[dict]:
                 content = str(doc.get("content", "")).lower()
                 if any(phrase in content for phrase in [
                     "currently unavailable", "please try again later", "failed", 
-                    "does not include", "not available", "customer-specific"
+                    "does not include", "not available", "customer-specific", "bhd 0", "at 0%"
                 ]):
                     logger.info(f"[EntityCache] Ignoring stale error/incomplete cached response for key={cache_key}")
                     return None

@@ -56,6 +56,10 @@ BUSINESS_CAPABILITIES = [
             "headers": "array"
         },
         "default_error_message": "I couldn't complete the requested analytical query at the moment. Please try again later.",
+        "required_context": ["temporal_scope"],
+        "clarifiable_context": ["temporal_scope"],
+        "inheritable_context": ["temporal_scope", "start_date", "end_date", "financial_year", "employee_id", "customer_id"],
+        "defaultable_context": [],
         "required_business_context": {},
         "parameter_metadata": {
             "financial_year": {
@@ -194,7 +198,7 @@ BUSINESS_CAPABILITIES = [
         "id": "receivables_analysis",
         "business_domain": "finance",
         "fast_path_eligible": True,
-        "intent_keywords": ['receivables', 'receivable', 'overdue invoices', 'ageing report'],
+        "intent_keywords": ['receivables', 'receivable', 'overdue invoices', 'ageing report', 'ageing bucket', 'view by ageing', 'view by service line', 'receivables by service line', 'ageing summary'],
         "description": "Full ageing breakdown of all overdue invoices. Use when asking about pending or overdue receivables.",
         "supported_metrics": ["total_receivables", "overdue_invoices", "ageing_buckets", "total_overdue_count"],
         "supported_operations": ["sum", "filter", "group_by", "comparison", "trend"],
@@ -264,15 +268,14 @@ BUSINESS_CAPABILITIES = [
         "id": "revenue_analysis",
         "business_domain": "finance",
         "fast_path_eligible": True,
-        "intent_keywords": ['revenue', 'revenue summary', 'monthly revenue', 'total revenue'],
+        "intent_keywords": ['revenue', 'revenue summary', 'monthly revenue', 'total revenue', 'top 5 customers', 'top customers by revenue', 'revenue by service line', 'highest revenue', 'gp performance', 'gp performance by service line', 'gross profit', 'gp', 'gp breakdown', 'monthly revenue trend', 'revenue trend', 'revenue comparison', 'revenue comparison with previous fy', 'previous fy', 'revenue analysis', 'show revenue', 'revenue by office'],
         "description": (
-            "Gets overall revenue totals, revenue by month, or team billing for a specific fiscal year or date range. "
-            "Use ONLY when the user asks for a revenue summary, monthly breakdown, or team billing overview. "
-            "Do NOT use for ranking customers by revenue, finding the top-N clients, or comparing service-line "
-            "revenues — those must use analytical_query instead."
+            "Gets overall revenue totals, revenue by month, customer revenue rankings, revenue by service line, or team billing for a specific fiscal year or date range."
         ),
-        "supported_metrics": ["total_revenue_ytd", "revenue_by_month", "gp_performance", "team_billing"],
-        "supported_operations": ["sum", "filter", "group_by", "comparison", "trend"],
+        "supported_metrics": ["total_revenue_ytd", "revenue_by_month", "gp_performance", "team_billing", "revenue", "count", "net_amount"],
+        "supported_operations": ["aggregate", "ranking", "breakdown", "comparison", "trend", "filter", "sum", "count", "avg"],
+        "supported_dimensions": ["customer", "service_line", "office", "month", "year", "employee"],
+        "supported_aggregations": ["SUM", "COUNT", "AVG", "MIN", "MAX"],
         "priority": PRIORITY_EXISTING_REPORT,
         "dependencies": [],
         "response_contract": {
@@ -299,6 +302,10 @@ BUSINESS_CAPABILITIES = [
             "team_billing_breakdown": "array"
         },
         "default_error_message": "Revenue metrics are currently unavailable. Please try again later.",
+        "required_context": ["temporal_scope"],
+        "clarifiable_context": ["temporal_scope"],
+        "inheritable_context": ["temporal_scope", "start_date", "end_date", "financial_year", "customer_id", "service_line_id"],
+        "defaultable_context": [],
         "required_parameters": [],
         "optional_parameters": {
             "start_date": {"type": "string", "format": "date", "description": "Start date (YYYY-MM-DD), e.g. FY start"},
@@ -341,6 +348,22 @@ BUSINESS_CAPABILITIES = [
         "implementations": [
             {
                 "priority": PRIORITY_EXISTING_REPORT,
+                "type": "wrapper",
+                "function_call": "get_revenue_metrics",
+                "needs_confirmation": False,
+                "required_entities": [],
+                "required_parameters": []
+            },
+            {
+                "priority": PRIORITY_EXISTING_REPORT,
+                "type": "report",
+                "endpoint": "GET /api/v1/reports/revenue-billing-report",
+                "needs_confirmation": False,
+                "required_entities": [],
+                "required_parameters": []
+            },
+            {
+                "priority": PRIORITY_EXISTING_REPORT,
                 "type": "api",
                 "endpoint": "GET /api/v1/reports/revenue-billing-report?searchQuery={\"client_id\":{customer_id}}",
                 "needs_confirmation": False,
@@ -354,14 +377,6 @@ BUSINESS_CAPABILITIES = [
                 "needs_confirmation": False,
                 "required_entities": ["project"],
                 "required_parameters": []
-            },
-            {
-                "priority": PRIORITY_SEMANTIC_WRAPPER,
-                "type": "wrapper",
-                "function_call": "get_revenue_metrics",
-                "needs_confirmation": False,
-                "required_entities": [],
-                "required_parameters": []
             }
         ]
     },
@@ -369,7 +384,7 @@ BUSINESS_CAPABILITIES = [
         "id": "proposal_search",
         "business_domain": "pipeline",
         "fast_path_eligible": True,
-        "intent_keywords": ['proposals', 'proposal', 'open proposals', 'pending proposals'],
+        "intent_keywords": ['proposals', 'proposal', 'open proposals', 'pending proposals', 'proposal win rate', 'win rate', 'winrate', 'proposal winrate', 'rejected proposals', 'accepted proposals'],
         "description": "Search proposals by code, customer, or status. Use when asked to show pending or open proposals.",
         "supported_metrics": ["proposals_list", "total_count", "open_proposals"],
         "supported_operations": ["filter", "search", "count", "summary"],
@@ -391,9 +406,21 @@ BUSINESS_CAPABILITIES = [
         "response_schema": {
             "proposals": "array",
             "total_count": "number",
-            "search_term": "string"
+            "search_term": "string",
+            "accepted_proposals": "object",
+            "rejected_proposals": "object",
+            "sent_proposals": "object",
+            "created_proposals": "object",
+            "open_proposals": "object",
+            "won_proposals": "object",
+            "total_proposals": "object",
+            "proposal_win_rate": "number"
         },
         "default_error_message": "Proposal search results are currently unavailable. Please try again later.",
+        "required_context": ["temporal_scope"],
+        "clarifiable_context": ["temporal_scope"],
+        "inheritable_context": ["temporal_scope", "status", "start_date", "end_date", "financial_year"],
+        "defaultable_context": [],
         "required_business_context": {
             "search_term": {"type": "string", "description": "Proposal code, reference, or 'open'/'pending'"}
         },
@@ -457,6 +484,10 @@ BUSINESS_CAPABILITIES = [
             "total_count": "number"
         },
         "default_error_message": "Project search data is currently unavailable.",
+        "required_context": [],
+        "clarifiable_context": [],
+        "inheritable_context": ["temporal_scope", "start_date", "end_date", "financial_year", "status", "customer_id"],
+        "defaultable_context": [],
         "required_business_context": {
             "search_term": {"type": "string", "description": "Project name or code"}
         },
@@ -521,10 +552,10 @@ BUSINESS_CAPABILITIES = [
         "id": "kpi_summary",
         "business_domain": "kpi",
         "fast_path_eligible": True,
-        "intent_keywords": ['kpi', 'kpi summary', 'executive kpi'],
+        "intent_keywords": ['kpi summary', 'executive kpi', 'organization kpi', 'kpi report', 'generate kpi report', 'kpi dashboard', 'show kpi'],
         "description": "Retrieves the master KPI summary report (budget vs actuals, GP performance).",
         "supported_metrics": ["strictly_active_projects_count", "overdue_tasks", "overdue_projects", "projects_by_status"],
-        "supported_operations": ["summary", "filter", "comparison", "trend"],
+        "supported_operations": ["summary", "filter", "comparison", "trend", "count", "aggregate", "generate"],
         "priority": PRIORITY_EXISTING_REPORT,
         "dependencies": [],
         "response_contract": {
@@ -541,14 +572,37 @@ BUSINESS_CAPABILITIES = [
         },
         "primary_metric": "strictly_active_projects_count",
         "response_schema": {
+            "employee_id": "number",
+            "employee_name": "string",
+            "is_organization_aggregate": "boolean",
+            "total_kpi_target": "number",
+            "target_gp": "number",
+            "secured_business": "number",
+            "balance_to_achieve": "number",
+            "total_proposals": "number",
+            "total_proposal_value": "number",
+            "total_projects": "number",
             "strictly_active_projects_count": "number",
             "total_projects_all_statuses_combined": "number",
+            "total_performing_revenue": "number",
+            "variance": "number",
             "projects_by_status": "object",
+            "gp_performance": "object",
+            "summary": "object",
+            "date_range": "object",
             "overdue_tasks": "number",
             "overdue_projects": "number"
         },
         "default_error_message": "KPI summary and active project metrics are currently unavailable.",
+        "required_context": ["temporal_scope"],
+        "clarifiable_context": ["temporal_scope"],
+        "inheritable_context": ["temporal_scope", "start_date", "end_date", "financial_year", "employee_id", "employee_name"],
+        "defaultable_context": [],
         "required_business_context": {},
+        "optional_parameters": {
+            "start_date": {"type": "string", "format": "date", "description": "Start date (YYYY-MM-DD), default FY start '2025-04-01'"},
+            "end_date": {"type": "string", "format": "date", "description": "End date (YYYY-MM-DD), default FY end '2026-03-31'"}
+        },
         "parameter_metadata": {
             "financial_year": {
                 "type": "string",
@@ -580,7 +634,7 @@ BUSINESS_CAPABILITIES = [
             {
                 "priority": PRIORITY_SEMANTIC_WRAPPER,
                 "type": "wrapper",
-                "function_call": "get_active_projects_metrics",
+                "function_call": "get_kpi_summary_report",
                 "needs_confirmation": False,
                 "required_entities": [],
                 "required_parameters": []
@@ -618,6 +672,10 @@ BUSINESS_CAPABILITIES = [
             "key_projects_sample": "array"
         },
         "default_error_message": "Project recoverability metrics are currently unavailable. Please try again later.",
+        "required_context": ["temporal_scope"],
+        "clarifiable_context": ["temporal_scope"],
+        "inheritable_context": ["temporal_scope", "start_date", "end_date", "financial_year", "project_id"],
+        "defaultable_context": [],
         "required_parameters": [],
         "optional_parameters": {
             "start_date": {"type": "string", "format": "date", "description": "Start date (YYYY-MM-DD)"},
@@ -667,9 +725,9 @@ BUSINESS_CAPABILITIES = [
         "id": "pipeline_analysis",
         "business_domain": "pipeline",
         "fast_path_eligible": True,
-        "intent_keywords": ['pipeline', 'sales pipeline', 'opportunities'],
-        "description": "Gets sales pipeline metrics, proposal pipeline funnel, weighted deal values, and win probabilities.",
-        "supported_metrics": ["open_proposals", "won_proposals", "proposal_win_rate", "service_pipeline_leads_summary"],
+        "intent_keywords": ['pipeline', 'sales pipeline', 'opportunities', 'proposals', 'proposal status', 'rejected proposals', 'accepted proposals', 'won proposals', 'proposal win rate', 'proposal metrics'],
+        "description": "Gets sales pipeline metrics, proposal status breakdown (accepted, rejected, sent, created), proposal win rate, and sales lead metrics.",
+        "supported_metrics": ["open_proposals", "won_proposals", "proposal_win_rate", "service_pipeline_leads_summary", "dashboard_proposal_metrics_breakdown"],
         "supported_operations": ["sum", "count", "filter", "group_by", "comparison", "trend", "summary"],
         "priority": PRIORITY_SEMANTIC_WRAPPER,
         "dependencies": [],
@@ -698,6 +756,10 @@ BUSINESS_CAPABILITIES = [
             "dashboard_continuous_engagement_metrics_breakdown": "array"
         },
         "default_error_message": "Pipeline and proposal metrics are currently unavailable. Please try again later.",
+        "required_context": ["temporal_scope"],
+        "clarifiable_context": ["temporal_scope"],
+        "inheritable_context": ["temporal_scope", "start_date", "end_date", "financial_year", "status"],
+        "defaultable_context": [],
         "required_parameters": [],
         "optional_parameters": {},
         "parameter_metadata": {
@@ -719,6 +781,14 @@ BUSINESS_CAPABILITIES = [
             }
         },
         "implementations": [
+            {
+                "priority": PRIORITY_EXISTING_REPORT,
+                "type": "report",
+                "endpoint": "GET /api/v1/proposal/statuswise_budget",
+                "needs_confirmation": False,
+                "required_entities": [],
+                "required_parameters": []
+            },
             {
                 "priority": PRIORITY_SEMANTIC_WRAPPER,
                 "type": "wrapper",
@@ -780,7 +850,7 @@ BUSINESS_CAPABILITIES = [
                 "needs_confirmation": False,
                 "required_entities": [],
                 "required_parameters": [],
-                "supported_operations": ["filter", "summary"]
+                "supported_operations": ["filter", "summary", "count", "aggregate"]
             }
         ]
     },
@@ -837,6 +907,10 @@ BUSINESS_CAPABILITIES = [
             "projects": "array"
         },
         "default_error_message": "Staff billing metrics are currently unavailable. Please try again later.",
+        "required_context": ["temporal_scope"],
+        "clarifiable_context": ["temporal_scope"],
+        "inheritable_context": ["temporal_scope", "start_date", "end_date", "financial_year", "department_id", "employee_id"],
+        "defaultable_context": [],
         "required_parameters": [],
         "optional_parameters": {
             "financial_year": {"type": "string", "description": "Financial year"},
@@ -846,20 +920,20 @@ BUSINESS_CAPABILITIES = [
         "ui_action": "navigate",
         "implementations": [
             {
-                "priority": PRIORITY_EXISTING_REPORT,
-                "type": "report",
-                "endpoint": "GET /api/v1/reports/staff-billing-report",
+                "priority": PRIORITY_SEMANTIC_WRAPPER,
+                "type": "wrapper",
+                "function_call": "get_staff_billing_report",
                 "needs_confirmation": False,
                 "required_entities": [],
                 "required_parameters": []
             },
             {
-                "priority": PRIORITY_SEMANTIC_WRAPPER,
-                "type": "wrapper",
-                "function_call": "call_staff_billing_report",
+                "priority": PRIORITY_EXISTING_REPORT,
+                "type": "report",
+                "endpoint": "GET /api/v1/reports/revenue-billing-report",
                 "needs_confirmation": False,
                 "required_entities": [],
-                "required_parameters": []
+                "required_parameters": ["department_id"]
             }
         ]
     },
@@ -915,25 +989,15 @@ CAPABILITY_ALIASES = {
 # ---------------------------------------------------------------------------
 def get_planner_capabilities_schema() -> list:
     """
-    Extracts ONLY the abstract business capabilities.
-    The Planner never sees implementations, priorities, endpoints, or SQL.
+    Extracts ONLY the compact abstract business capabilities for Planner prompt.
+    Optimized for minimal token consumption.
     """
     schemas = []
     for cap in BUSINESS_CAPABILITIES:
         schemas.append({
-            "type": "function",
-            "function": {
-                "name": cap["id"],
-                "description": cap["description"],
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        **cap.get("required_business_context", {}),
-                        **cap.get("optional_parameters", {})
-                    },
-                    "required": list(cap.get("required_business_context", {}).keys())
-                }
-            }
+            "id": cap["id"],
+            "domain": cap.get("business_domain", "general"),
+            "description": cap["description"]
         })
     return schemas
 

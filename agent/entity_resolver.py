@@ -186,11 +186,22 @@ def resolve_fiscal_year(fy_input: Optional[str] = None) -> Dict[str, Any]:
 def parse_scope_time_filter(time_str: str) -> Dict[str, str]:
     """
     Deterministically parses user time expressions into start_date, end_date, and financial_year boundaries.
+    Uses canonical resolve_temporal_scope for guaranteed parity across all modules.
     """
     if not time_str or not isinstance(time_str, str):
         return {}
 
     ts = time_str.strip().lower()
+    from agent.temporal_resolver import resolve_temporal_scope
+    resolved = resolve_temporal_scope(ts)
+    if resolved.get("is_explicit"):
+        return {
+            "start_date": resolved["start_date"],
+            "end_date": resolved["end_date"],
+            "financial_year": resolved.get("financial_year", ""),
+            "temporal_scope": resolved.get("temporal_scope", "")
+        }
+
     res = {}
 
     # 1. Centralized Fiscal Year Resolver
