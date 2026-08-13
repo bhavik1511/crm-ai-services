@@ -24,7 +24,7 @@ from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Union, Any
 
 from db.database import get_db_engine
 from sqlalchemy import text
@@ -2331,27 +2331,51 @@ async def enhance_text(request: EnhanceTextRequest):
 
 
 class EmailTaskRequest(BaseModel):
-    subject: str
-    text_body: str
-    html_body: str
-    outer_from: str
-    outer_to: str
-    outer_cc: str
+    subject: Optional[str] = ""
+    text_body: Optional[str] = ""
+    html_body: Optional[str] = ""
+    outer_from: Optional[str] = ""
+    outer_to: Optional[str] = ""
+    outer_cc: Optional[str] = ""
+    from_email: Optional[str] = None
+    sender_email: Optional[str] = None
+    to_emails: Optional[str] = None
+    text: Optional[str] = None
+    html: Optional[str] = None
     attachments: Optional[List[Dict]] = []
     files: Optional[List[Dict]] = []
     employee_id: Optional[int] = 0
+    reference_id: Optional[str] = None
+    email_url: Optional[str] = None
+    web_link: Optional[str] = None
+    webLink: Optional[str] = None
+    message_id: Optional[str] = None
+    email_id: Optional[str] = None
+    source_email_id: Optional[str] = None
 
 class EmailLeadRequest(BaseModel):
-    subject: str
-    text_body: str
-    html_body: str
-    outer_from: str
-    outer_to: str
-    outer_cc: str
+    subject: Optional[str] = ""
+    text_body: Optional[str] = ""
+    html_body: Optional[str] = ""
+    outer_from: Optional[str] = ""
+    outer_to: Optional[str] = ""
+    outer_cc: Optional[str] = ""
+    from_email: Optional[str] = None
+    sender_email: Optional[str] = None
+    to_emails: Optional[str] = None
+    text: Optional[str] = None
+    html: Optional[str] = None
     attachments: Optional[List[Dict]] = []
     files: Optional[List[Dict]] = []
     employee_id: Optional[int] = 0
     context: Optional[Dict] = {}
+    reference_id: Optional[str] = None
+    email_url: Optional[str] = None
+    web_link: Optional[str] = None
+    webLink: Optional[str] = None
+    message_id: Optional[str] = None
+    email_id: Optional[str] = None
+    source_email_id: Optional[str] = None
 
 API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
@@ -2368,17 +2392,34 @@ async def extract_email_task(request: EmailTaskRequest):
     try:
         from agent.email_parser import strip_html_to_text, parse_forwarded_email, classify_sender, extract_entities_with_llm
         
+        # Resolve Outlook email URL / reference_id
+        resolved_ref_id = (
+            request.reference_id or 
+            request.email_url or 
+            request.web_link or 
+            request.webLink or 
+            request.message_id or 
+            request.email_id or 
+            None
+        )
+
+        # Resolve field alias fallbacks
+        sender_val = request.outer_from or request.sender_email or request.from_email or ""
+        to_val = request.outer_to or request.to_emails or ""
+        html_val = request.html_body or request.html or ""
+        text_val = request.text_body or request.text or ""
+
         # 1. Clean HTML
-        clean_text = strip_html_to_text(request.html_body)
+        clean_text = strip_html_to_text(html_val)
         if not clean_text:
-            clean_text = request.text_body
+            clean_text = text_val
             
         # 2. Parse Forwarded structure
         parsed_email = parse_forwarded_email(
             request.subject, 
             clean_text, 
-            request.outer_from, 
-            request.outer_to
+            sender_val, 
+            to_val
         )
         
         # 3. Determine Context
@@ -2388,7 +2429,7 @@ async def extract_email_task(request: EmailTaskRequest):
         if is_forwarded and parsed_email.get("originalFromEmail"):
             real_sender = parsed_email.get("originalFromEmail")
         else:
-            real_sender = parsed_email.get("forwarderEmail") or request.outer_from
+            real_sender = parsed_email.get("forwarderEmail") or sender_val
             
         sender_type = classify_sender(real_sender)
         
@@ -2431,7 +2472,11 @@ async def extract_email_task(request: EmailTaskRequest):
             sender_type=sender_type, 
             is_forwarded=is_forwarded, 
             attachments=all_attachments, 
-            employee_id=request.employee_id
+            employee_id=request.employee_id,
+            reference_id=resolved_ref_id,
+            sender_email=real_sender,
+            to_emails=request.outer_to,
+            subject=request.subject
         )
         
         processing_time_ms = int((time.time() - start_time) * 1000)
@@ -2469,7 +2514,7 @@ async def extract_email_task(request: EmailTaskRequest):
         
         # Determine emails
         from agent.email_parser import parse_email_addresses
-        json_result["to_emails"] = parse_email_addresses(request.outer_to)
+        json_result["to_emails"] = parse_email_addresses(to_val)
         json_result["cc_emails"] = parse_email_addresses(request.outer_cc)
         json_result["is_forwarded"] = is_forwarded
         json_result["forwarded_by_email"] = parsed_email.get("forwarderEmail") if is_forwarded else None
@@ -2524,6 +2569,103 @@ async def extract_email_lead(request: EmailLeadRequest):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/email-tasks/badge-status")
+@app.get("/email-tasks/badge-status")
+async def get_email_tasks_badge_status(employee_id: Optional[int] = 0):
+    """
+    Returns real-time unread/assigned task badge metrics for header navigation & inbox badge icons.
+    """
+    try:
+        engine = get_db_engine()
+        unread_count = 0
+        assigned_to_me_count = 0
+        
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT COUNT(*) FROM ai_email_parsing WHERE document_type = 'email_task' AND created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)"
+            )).fetchone()
+            if row:
+                unread_count = row[0] or 0
+                
+            if employee_id and employee_id > 0:
+                row_emp = conn.execute(text(
+                    "SELECT COUNT(*) FROM ai_email_parsing WHERE employee_id = :emp_id AND document_type = 'email_task' AND created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)"
+                ), {"emp_id": employee_id}).fetchone()
+                if row_emp:
+                    assigned_to_me_count = row_emp[0] or 0
+
+        return {
+            "success": True,
+            "has_new_task": unread_count > 0,
+            "unread_count": unread_count,
+            "assigned_to_me_count": assigned_to_me_count,
+            "badge_text": f"{unread_count} New" if unread_count > 0 else "0 New",
+            "badge_type": "info" if unread_count > 0 else "default"
+        }
+    except Exception as e:
+        print(f"Error fetching email task badge status: {e}")
+        return {
+            "success": False,
+            "has_new_task": False,
+            "unread_count": 0,
+            "assigned_to_me_count": 0,
+            "badge_text": "0 New",
+            "badge_type": "default"
+        }
+
+
+class EmailDraftFeedbackRequest(BaseModel):
+    reference_id: str
+    action_status: str  # 'APPROVED', 'DISCARDED', 'CONVERTED'
+    is_task_required: Optional[bool] = True
+    was_edited: Optional[bool] = False
+    intent_edited: Optional[bool] = False
+    customer_edited: Optional[bool] = False
+    assignee_edited: Optional[bool] = False
+    due_date_edited: Optional[bool] = False
+    is_hard_example: Optional[bool] = False
+    time_to_action_ms: Optional[int] = None
+    human_approved_values: Optional[dict] = None
+    reviewed_by_user_id: Optional[Union[int, str]] = None
+    reviewed_by_user_name: Optional[str] = None
+    reviewed_by_user_email: Optional[str] = None
+    include_in_training: Optional[bool] = True
+
+
+@app.post("/api/v1/email-drafts/feedback")
+@app.post("/api/email-drafts/feedback")
+@app.post("/email-drafts/feedback")
+async def email_draft_feedback(request: EmailDraftFeedbackRequest):
+    """
+    Receives human feedback (approval, discard, edit diffs) from the frontend EmailTaskPopup modal
+    and asynchronously updates the unified ML dataset row in ai_email_ml_dataset.
+    """
+    try:
+        from db.database import update_email_ml_dataset_feedback_async
+        asyncio.create_task(update_email_ml_dataset_feedback_async(
+            reference_id=request.reference_id,
+            action_status=request.action_status,
+            is_task_required=request.is_task_required if request.is_task_required is not None else True,
+            was_edited=request.was_edited or False,
+            intent_edited=request.intent_edited or False,
+            customer_edited=request.customer_edited or False,
+            assignee_edited=request.assignee_edited or False,
+            due_date_edited=request.due_date_edited or False,
+            is_hard_example=request.is_hard_example or request.was_edited or False,
+            time_to_action_ms=request.time_to_action_ms,
+            human_approved_values=request.human_approved_values,
+            reviewed_by_user_id=request.reviewed_by_user_id,
+            reviewed_by_user_name=request.reviewed_by_user_name,
+            reviewed_by_user_email=request.reviewed_by_user_email,
+            include_in_training=request.include_in_training if request.include_in_training is not None else True
+        ))
+        return {"success": True, "message": "Feedback recorded successfully"}
+    except Exception as e:
+        print(f"[MLFeedback] Error recording feedback: {e}")
+        return {"success": False, "message": str(e)}
+
 
 
 if __name__ == "__main__":
