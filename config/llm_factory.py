@@ -1,13 +1,16 @@
 import os
 from typing import Optional
+from dotenv import load_dotenv
+
+# Automatically load environment variables from .env
+load_dotenv()
 
 def get_llm(model_name: Optional[str] = None, temperature: Optional[float] = None, max_tokens: Optional[int] = None, is_vision: bool = False):
     """
-    Universal LLM Factory.
-    Reads from .env and returns the correct Langchain ChatModel (Groq, OpenAI, Gemini, Anthropic, Ollama, etc).
-    This architecture is completely provider-agnostic.
+    Universal LLM Factory driven by .env variables.
+    Reads LLM_PROVIDER, LLM_MODEL, and LLM_API_KEY directly from .env with fallbacks for Groq, OpenAI, Gemini, Anthropic, Azure, and Ollama.
     """
-    provider = os.getenv("LLM_PROVIDER", "groq").lower()
+    provider = os.getenv("LLM_PROVIDER", "groq").lower().strip()
 
     # 0. Check for Mock / Offline Mode (ZERO token usage guarantee)
     is_mock = os.getenv("MOCK_LLM_MODE", "false").lower() in ("true", "1", "yes")
@@ -33,17 +36,19 @@ def get_llm(model_name: Optional[str] = None, temperature: Optional[float] = Non
         })
         print("[MOCK LLM] MOCK_LLM_MODE is active — Returning Zero-Token Fake LLM Stub with structured JSON plan.")
         return FakeListChatModel(responses=[mock_plan_json] * 100)
-    
+
     # 1. Resolve Model Name
     if not model_name:
         if is_vision:
-            model_name = os.getenv("VISION_MODEL", "llama-3.2-90b-vision-preview")
+            model_name = os.getenv("VISION_MODEL") or os.getenv("LLM_MODEL")
         else:
             model_name = os.getenv("LLM_MODEL") or os.getenv("PRIMARY_MODEL", "llama-3.3-70b-versatile")
-            
+
+    if not model_name:
+        model_name = "llama-3.3-70b-versatile"
+
     # 2. Resolve API Key
-    # We prioritize LLM_API_KEY to be provider-agnostic, but fallback to specific keys for backward compatibility.
-    api_key = os.getenv("LLM_API_KEY")
+    api_key = os.getenv("LLM_API_KEY") or os.getenv("EMAIL_API_KEY") or os.getenv("CHATBOT_API_KEY")
     if not api_key:
         if provider == "groq":
             api_key = os.getenv("CHATBOT_API_KEY") or os.getenv("GROQ_API_KEY") or os.getenv("EMAIL_API_KEY")
@@ -53,20 +58,18 @@ def get_llm(model_name: Optional[str] = None, temperature: Optional[float] = Non
             api_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY")
         elif provider == "openai":
             api_key = os.getenv("OPENAI_API_KEY")
-            
+
     # 3. Resolve base configuration
     kwargs = {}
-    
     temp = temperature if temperature is not None else float(os.getenv("LLM_TEMPERATURE", "0.0"))
     kwargs["temperature"] = temp
-    
+
     tokens = max_tokens if max_tokens is not None else os.getenv("LLM_MAX_TOKENS")
     if tokens:
         kwargs["max_tokens"] = int(tokens)
-        
+
     base_url = os.getenv("LLM_BASE_URL")
-    
-    print(f"[DEBUG LLM_FACTORY] Provider: {provider} | Model: {model_name}")
+    print(f"[DEBUG LLM_FACTORY] Provider: '{provider}' | Model: '{model_name}'")
 
     if provider == "openai":
         from langchain_openai import ChatOpenAI
@@ -114,7 +117,7 @@ def get_llm(model_name: Optional[str] = None, temperature: Optional[float] = Non
         # Default: Groq
         from langchain_groq import ChatGroq
         if not api_key:
-            raise RuntimeError("LLM_API_KEY or GROQ_API_KEY missing from .env")
+            raise RuntimeError("LLM_API_KEY or GROQ_API_KEY is missing from .env")
         kwargs["model_name"] = model_name
         kwargs["groq_api_key"] = api_key
         kwargs["max_retries"] = 1

@@ -138,13 +138,14 @@ def _build_ownership_sql(employee_id: int, user_tier: int, table_alias: str = "i
     )"""
 
 @tool
-async def get_revenue_metrics(start_date: Optional[str] = None, end_date: Optional[str] = None, employee_id: int = None, user_tier: int = None) -> str:
+async def get_revenue_metrics(start_date: Optional[str] = None, end_date: Optional[str] = None, employee_id: int = None, user_tier: int = None, service_line: Optional[str] = None) -> str:
     """Useful for answering questions about Total Revenue, Revenue by Month, and TEAM BILLING (Service Line Breakdown).
     Args:
         start_date: Start of the period (defaults to CURRENT Fiscal Year start: Oct 1)
         end_date: End of the period (defaults to CURRENT Fiscal Year end: Sep 30)
         employee_id: The ID of the employee to filter by. Always pass the user's Employee ID from the system prompt to get personalized dashboard results.
         user_tier: The tier level of the requesting user (1-9). Tier 1-4 can access service_line aggregates. Tier 5+ are restricted to direct involvement only.
+        service_line: Optional service line name to filter by (e.g. "Audit", "Tax", "Advisory").
     """
     try:
         # RBAC: resolve from server-side context if LLM omits params
@@ -153,10 +154,15 @@ async def get_revenue_metrics(start_date: Optional[str] = None, end_date: Option
         start_date = start_date or fy_info['fy_start']
         end_date = end_date or fy_info['fy_end']
 
-        ownership_sql = _build_ownership_sql(employee_id, user_tier, "i", True)
+        sl_cond = ""
+        if service_line and service_line.strip().lower() not in ("all", ""):
+            sl_cond = f" AND msl.name LIKE '%{service_line.strip()}%'"
 
-        total_q = f"SELECT ROUND(SUM(total_amt_ex_vat), 2) AS revenue FROM invoice i WHERE i.is_active = 1 AND i.created_at BETWEEN '{start_date}' AND '{end_date}' AND {ownership_sql}"
-        month_q = f"SELECT DATE_FORMAT(i.created_at, '%b-%Y') AS month, ROUND(SUM(i.total_amt_ex_vat), 2) AS amount FROM invoice i WHERE i.is_active = 1 AND i.created_at BETWEEN '{start_date}' AND '{end_date}' AND {ownership_sql} GROUP BY DATE_FORMAT(i.created_at, '%b-%Y') ORDER BY MIN(i.created_at)"
+        # Build ownership filter matching the backend row-level security exactly
+        ownership_sql = _build_ownership_sql(employee_id, user_tier, "i", True, "created_by")
+
+        total_q = f"SELECT ROUND(SUM(i.total_amt_ex_vat), 2) AS revenue FROM invoice i LEFT JOIN m_serviceline msl ON msl.id = i.service_line_id WHERE i.is_active = 1 AND i.created_at BETWEEN '{start_date}' AND '{end_date}' {sl_cond} AND {ownership_sql}"
+        month_q = f"SELECT DATE_FORMAT(i.created_at, '%b-%Y') AS month, ROUND(SUM(i.total_amt_ex_vat), 2) AS amount FROM invoice i LEFT JOIN m_serviceline msl ON msl.id = i.service_line_id WHERE i.is_active = 1 AND i.created_at BETWEEN '{start_date}' AND '{end_date}' {sl_cond} AND {ownership_sql} GROUP BY DATE_FORMAT(i.created_at, '%b-%Y') ORDER BY MIN(i.created_at)"
         gp_perf_q = f"SELECT sl.name, sl.short_code, ROUND(COALESCE(SUM(i.total_amt_ex_vat), 0), 2) AS performing, COALESCE((SELECT ROUND(SUM(km.target_value), 2) FROM kpi_master km JOIN serviceline_department sd ON km.department_id = sd.department_id WHERE sd.serviceline_id = sl.id), 0) AS target FROM m_serviceline sl LEFT JOIN invoice i ON i.service_line_id = sl.id AND i.is_active = 1 AND i.created_at BETWEEN '{start_date}' AND '{end_date}' AND {ownership_sql} WHERE sl.is_active = 1 GROUP BY sl.id, sl.name, sl.short_code HAVING performing > 0 OR target > 0"
         top_cust_q = f"SELECT COALESCE(c.customer_name, CONCAT('Customer #', i.client_name_id)) AS customer_name, ROUND(SUM(i.total_amt_ex_vat), 2) AS revenue FROM invoice i LEFT JOIN customers c ON i.client_name_id = c.id WHERE i.is_active = 1 AND i.created_at BETWEEN '{start_date}' AND '{end_date}' AND {ownership_sql} GROUP BY c.id, customer_name ORDER BY revenue DESC LIMIT 5"
 
@@ -303,7 +309,7 @@ async def get_receivables_metrics(employee_id: int = None, user_tier: int = None
         return f"Error retrieving receivables metrics: {str(e)}"
 
 @tool
-async def get_pipeline_and_proposals(start_date: Optional[str] = None, end_date: Optional[str] = None, employee_id: int = None, user_tier: int = None) -> str:
+async def get_pipeline_and_proposals(start_date: Optional[str] = None, end_date: Optional[str] = None, employee_id: int = None, user_tier: int = None, service_line: Optional[str] = None) -> str:
     """Useful for answering questions about open leads, proposals, engagement letters, budgets, and WIN RATES.
     This tool returns:
     - service_pipeline_leads_open: Count and value of open leads
@@ -319,6 +325,7 @@ async def get_pipeline_and_proposals(start_date: Optional[str] = None, end_date:
         end_date: End of the period (defaults to CURRENT Fiscal Year end: Sep 30)
         employee_id: The ID of the employee to filter by. Always pass the user's Employee ID from the system prompt to get personalized dashboard results.
         user_tier: The tier level of the requesting user (1-9). Tier 1-4 can access service_line aggregates. Tier 5+ are restricted to direct involvement only.
+        service_line: Optional service line name to filter by (e.g. "Audit", "Tax", "Advisory").
     """
     try:
         # RBAC: resolve from server-side context if LLM omits params
@@ -330,6 +337,9 @@ async def get_pipeline_and_proposals(start_date: Optional[str] = None, end_date:
         # Normalize end_date to capture full day
         if end_date and len(end_date) == 10:
             end_date += " 23:59:59"
+        sl_cond = ""
+        if service_line and service_line.strip().lower() not in ("all", ""):
+            sl_cond = f" AND msl.name LIKE '%{service_line.strip()}%'"
 
         # Build ownership filter matching the backend row-level security exactly
         ownership_sql = _build_ownership_sql(employee_id, user_tier, "sl", True, "lead_owner", "serviceline_id")
@@ -353,9 +363,9 @@ async def get_pipeline_and_proposals(start_date: Optional[str] = None, end_date:
 
         # CRITICAL: AND p.project_id IS NULL mirrors the dashboard "Pending Projects" filter.
         # Without this filter the counts are inflated by proposals already converted to projects.
-        props_q = f"SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p WHERE p.is_active = 1 AND p.proposal_status_id IN (1, 7, 8) AND p.project_id IS NULL AND p.created_at BETWEEN '{start_date}' AND '{end_date}' AND {prop_ownership_sql}"
-        won_props_q = f"SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p WHERE p.is_active = 1 AND (p.project_id IS NOT NULL OR p.proposal_status_id = 3) AND p.created_at BETWEEN '{start_date}' AND '{end_date}' AND {prop_ownership_sql}"
-        total_props_q = f"SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p WHERE p.is_active = 1 AND p.created_at BETWEEN '{start_date}' AND '{end_date}' AND {prop_ownership_sql}"
+        props_q = f"SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p LEFT JOIN m_serviceline msl ON msl.id = p.service_line_id WHERE p.is_active = 1 AND p.proposal_status_id IN (1, 7, 8) AND p.project_id IS NULL AND p.created_at BETWEEN '{start_date}' AND '{end_date}' {sl_cond} AND {prop_ownership_sql}"
+        won_props_q = f"SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p LEFT JOIN m_serviceline msl ON msl.id = p.service_line_id WHERE p.is_active = 1 AND (p.project_id IS NOT NULL OR p.proposal_status_id = 3) AND p.created_at BETWEEN '{start_date}' AND '{end_date}' {sl_cond} AND {prop_ownership_sql}"
+        total_props_q = f"SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p LEFT JOIN m_serviceline msl ON msl.id = p.service_line_id WHERE p.is_active = 1 AND p.created_at BETWEEN '{start_date}' AND '{end_date}' {sl_cond} AND {prop_ownership_sql}"
         
         # Dashboard chart queries — use proper LEFT JOINs with WHERE clause matching CRM UI metrics exactly
         # Exclude status ids 9 (Project Pending) and 10 (All Project Created) to match the frontend filter in StatusInfoList.tsx.
@@ -363,7 +373,8 @@ async def get_pipeline_and_proposals(start_date: Optional[str] = None, end_date:
             f"SELECT ps.name as status_name, COUNT(p.id) AS total_entries, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget "
             f"FROM m_proposal_status ps "
             f"LEFT JOIN proposal p ON ps.id = p.proposal_status_id AND p.is_active = 1 AND p.created_at BETWEEN '{start_date}' AND '{end_date}' AND ({prop_ownership_sql}) "
-            f"WHERE ps.id NOT IN (9, 10) "
+            f"LEFT JOIN m_serviceline msl ON msl.id = p.service_line_id "
+            f"WHERE ps.id NOT IN (9, 10) {sl_cond} "
             f"GROUP BY ps.id, ps.name, ps.sequence ORDER BY ps.sequence ASC"
         )
         ui_engs_q = (

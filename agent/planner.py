@@ -187,7 +187,17 @@ class EnterprisePlanner:
         
         logger.info(f"[Req: {tracker.request_id}] Starting business reasoning for query: {context.question}")
         
-        # 1. Check for Clarification State Persistence (DIAG-7, 8, 9)
+        # Security Guardrail Check for Schema / Internal System Queries
+        from config.security_guard import check_security_guardrail
+        sec_block = check_security_guardrail(context.question or "")
+        if sec_block:
+            return {
+                "type": "done",
+                "content": sec_block["content"],
+                "is_clarification": False
+            }
+
+        # 1. Check for Clarification State Persistence
         previous_plan = context.user_context.get("previous_execution_plan")
         is_internal = context.request_metadata.get("is_internal", False)
         
@@ -583,7 +593,9 @@ class EnterprisePlanner:
         if not is_valid:
             logger.warning(f"[Req: {tracker.request_id}] Execution blocked by Validator.")
             tracker.dump_trace()
-            return {"type": "done", "content": "⚠️ **Execution Blocked**\n\n" + "\n".join([f"- {err}" for err in validation_errors]), "is_clarification": True, "execution_plan": execution_plan}
+            clean_errs = [err for err in validation_errors if err]
+            err_content = clean_errs[0] if clean_errs else "I need a bit more detail to answer your request accurately. Could you please specify which customer, project, or revenue report you would like to view?"
+            return {"type": "done", "content": err_content, "is_clarification": True, "execution_plan": execution_plan}
             
         # 3.8 Entity-Aware Cache Check (Post Entity Resolution, Pre-Backend Execution)
         from memory.session_manager import build_entity_cache_key, get_entity_cache, set_entity_cache

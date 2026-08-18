@@ -410,33 +410,63 @@ async def synthesize_response(original_query: str, tool_results: List[Dict[str, 
                 "7. Format all monetary values as BHD (e.g., BHD 1,155,574). Never use $ or USD.\n"
             )
         
-        prompt = f"User Query: {original_query}\n\nSummarized Tool Results:\n{serialized_results}\n\nFormat this into a clear, direct executive answer."
+        system_prompt = (
+            "You are an Enterprise CRM Assistant. Format the following raw JSON tool outputs into a concise, professional markdown response for the user.\n"
+            "Rules:\n"
+            "1. Merge data from multiple tools naturally.\n"
+            "2. Remove duplicate information.\n"
+            "3. Format data as markdown tables when appropriate.\n"
+            "4. If a capability failed or returned an error, explain it gracefully but still present any successful data.\n"
+            "5. NEVER invent or hallucinate data. Only use the provided JSON.\n"
+            "6. Do not expose internal technical terms like 'capabilities', 'JSON', or 'SQL'.\n"
+            "7. Do not explain your reasoning process."
+        )
+        
+        # Truncate overly large JSON payload to prevent exceeding LLM rate limits (e.g. 8k TPM)
+        raw_json_str = json.dumps(tool_results, default=str, indent=2)
+        if len(raw_json_str) > 12000:
+            compact_json_str = json.dumps(tool_results, default=str)
+            if len(compact_json_str) > 12000:
+                raw_json_str = compact_json_str[:12000] + "\n... [TRUNCATED DATA DUE TO PAYLOAD SIZE LIMIT]"
+            else:
+                raw_json_str = compact_json_str
+
+        prompt = f"User Query: {original_query}\n\nTool Results:\n{raw_json_str}\n\nFormat this into a clear, professional answer."
         
         synth_token_usage = {}
         try:
-            try:
-                response = await llm_client.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=prompt)])
-            except Exception as primary_err:
-                err_str = str(primary_err)
-                if "429" in err_str or "rate_limit" in err_str.lower() or "quota" in err_str.lower():
-                    logger.warning("[Synthesizer] Primary model rate-limited (429). Retrying with llama-3.1-8b-instant fallback model...")
-                    from config.llm_factory import get_llm
-                    fallback_llm = get_llm(model_name="llama-3.1-8b-instant")
-                    response = await fallback_llm.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=prompt)])
-                else:
-                    raise primary_err
+            from agent.pseudonymizer import prepare_for_external_llm, unmask_data, PrivacySecurityError
+            privacy_res = prepare_for_external_llm(prompt)
+            if not privacy_res.safe:
+                logger.error(f"Privacy validation failed in synthesizer: {privacy_res.blocked_reason}")
+                final_text = "Data formatting paused due to security privacy policy enforcement."
+            else:
+                try:
+                    response = await llm_client.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=privacy_res.masked_text)])
+                except Exception as primary_err:
+                    err_str = str(primary_err)
+                    if "429" in err_str or "rate_limit" in err_str.lower() or "quota" in err_str.lower():
+                        logger.warning("[Synthesizer] Primary model rate-limited (429). Retrying with llama-3.1-8b-instant fallback model...")
+                        from config.llm_factory import get_llm
+                        fallback_llm = get_llm(model_name="llama-3.1-8b-instant")
+                        response = await fallback_llm.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=privacy_res.masked_text)])
+                    else:
+                        raise primary_err
 
-            final_text = response.content
-            # Post-process: convert any remaining $ currency symbols to BHD
-            import re
-            final_text = re.sub(r'\$(\d)', r'BHD \1', final_text)
-            if hasattr(response, "usage_metadata") and response.usage_metadata:
-                synth_token_usage = {
-                    "input_tokens": response.usage_metadata.get("input_tokens", 0),
-                    "output_tokens": response.usage_metadata.get("output_tokens", 0),
-                    "total_tokens": response.usage_metadata.get("total_tokens", 0),
-                }
-                logger.info(f"[Synthesizer Tokens] In: {synth_token_usage['input_tokens']} | Out: {synth_token_usage['output_tokens']} | Total: {synth_token_usage['total_tokens']}")
+                final_text = unmask_data(response.content, privacy_res.token_mapping)
+                privacy_res.clear_mapping()
+
+                # Post-process: convert any remaining $ currency symbols to BHD
+                import re
+                final_text = re.sub(r'\$(\d)', r'BHD \1', final_text)
+
+                if hasattr(response, "usage_metadata") and response.usage_metadata:
+                    synth_token_usage = {
+                        "input_tokens": response.usage_metadata.get("input_tokens", 0),
+                        "output_tokens": response.usage_metadata.get("output_tokens", 0),
+                        "total_tokens": response.usage_metadata.get("total_tokens", 0),
+                    }
+                    logger.info(f"[Synthesizer Tokens] In: {synth_token_usage['input_tokens']} | Out: {synth_token_usage['output_tokens']} | Total: {synth_token_usage['total_tokens']}")
         except Exception as e:
             logger.error(f"Dynamic synthesis failed ({e}). Falling back to 0-token DATA mode formatter.")
             fallback_res = format_data_response(original_query, tool_results)

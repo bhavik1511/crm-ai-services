@@ -529,7 +529,7 @@ LIMIT 1
 def _build_parser_llm():
     from config.llm_factory import get_llm
     import os
-    fast_model = os.getenv("FAST_MODEL", "llama-3.1-8b-instant")
+    fast_model = os.getenv("FAST_MODEL") or os.getenv("LLM_MODEL")
     return get_llm(model_name=fast_model, temperature=0.0)
 
 # ---------------------------------------------------------------------------

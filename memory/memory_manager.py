@@ -522,15 +522,31 @@ def _deterministic_top_customers_by_revenue(question: str) -> Optional[dict]:
     if m:
         n = min(int(m.group(1)), 20)  # cap at 20
 
+    # Extract date range if user selected a timeframe/FY
+    start_date, end_date = None, None
+    try:
+        from agent.query_parser import _extract_date_range
+        s, e, date_specified = _extract_date_range(question)
+        if date_specified and s and e:
+            start_date, end_date = f"{s} 00:00:00", f"{e} 23:59:59"
+    except Exception:
+        pass
+
+    date_filter = "AND i.created_at BETWEEN :start_date AND :end_date" if start_date else ""
+    params = {"n": n}
+    if start_date:
+        params["start_date"] = start_date
+        params["end_date"] = end_date
+
     query = text(
-        """
+        f"""
         SELECT
             c.customer_name,
             ROUND(SUM(i.total_amt_ex_vat), 2) AS total_revenue,
             COUNT(DISTINCT i.id) AS invoice_count
         FROM customers c
         JOIN invoice i ON i.client_name_id = c.id
-        WHERE i.is_active = 1
+        WHERE i.is_active = 1 {date_filter}
         GROUP BY c.id, c.customer_name
         ORDER BY total_revenue DESC
         LIMIT :n
@@ -540,26 +556,37 @@ def _deterministic_top_customers_by_revenue(question: str) -> Optional[dict]:
     try:
         engine = get_db_engine()
         with engine.connect() as conn:
-            rows = conn.execute(query, {"n": n}).fetchall()
+            rows = conn.execute(query, params).fetchall()
 
         if not rows:
             # Try alternate join column
             query2 = text(
-                """
+                f"""
                 SELECT
                     c.customer_name,
                     ROUND(SUM(i.total_amt_ex_vat), 2) AS total_revenue,
                     COUNT(DISTINCT i.id) AS invoice_count
                 FROM customers c
                 JOIN invoice i ON i.client_id = c.id
-                WHERE i.is_active = 1
+                WHERE i.is_active = 1 {date_filter}
                 GROUP BY c.id, c.customer_name
                 ORDER BY total_revenue DESC
                 LIMIT :n
                 """
             )
             with engine.connect() as conn:
-                rows = conn.execute(query2, {"n": n}).fetchall()
+                rows = conn.execute(query2, params).fetchall()
+
+        # If date filtering produced no rows (e.g. historical data outside selected FY), fallback to all-time query
+        if not rows and start_date:
+            with engine.connect() as conn:
+                rows = conn.execute(
+                    text("""
+                        SELECT c.customer_name, ROUND(SUM(i.total_amt_ex_vat), 2) AS total_revenue, COUNT(DISTINCT i.id) AS invoice_count
+                        FROM customers c JOIN invoice i ON i.client_name_id = c.id WHERE i.is_active = 1 GROUP BY c.id, c.customer_name ORDER BY total_revenue DESC LIMIT :n
+                    """),
+                    {"n": n}
+                ).fetchall()
 
         if not rows:
             return {

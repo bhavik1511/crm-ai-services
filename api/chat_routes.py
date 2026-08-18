@@ -309,6 +309,10 @@ async def chat(
     
     set_trace_id()
     user_context = _decode_jwt(credentials)
+    if request.context and isinstance(request.context, dict):
+        for k, v in request.context.items():
+            if v is not None and k not in ("user_id", "employee_id", "role", "hierarchy_level", "department_id"):
+                user_context[k] = v
     user_id = user_context["user_id"]
     question = request.question.strip()
     session_id = request.session_id
@@ -403,6 +407,14 @@ async def chat(
             fast = await deterministic_dashboard_response(history, question, user_context, credentials.credentials)
             
         if fast:
+            if os.getenv("PSEUDONYMIZE_CHAT_RESPONSES", "false").lower() in ("true", "1") or (user_context and user_context.get("pseudonymize")):
+                try:
+                    from agent.pseudonymizer import prepare_for_external_llm, unmask_data
+                    p_fast = prepare_for_external_llm(fast.get("answer", ""))
+                    if p_fast.safe:
+                        fast["answer"] = unmask_data(p_fast.masked_text, p_fast.token_mapping) if p_fast.token_mapping else p_fast.masked_text
+                except Exception as pe:
+                    logger.warning(f"[ChatRoute] Pseudonymizer notice: {pe}")
             result = fast
             result["was_cached"] = False
             result["cache_tier"] = "fresh"
@@ -524,7 +536,7 @@ async def chat(
             from db.database import save_token_usage_async
             _emp_id = (user_context or {}).get("employee_id") or user_id or 0
             _telem = result.get("telemetry", {})
-            _model = _telem.get("model") or ("fast-path-deterministic" if _telem.get("fast_path") else (os.getenv("PRIMARY_MODEL") or "gemini-2.5-flash"))
+            _model = _telem.get("model") or ("fast-path-deterministic" if _telem.get("fast_path") else (os.getenv("PRIMARY_MODEL") or os.getenv("LLM_MODEL") or "qwen/qwen3.6-27b"))
             _in_tok = _telem.get("input_tokens") if _telem.get("input_tokens") is not None else _telem.get("planner_tokens", 0)
             _out_tok = _telem.get("output_tokens") if _telem.get("output_tokens") is not None else _telem.get("synthesizer_tokens", 0)
             _tot_tok = _telem.get("total_tokens", _in_tok + _out_tok)
@@ -693,12 +705,12 @@ async def chat_stream(
     from memory.conversation_memory import memory
 
     user_context = _decode_jwt(credentials)
-    
-    # Merge UI context (like active date picker) into the user_context
-    if hasattr(request, "context") and request.context:
-        user_context.update(request.context)
+    if request.context and isinstance(request.context, dict):
+        for k, v in request.context.items():
+            if v is not None and k not in ("user_id", "employee_id", "role", "hierarchy_level", "department_id"):
+                user_context[k] = v
 
-    # NEW: Extract report filters from the query text and merge into user_context globally
+    # Extract report filters from the query text and merge into user_context globally
     from main import _extract_kpi_filters_from_text
     _text_filters = _extract_kpi_filters_from_text(request.question.strip())
     for _k, _v in _text_filters.items():
@@ -1137,105 +1149,34 @@ async def chat_stream(
         yield f"data: {safe_json_dumps(metadata)}\n\n"
         yield "data: [DONE]\n\n"
 
-        # ── Token tracking & failure logging ───────────────────────────────────
-        # Always log failures (rate limits, model errors) even when token count is 0
-        _error_code = result.get("error_code")
-        _token_usage = result.get("token_usage", {})
-        _total_tokens = _token_usage.get("total_tokens", 0) if isinstance(_token_usage, dict) else 0
-
-        if _error_code and _total_tokens == 0:
-            try:
-                from db.database import save_token_usage_async
-                _emp_id = (user_context or {}).get("employee_id") or user_id or 0
-                _model = os.getenv("LLM_MODEL") or os.getenv("PRIMARY_MODEL") or "unknown"
-                asyncio.create_task(save_token_usage_async(
-                    employee_id=_emp_id,
-                    session_id=session_id,
-                    model_name=_model,
-                    input_tokens=0,
-                    output_tokens=0,
-                    total_tokens=0,
-                    total_cost_usd=0.0,
-                    status="failed",
-                    error_type=_error_code,
-                    error_message=(result.get("content", "") or "")[:512]
-                ))
-                logger.info(f"[TokenTracker] Logged failure to DB: status=failed, type={_error_code}")
-            except Exception as _te:
-                logger.error(f"[TokenTracker] Could not log failure: {_te}")
-
-        # Calculate and track token cost (successful AND fast-path 0-token requests)
-        token_usage = result.get("token_usage", {})
-        _is_fast_path = isinstance(token_usage, dict) and token_usage.get("model_name") == "lightweight_router_fast_path"
-        if token_usage and (token_usage.get("total_tokens", 0) > 0 or _is_fast_path):
-            model = token_usage.get("model_name", "llama-3.3-70b-versatile")
-            in_tok = token_usage.get("input_tokens", 0)
-            out_tok = token_usage.get("output_tokens", 0)
-            tot_tok = token_usage.get("total_tokens", 0)
-            model_key = (model or "").lower()
-            
-            # Dynamic pricing dictionary (Cost per 1M tokens)
-            pricing_map = {
-                # Groq Models
-                "llama-3.3-70b-versatile": {"in": 0.59, "out": 0.79},
-                "llama-3.1-8b-instant": {"in": 0.05, "out": 0.08},
-                "llama3-70b-8192": {"in": 0.59, "out": 0.79},
-                "llama3-8b-8192": {"in": 0.05, "out": 0.08},
-                "mixtral-8x7b-32768": {"in": 0.24, "out": 0.24},
-                "gemma2-9b-it": {"in": 0.20, "out": 0.20},
-                
-                # OpenAI Models
-                "gpt-4o": {"in": 5.00, "out": 15.00},
-                "gpt-4o-mini": {"in": 0.15, "out": 0.60},
-                "gpt-4-turbo": {"in": 10.00, "out": 30.00},
-                "gpt-3.5-turbo": {"in": 0.50, "out": 1.50},
-                
-                # Anthropic Models
-                "claude-3-5-sonnet-20240620": {"in": 3.00, "out": 15.00},
-                "claude-3-opus-20240229": {"in": 15.00, "out": 75.00},
-                "claude-3-haiku-20240307": {"in": 0.25, "out": 1.25},
-            }
-            
-            rates = pricing_map.get(model_key, {"in": 0.0, "out": 0.0})
-            
-            # Fallback for dynamic/custom names not strictly matching keys
-            if rates["in"] == 0.0 and rates["out"] == 0.0:
-                if "70b" in model_key: rates = {"in": 0.59, "out": 0.79}
-                elif "8b" in model_key: rates = {"in": 0.05, "out": 0.08}
-                elif "gpt-4o-mini" in model_key: rates = {"in": 0.15, "out": 0.60}
-                elif "gpt-4o" in model_key: rates = {"in": 5.00, "out": 15.00}
-                elif "gpt-4" in model_key: rates = {"in": 10.00, "out": 30.00}
-                elif "gpt-3.5" in model_key: rates = {"in": 0.50, "out": 1.50}
-                elif "claude-3-5-sonnet" in model_key: rates = {"in": 3.00, "out": 15.00}
-                elif "claude-3-haiku" in model_key: rates = {"in": 0.25, "out": 1.25}
-
-            cost = (in_tok / 1000000.0 * rates["in"]) + (out_tok / 1000000.0 * rates["out"])
-            try:
-                from db.database import save_token_usage_async
-                # Determine status from result: if error_code is set, the planner or synthesizer failed
-                _error_code = result.get("error_code")
-                _db_status = "failed" if _error_code else "success"
-                _exec_path = "FAST_PATH" if _is_fast_path else "PLANNER_LLM"
-                _task = asyncio.create_task(save_token_usage_async(
-                    employee_id=user_context.get("employee_id", user_id) or user_id,
-                    session_id=session_id,
-                    model_name=model or "unknown",
-                    input_tokens=in_tok,
-                    output_tokens=out_tok,
-                    total_tokens=tot_tok,
-                    total_cost_usd=cost,
-                    status=_db_status,
-                    error_type=_error_code,
-                    error_message=None,
-                    execution_path=_exec_path
-                ))
-                # Attach error callback so unhandled exceptions don't silently disrupt the event loop
-                def _db_task_done(t):
-                    if not t.cancelled() and t.exception():
-                        logger.error(f"[TokenTracker] Background DB task failed: {t.exception()}")
-                _task.add_done_callback(_db_task_done)
-            except Exception as e:
-                logger.error(f"[StreamEndpoint] Failed to spawn token tracking task: {e}")
+        # Calculate and track token cost
+        token_usage = result.get("token_usage") or {}
+        model = token_usage.get("model_name") if token_usage else None
+        model = model or os.getenv("LLM_MODEL") or os.getenv("PRIMARY_MODEL") or "qwen/qwen3.6-27b"
+        in_tok = token_usage.get("input_tokens", 0) if token_usage else 0
+        out_tok = token_usage.get("output_tokens", 0) if token_usage else 0
+        tot_tok = token_usage.get("total_tokens", 0) if token_usage else 0
+        from db.database import calculate_llm_cost
+        cost = calculate_llm_cost(model, in_tok, out_tok) if tot_tok > 0 else 0.0
+        exec_path = result.get("cache_tier") or ("fast_path" if result.get("latency_ms") == 0 else "llm_stream")
+        cap_id = result.get("report_intent") or "general_query"
+        try:
+            from db.database import save_token_usage_async
+            await save_token_usage_async(
+                employee_id=user_context.get("employee_id", user_id) or user_id or 1,
+                session_id=session_id,
+                model_name=model or "unknown",
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                total_tokens=tot_tok,
+                total_cost_usd=cost,
+                execution_path=exec_path,
+                capability_id=cap_id,
+                operation="report_generation" if result.get("report_intent") else "chat_response",
+                status="success"
+            )
+        except Exception as e:
+            logger.error(f"[StreamEndpoint] Failed to save chatbot token usage: {e}")
 
         try:
             is_form = False
@@ -1305,9 +1246,9 @@ async def get_history(
     user_id = user_context["user_id"]
 
     try:
-        # Parse date strings if provided
-        df = datetime.fromisoformat(date_from.replace('Z', '+00:00')) if date_from else None
-        dt = datetime.fromisoformat(date_to.replace('Z', '+00:00')) if date_to else None
+        # Parse date strings if provided (strip timezone info for naive UTC MongoDB comparison)
+        df = datetime.fromisoformat(date_from.replace('Z', '+00:00')).replace(tzinfo=None) if date_from else None
+        dt = datetime.fromisoformat(date_to.replace('Z', '+00:00')).replace(tzinfo=None) if date_to else None
 
         result = await chat_history.get_user_history(
             user_id=user_id,
@@ -1844,3 +1785,46 @@ async def get_staff_billing_filters(
         "customerName": _run_values_query(customer_q),
         "employeeName": _run_values_query(emp_q),
     }
+
+
+@router.get("/usage-logs")
+@router.get("/telemetry")
+async def get_ai_usage_logs(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    limit: int = Query(50, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    """
+    Retrieve recent AI chatbot usage telemetry logs from MySQL (ai_chatbot_usage).
+    """
+    user_context = _decode_jwt(credentials)
+    try:
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            query = sql_text("""
+                SELECT 
+                    id, employee_id, session_id, model_name, input_tokens, 
+                    output_tokens, total_tokens, total_cost_usd, status, 
+                    execution_path, capability_id, operation, backend_execution_ms, created_at
+                FROM ai_chatbot_usage
+                ORDER BY id DESC
+                LIMIT :limit OFFSET :offset
+            """)
+            rows = conn.execute(query, {"limit": limit, "offset": offset}).mappings().all()
+            
+            result_logs = []
+            for row in rows:
+                r = dict(row)
+                if r.get("created_at") and hasattr(r["created_at"], "isoformat"):
+                    r["created_at"] = r["created_at"].isoformat()
+                r["total_cost_usd"] = float(r["total_cost_usd"]) if r.get("total_cost_usd") is not None else 0.0
+                result_logs.append(r)
+                
+            return {
+                "status": "success",
+                "count": len(result_logs),
+                "logs": result_logs
+            }
+    except Exception as e:
+        logger.error(f"[UsageLogs] Failed to fetch usage logs: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch usage logs: {str(e)}")
