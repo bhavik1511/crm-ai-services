@@ -401,20 +401,11 @@ Return ONLY a valid JSON object with these EXACT keys:
         getattr(llm, 'model', None) or 
         getattr(getattr(llm, 'bound', None), 'model_name', None) or 
         getattr(getattr(llm, 'bound', None), 'model', None) or 
-        os.getenv("PRIMARY_MODEL", "llama-3.3-70b-versatile")
+        os.getenv("LLM_MODEL") or os.getenv("PRIMARY_MODEL") or "qwen/qwen3.6-27b"
     )
 
-    model_lower = str(model_name_used).lower()
-    if "llama-3.3-70b" in model_lower:
-        cost = (in_tok / 1_000_000 * 0.59) + (out_tok / 1_000_000 * 0.79)
-    elif "llama-3.1-8b" in model_lower:
-        cost = (in_tok / 1_000_000 * 0.05) + (out_tok / 1_000_000 * 0.08)
-    elif "llama-3.2-90b" in model_lower:
-        cost = (in_tok / 1_000_000 * 0.90) + (out_tok / 1_000_000 * 0.90)
-    elif "gpt-4o-mini" in model_lower:
-        cost = (in_tok / 1_000_000 * 0.150) + (out_tok / 1_000_000 * 0.600)
-    elif "gpt-4o" in model_lower:
-        cost = (in_tok / 1_000_000 * 2.50) + (out_tok / 1_000_000 * 10.00)
+    from db.database import calculate_llm_cost
+    cost = calculate_llm_cost(model_name_used, in_tok, out_tok)
 
     execution_time_ms = int((time.time() - start_time) * 1000)
 

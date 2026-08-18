@@ -2,7 +2,7 @@ from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import Engine
 from dotenv import load_dotenv
 from urllib.parse import quote_plus
-from typing import Optional
+from typing import Optional, Any, Union
 import os
 
 load_dotenv(override=True)
@@ -64,6 +64,11 @@ def get_db_engine() -> Engine:
                 output_tokens INT DEFAULT 0,
                 total_tokens INT DEFAULT 0,
                 total_cost_usd DECIMAL(10, 6) DEFAULT 0.000000,
+                status VARCHAR(50) DEFAULT 'success',
+                execution_path VARCHAR(50) DEFAULT 'fast_path',
+                capability_id VARCHAR(100) DEFAULT 'general_query',
+                operation VARCHAR(100) DEFAULT 'chat_response',
+                backend_execution_ms INT DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """))
@@ -135,14 +140,19 @@ def get_db_engine() -> Engine:
         """))
 
         # Alter table migrations for existing installations
-        try:
-            conn.execute(text("ALTER TABLE ai_email_ml_dataset ADD COLUMN review_count INT DEFAULT 1;"))
-        except Exception:
-            pass
-        try:
-            conn.execute(text("ALTER TABLE ai_email_ml_dataset ADD COLUMN discard_count INT DEFAULT 0;"))
-        except Exception:
-            pass
+        for col_stmt in [
+            "ALTER TABLE ai_chatbot_usage ADD COLUMN status VARCHAR(50) DEFAULT 'success';",
+            "ALTER TABLE ai_chatbot_usage ADD COLUMN execution_path VARCHAR(50) DEFAULT 'fast_path';",
+            "ALTER TABLE ai_chatbot_usage ADD COLUMN capability_id VARCHAR(100) DEFAULT 'general_query';",
+            "ALTER TABLE ai_chatbot_usage ADD COLUMN operation VARCHAR(100) DEFAULT 'chat_response';",
+            "ALTER TABLE ai_chatbot_usage ADD COLUMN backend_execution_ms INT DEFAULT 0;",
+            "ALTER TABLE ai_email_ml_dataset ADD COLUMN review_count INT DEFAULT 1;",
+            "ALTER TABLE ai_email_ml_dataset ADD COLUMN discard_count INT DEFAULT 0;"
+        ]:
+            try:
+                conn.execute(text(col_stmt))
+            except Exception:
+                pass
 
         # Drop legacy bloated unreadable JSON columns if they exist
         try:
@@ -168,7 +178,12 @@ async def save_token_usage_async(
     input_tokens: int, 
     output_tokens: int, 
     total_tokens: int, 
-    total_cost_usd: float
+    total_cost_usd: float,
+    execution_path: str = "fast_path",
+    capability_id: str = "general_query",
+    operation: str = "chat_response",
+    status: str = "success",
+    backend_execution_ms: int = 0
 ):
     """
     Asynchronously saves the token usage record for chatbot to MySQL (ai_chatbot_usage).
@@ -176,23 +191,39 @@ async def save_token_usage_async(
     def _insert_sync():
         try:
             engine = get_db_engine()
+            safe_emp_id = 1
+            if employee_id is not None:
+                try:
+                    s_emp = str(employee_id).strip()
+                    if ":" in s_emp:
+                        s_emp = s_emp.split(":")[-1]
+                    safe_emp_id = int(s_emp)
+                except Exception:
+                    safe_emp_id = 1
+
             with engine.begin() as conn:
                 conn.execute(
                     text("""
                         INSERT INTO ai_chatbot_usage 
-                        (employee_id, session_id, model_name, input_tokens, output_tokens, total_tokens, total_cost_usd)
-                        VALUES (:emp_id, :sess_id, :model, :in_tok, :out_tok, :tot_tok, :cost)
+                        (employee_id, session_id, model_name, input_tokens, output_tokens, total_tokens, total_cost_usd, status, execution_path, capability_id, operation, backend_execution_ms)
+                        VALUES (:emp_id, :sess_id, :model, :in_tok, :out_tok, :tot_tok, :cost, :status, :exec_path, :cap_id, :oper, :exec_ms)
                     """),
                     {
-                        "emp_id": employee_id,
-                        "sess_id": session_id,
-                        "model": model_name,
-                        "in_tok": input_tokens,
-                        "out_tok": output_tokens,
-                        "tot_tok": total_tokens,
-                        "cost": total_cost_usd
+                        "emp_id": safe_emp_id,
+                        "sess_id": str(session_id or "default_session")[:255],
+                        "model": str(model_name or "qwen/qwen3.6-27b")[:100],
+                        "in_tok": int(input_tokens or 0),
+                        "out_tok": int(output_tokens or 0),
+                        "tot_tok": int(total_tokens or 0),
+                        "cost": float(total_cost_usd or 0.0),
+                        "status": str(status or "success")[:50],
+                        "exec_path": str(execution_path or "fast_path")[:100],
+                        "cap_id": str(capability_id or "general_query")[:100],
+                        "oper": str(operation or "chat_response")[:50],
+                        "exec_ms": int(backend_execution_ms or 0)
                     }
                 )
+            logger.info(f"[TokenTracker] Successfully saved usage record to ai_chatbot_usage table: emp_id={safe_emp_id}, session={session_id}, path={execution_path}")
         except Exception as e:
             logger.error(f"[TokenTracker] Failed to save chatbot token usage: {e}")
 
@@ -213,19 +244,49 @@ async def save_parsing_token_usage_async(
     """
     Asynchronously saves the token usage record for document parsing (email, pdf, screenshot) to MySQL.
     """
-    if model_name is None:
+    if not model_name or model_name == "unknown":
         model_name = (
+            os.getenv("LLM_MODEL") or 
             os.getenv("PRIMARY_MODEL") or 
             os.getenv("OPENROUTER_PRIMARY_MODEL") or 
             os.getenv("GROQ_MODEL") or 
-            os.getenv("LLM_PROVIDER") or 
-            "unknown"
+            "qwen/qwen3.6-27b"
         )
 
     def _insert_sync():
         try:
             engine = get_db_engine()
             with engine.begin() as conn:
+                if reference_id and str(reference_id).strip():
+                    existing = conn.execute(
+                        text("SELECT id FROM ai_email_parsing WHERE reference_id = :ref LIMIT 1"),
+                        {"ref": str(reference_id).strip()}
+                    ).fetchone()
+                    if existing:
+                        conn.execute(
+                            text("""
+                                UPDATE ai_email_parsing
+                                SET employee_id = :emp_id, document_type = :doc_type, model_name = :model,
+                                    input_tokens = :in_tok, output_tokens = :out_tok, total_tokens = :tot_tok,
+                                    total_cost_usd = :cost, has_attachment = :has_att, file_extension = :ext,
+                                    created_at = CURRENT_TIMESTAMP
+                                WHERE id = :row_id
+                            """),
+                            {
+                                "row_id": existing[0],
+                                "emp_id": employee_id,
+                                "doc_type": document_type,
+                                "model": model_name,
+                                "in_tok": input_tokens,
+                                "out_tok": output_tokens,
+                                "tot_tok": total_tokens,
+                                "cost": total_cost_usd,
+                                "has_att": has_attachment,
+                                "ext": file_extension
+                            }
+                        )
+                        return
+
                 conn.execute(
                     text("""
                         INSERT INTO ai_email_parsing 
@@ -265,18 +326,48 @@ def save_parsing_token_usage(
     """
     Synchronously saves the token usage record for document parsing (email, pdf, screenshot) to MySQL.
     """
-    if model_name is None:
+    if not model_name or model_name == "unknown":
         model_name = (
+            os.getenv("LLM_MODEL") or 
             os.getenv("PRIMARY_MODEL") or 
             os.getenv("OPENROUTER_PRIMARY_MODEL") or 
             os.getenv("GROQ_MODEL") or 
-            os.getenv("LLM_PROVIDER") or 
-            "unknown"
+            "qwen/qwen3.6-27b"
         )
         
     try:
         engine = get_db_engine()
         with engine.begin() as conn:
+            if reference_id and str(reference_id).strip():
+                existing = conn.execute(
+                    text("SELECT id FROM ai_email_parsing WHERE reference_id = :ref LIMIT 1"),
+                    {"ref": str(reference_id).strip()}
+                ).fetchone()
+                if existing:
+                    conn.execute(
+                        text("""
+                            UPDATE ai_email_parsing
+                            SET employee_id = :emp_id, document_type = :doc_type, model_name = :model,
+                                input_tokens = :in_tok, output_tokens = :out_tok, total_tokens = :tot_tok,
+                                total_cost_usd = :cost, has_attachment = :has_att, file_extension = :ext,
+                                created_at = CURRENT_TIMESTAMP
+                            WHERE id = :row_id
+                        """),
+                        {
+                            "row_id": existing[0],
+                            "emp_id": employee_id,
+                            "doc_type": document_type,
+                            "model": model_name,
+                            "in_tok": input_tokens,
+                            "out_tok": output_tokens,
+                            "tot_tok": total_tokens,
+                            "cost": total_cost_usd,
+                            "has_att": has_attachment,
+                            "ext": file_extension
+                        }
+                    )
+                    return
+
             conn.execute(
                 text("""
                     INSERT INTO ai_email_parsing 
@@ -321,17 +412,53 @@ async def save_ai_email_parsing_async(
     """
     if not model_name or model_name == "unknown":
         model_name = (
+            os.getenv("LLM_MODEL") or 
             os.getenv("PRIMARY_MODEL") or 
             os.getenv("OPENROUTER_PRIMARY_MODEL") or 
             os.getenv("GROQ_MODEL") or 
-            os.getenv("LLM_PROVIDER") or 
-            "llama-3.3-70b-versatile"
+            "qwen/qwen3.6-27b"
         )
 
     def _insert_sync():
         try:
             engine = get_db_engine()
             with engine.begin() as conn:
+                if reference_id and str(reference_id).strip():
+                    existing = conn.execute(
+                        text("SELECT id FROM ai_email_parsing WHERE reference_id = :ref LIMIT 1"),
+                        {"ref": str(reference_id).strip()}
+                    ).fetchone()
+                    if existing:
+                        conn.execute(
+                            text("""
+                                UPDATE ai_email_parsing
+                                SET employee_id = :emp_id, document_type = :doc_type, model_name = :model,
+                                    input_tokens = :in_tok, output_tokens = :out_tok, total_tokens = :tot_tok,
+                                    total_cost_usd = :cost, has_attachment = :has_att, file_extension = :ext,
+                                    confidence_score = :conf_score, confidence_level = :conf_level,
+                                    processing_status = :proc_status, processing_time_ms = :proc_time,
+                                    created_at = CURRENT_TIMESTAMP
+                                WHERE id = :row_id
+                            """),
+                            {
+                                "row_id": existing[0],
+                                "emp_id": employee_id,
+                                "doc_type": document_type,
+                                "model": model_name,
+                                "in_tok": input_tokens,
+                                "out_tok": output_tokens,
+                                "tot_tok": total_tokens,
+                                "cost": total_cost_usd,
+                                "has_att": has_attachment,
+                                "ext": file_extension,
+                                "conf_score": confidence_score,
+                                "conf_level": confidence_level,
+                                "proc_status": processing_status,
+                                "proc_time": processing_time_ms
+                            }
+                        )
+                        return
+
                 conn.execute(
                     text("""
                         INSERT INTO ai_email_parsing 
@@ -361,7 +488,115 @@ async def save_ai_email_parsing_async(
     await asyncio.to_thread(_insert_sync)
 
 
+def calculate_llm_cost(model_name: str, input_tokens: int, output_tokens: int) -> float:
+    """
+    Calculates the USD cost of an LLM call based on model pricing per 1M tokens.
+    Guarantees non-zero estimation for active models.
+    """
+    if not model_name:
+        model_name = "qwen/qwen3.6-27b"
+    
+    model_key = str(model_name).lower().strip()
+    
+    pricing_map = {
+        # Groq & OpenRouter Models
+        "qwen/qwen3.6-27b": {"in": 0.27, "out": 0.40},
+        "openai/gpt-oss-20b": {"in": 0.10, "out": 0.15},
+        "llama-3.3-70b-versatile": {"in": 0.59, "out": 0.79},
+        "llama-3.3-70b": {"in": 0.59, "out": 0.79},
+        "llama-3.1-8b-instant": {"in": 0.05, "out": 0.08},
+        "llama-3.1-8b": {"in": 0.05, "out": 0.08},
+        "llama-3.2-90b": {"in": 0.90, "out": 0.90},
+        "llama3-70b-8192": {"in": 0.59, "out": 0.79},
+        "llama3-8b-8192": {"in": 0.05, "out": 0.08},
+        "mixtral-8x7b-32768": {"in": 0.24, "out": 0.24},
+        "gemma2-9b-it": {"in": 0.20, "out": 0.20},
+        
+        # OpenAI Models
+        "gpt-4o": {"in": 2.50, "out": 10.00},
+        "gpt-4o-mini": {"in": 0.15, "out": 0.60},
+        "gpt-4-turbo": {"in": 10.00, "out": 30.00},
+        "gpt-3.5-turbo": {"in": 0.50, "out": 1.50},
+        
+        # Anthropic Models
+        "claude-3-5-sonnet-20240620": {"in": 3.00, "out": 15.00},
+        "claude-3-opus-20240229": {"in": 15.00, "out": 75.00},
+        "claude-3-haiku-20240307": {"in": 0.25, "out": 1.25},
+    }
+    
+    rates = pricing_map.get(model_key)
+    if not rates:
+        if "70b" in model_key: rates = {"in": 0.59, "out": 0.79}
+        elif "90b" in model_key: rates = {"in": 0.90, "out": 0.90}
+        elif "8b" in model_key: rates = {"in": 0.05, "out": 0.08}
+        elif "gpt-4o-mini" in model_key: rates = {"in": 0.15, "out": 0.60}
+        elif "gpt-4o" in model_key: rates = {"in": 2.50, "out": 10.00}
+        elif "gpt-4" in model_key: rates = {"in": 10.00, "out": 30.00}
+        elif "gpt-3.5" in model_key: rates = {"in": 0.50, "out": 1.50}
+        elif "claude-3-5-sonnet" in model_key: rates = {"in": 3.00, "out": 15.00}
+        elif "claude-3-haiku" in model_key: rates = {"in": 0.25, "out": 1.25}
+        elif "qwen" in model_key: rates = {"in": 0.27, "out": 0.40}
+        elif "mixtral" in model_key: rates = {"in": 0.24, "out": 0.24}
+        else: rates = {"in": 0.50, "out": 0.50}
+
+    cost = (input_tokens / 1_000_000.0 * rates["in"]) + (output_tokens / 1_000_000.0 * rates["out"])
+    return round(cost, 6)
+
+
+
 import json
+
+def check_duplicate_message_id(reference_id: str) -> Optional[dict]:
+    """
+    Checks if an email Message ID / reference_id has already been processed in MySQL DB.
+    Returns existing parsed result dict if found, skipping redundant LLM invocations.
+    """
+    if not reference_id or str(reference_id).startswith("draft_") or len(str(reference_id).strip()) < 5:
+        return None
+
+    ref_clean = str(reference_id).strip()
+    INVALID_PHRASES = ["information for your", "contact information", "further take up"]
+    
+    try:
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            # Search ai_email_parsing for existing telemetry record
+            p_row = conn.execute(
+                text("SELECT confidence_score, confidence_level, document_type FROM ai_email_parsing WHERE reference_id = :ref ORDER BY id DESC LIMIT 1"),
+                {"ref": ref_clean}
+            ).fetchone()
+            
+            if p_row:
+                # Retrieve extracted entities from ai_email_ml_dataset if present
+                ml_row = conn.execute(
+                    text("SELECT predicted_intent, extracted_keywords, subject, body_clean FROM ai_email_ml_dataset WHERE reference_id = :ref ORDER BY id DESC LIMIT 1"),
+                    {"ref": ref_clean}
+                ).fetchone()
+
+                if ml_row and len(ml_row) >= 4:
+                    keywords_str = str(ml_row[1] or "").lower()
+                    subj_str = str(ml_row[2] or "").lower()
+                    body_str = str(ml_row[3] or "").lower()
+                    # Invalidate cache if stale row contains invalid filler string
+                    if any(phrase in keywords_str or phrase in subj_str for phrase in INVALID_PHRASES):
+                        logger.info(f"[check_duplicate_message_id] Stale invalid phrase detected in cached record for {ref_clean}. Bypassing cache for fresh re-parse.")
+                        return None
+
+                intent_val = ml_row[0] if (ml_row and len(ml_row) > 0 and ml_row[0]) else "General Task"
+                return {
+                    "reference_id": ref_clean,
+                    "intent": intent_val,
+                    "confidence_score": p_row[0] if (p_row and len(p_row) > 0 and p_row[0] is not None) else 90,
+                    "confidence_level": p_row[1] if (p_row and len(p_row) > 1 and p_row[1]) else "high",
+                    "is_duplicate": True,
+                    "duplicate_notice": "Email Message ID was previously processed. Cached result returned without calling LLM.",
+                    "requires_manual_review": False,
+                    "task_description": f"Cached task extraction for Message ID: {ref_clean}"
+                }
+    except Exception as e:
+        logger.error(f"[check_duplicate_message_id] Error checking duplicate reference_id: {e}")
+    return None
+
 
 async def save_email_ml_dataset_async(
     reference_id: Optional[str],
@@ -375,7 +610,8 @@ async def save_email_ml_dataset_async(
     predicted_intent: Optional[str],
     extracted_keywords: Optional[list],
     extracted_entities: Optional[dict],
-    confidence_score: int = 90
+    confidence_score: int = 90,
+    employee_id: Optional[int] = None
 ):
     """
     Asynchronously saves initial ML training dataset entry to MySQL table (ai_email_ml_dataset)
@@ -389,31 +625,73 @@ async def save_email_ml_dataset_async(
         try:
             engine = get_db_engine()
             with engine.begin() as conn:
-                conn.execute(
-                    text("""
-                        INSERT INTO ai_email_ml_dataset 
-                        (reference_id, sender_email, to_emails, subject, body_clean, thread_count, is_forwarded, forwarded_by_email, predicted_intent, extracted_keywords, confidence_score)
-                        VALUES (:ref_id, :sender, :to_e, :subj, :body, :t_cnt, :is_fwd, :fwd_by, :intent, :kw, :conf)
-                        ON DUPLICATE KEY UPDATE
-                        sender_email=VALUES(sender_email), to_emails=VALUES(to_emails), subject=VALUES(subject),
-                        body_clean=VALUES(body_clean), predicted_intent=VALUES(predicted_intent),
-                        extracted_keywords=VALUES(extracted_keywords),
-                        confidence_score=VALUES(confidence_score)
-                    """),
-                    {
-                        "ref_id": reference_id,
-                        "sender": sender_email,
-                        "to_e": to_emails,
-                        "subj": subject,
-                        "body": body_clean,
-                        "t_cnt": thread_count,
-                        "is_fwd": is_forwarded,
-                        "fwd_by": forwarded_by_email,
-                        "intent": predicted_intent,
-                        "kw": keywords_str,
-                        "conf": confidence_score
-                    }
-                )
+                existing = None
+                if reference_id and str(reference_id).strip():
+                    existing = conn.execute(
+                        text("SELECT id FROM ai_email_ml_dataset WHERE reference_id = :ref AND (reviewed_by_user_id = :emp_id OR reviewed_by_user_id IS NULL) LIMIT 1"),
+                        {"ref": str(reference_id).strip(), "emp_id": employee_id}
+                    ).fetchone()
+                
+                if not existing and subject and str(subject).strip():
+                    existing = conn.execute(
+                        text("SELECT id FROM ai_email_ml_dataset WHERE subject = :subj AND (sender_email = :send OR :send IS NULL) AND (reviewed_by_user_id = :emp_id OR reviewed_by_user_id IS NULL) LIMIT 1"),
+                        {"subj": str(subject).strip(), "send": sender_email, "emp_id": employee_id}
+                    ).fetchone()
+
+                if existing:
+                    conn.execute(
+                        text("""
+                            UPDATE ai_email_ml_dataset
+                            SET reference_id = COALESCE(:ref_id, reference_id),
+                                sender_email = COALESCE(:sender, sender_email),
+                                to_emails = COALESCE(:to_e, to_emails),
+                                subject = COALESCE(:subj, subject),
+                                body_clean = COALESCE(:body, body_clean),
+                                thread_count = :t_cnt,
+                                is_forwarded = :is_fwd,
+                                forwarded_by_email = COALESCE(:fwd_by, forwarded_by_email),
+                                predicted_intent = COALESCE(:intent, predicted_intent),
+                                extracted_keywords = COALESCE(:kw, extracted_keywords),
+                                confidence_score = :conf
+                            WHERE id = :row_id
+                        """),
+                        {
+                            "row_id": existing[0],
+                            "ref_id": reference_id,
+                            "sender": sender_email,
+                            "to_e": to_emails,
+                            "subj": subject,
+                            "body": body_clean,
+                            "t_cnt": thread_count,
+                            "is_fwd": is_forwarded,
+                            "fwd_by": forwarded_by_email,
+                            "intent": predicted_intent,
+                            "kw": keywords_str,
+                            "conf": confidence_score
+                        }
+                    )
+                else:
+                    conn.execute(
+                        text("""
+                            INSERT INTO ai_email_ml_dataset 
+                            (reference_id, sender_email, to_emails, subject, body_clean, thread_count, is_forwarded, forwarded_by_email, predicted_intent, extracted_keywords, confidence_score, reviewed_by_user_id)
+                            VALUES (:ref_id, :sender, :to_e, :subj, :body, :t_cnt, :is_fwd, :fwd_by, :intent, :kw, :conf, :emp_id)
+                        """),
+                        {
+                            "ref_id": reference_id,
+                            "sender": sender_email,
+                            "to_e": to_emails,
+                            "subj": subject,
+                            "body": body_clean,
+                            "t_cnt": thread_count,
+                            "is_fwd": is_forwarded,
+                            "fwd_by": forwarded_by_email,
+                            "intent": predicted_intent,
+                            "kw": keywords_str,
+                            "conf": confidence_score,
+                            "emp_id": employee_id
+                        }
+                    )
         except Exception as e:
             logger.error(f"[MLDataset] Failed to insert DB ML dataset row: {e}")
 
@@ -481,65 +759,80 @@ async def update_email_ml_dataset_feedback_async(
             engine = get_db_engine()
             is_disc = 1 if action_status == 'DISCARDED' else 0
             with engine.begin() as conn:
-                res = conn.execute(
-                    text("""
-                        UPDATE ai_email_ml_dataset
-                        SET action_status = :act_stat,
-                            is_task_required = :is_task,
-                            was_edited = :was_ed,
-                            intent_edited = :int_ed,
-                            customer_edited = :cust_ed,
-                            assignee_edited = :ass_ed,
-                            due_date_edited = :due_ed,
-                            is_hard_example = :hard_ex,
-                            time_to_action_ms = :t_action,
-                            approved_intent = :app_intent,
-                            approved_task_name = :app_tname,
-                            approved_customer_name = :app_cname,
-                            approved_customer_id = :app_cid,
-                            approved_priority = :app_prio,
-                            approved_due_date = :app_ddate,
-                            approved_assignee_id = :app_ass,
-                            approved_contact_phone = :app_phone,
-                            approved_task_description = :app_desc,
-                            reviewed_by_user_id = :rev_id,
-                            reviewed_by_user_name = :rev_name,
-                            reviewed_by_user_email = :rev_email,
-                            include_in_training = :inc_train,
-                            review_count = review_count + 1,
-                            discard_count = discard_count + :is_disc
-                        WHERE reference_id = :ref_id
-                    """),
-                    {
-                        "ref_id": reference_id,
-                        "act_stat": action_status,
-                        "is_task": is_task_required,
-                        "was_ed": was_edited,
-                        "int_ed": intent_edited,
-                        "cust_ed": customer_edited,
-                        "ass_ed": assignee_edited,
-                        "due_ed": due_date_edited,
-                        "hard_ex": is_hard_example or was_edited,
-                        "t_action": time_to_action_ms,
-                        "app_intent": vals.get("intent"),
-                        "app_tname": vals.get("task_name"),
-                        "app_cname": vals.get("customer_name"),
-                        "app_cid": str(vals.get("customer_id")) if vals.get("customer_id") is not None else None,
-                        "app_prio": vals.get("priority"),
-                        "app_ddate": str(vals.get("due_date")) if vals.get("due_date") is not None else None,
-                        "app_ass": int(vals["assigned_to"]) if vals.get("assigned_to") and str(vals["assigned_to"]).isdigit() else None,
-                        "app_phone": vals.get("contact_phone"),
-                        "app_desc": vals.get("task_description"),
-                        "rev_id": reviewed_by_user_id,
-                        "rev_name": reviewed_by_user_name,
-                        "rev_email": reviewed_by_user_email,
-                        "inc_train": include_in_training,
-                        "is_disc": is_disc
-                    }
-                )
+                existing = None
+                if reference_id and str(reference_id).strip():
+                    ref_str = str(reference_id).strip()
+                    existing = conn.execute(
+                        text("SELECT id FROM ai_email_ml_dataset WHERE reference_id = :ref LIMIT 1"),
+                        {"ref": ref_str}
+                    ).fetchone()
+                    if not existing and "_" in ref_str:
+                        # Try partial match on raw email ID or subject component
+                        subj_part = ref_str.split("_")[-1]
+                        if len(subj_part) > 3:
+                            existing = conn.execute(
+                                text("SELECT id FROM ai_email_ml_dataset WHERE reference_id LIKE :pat OR subject LIKE :pat LIMIT 1"),
+                                {"pat": f"%{subj_part}%"}
+                            ).fetchone()
 
-                if res.rowcount == 0:
-                    # Row didn't exist for this reference_id — INSERT it directly!
+                if existing:
+                    conn.execute(
+                        text("""
+                            UPDATE ai_email_ml_dataset
+                            SET action_status = :act_stat,
+                                is_task_required = :is_task,
+                                was_edited = :was_ed,
+                                intent_edited = :int_ed,
+                                customer_edited = :cust_ed,
+                                assignee_edited = :ass_ed,
+                                due_date_edited = :due_ed,
+                                is_hard_example = :hard_ex,
+                                time_to_action_ms = :t_action,
+                                approved_intent = :app_intent,
+                                approved_task_name = :app_tname,
+                                approved_customer_name = :app_cname,
+                                approved_customer_id = :app_cid,
+                                approved_priority = :app_prio,
+                                approved_due_date = :app_ddate,
+                                approved_assignee_id = :app_ass,
+                                approved_contact_phone = :app_phone,
+                                approved_task_description = :app_desc,
+                                reviewed_by_user_id = :rev_id,
+                                reviewed_by_user_name = :rev_name,
+                                reviewed_by_user_email = :rev_email,
+                                include_in_training = :inc_train,
+                                review_count = review_count + 1,
+                                discard_count = discard_count + :is_disc
+                            WHERE id = :row_id
+                        """),
+                        {
+                            "row_id": existing[0],
+                            "act_stat": action_status,
+                            "is_task": is_task_required,
+                            "was_ed": was_edited,
+                            "int_ed": intent_edited,
+                            "cust_ed": customer_edited,
+                            "ass_ed": assignee_edited,
+                            "due_ed": due_date_edited,
+                            "hard_ex": is_hard_example or was_edited,
+                            "t_action": time_to_action_ms,
+                            "app_intent": vals.get("intent"),
+                            "app_tname": vals.get("task_name"),
+                            "app_cname": vals.get("customer_name"),
+                            "app_cid": str(vals.get("customer_id")) if vals.get("customer_id") is not None else None,
+                            "app_prio": vals.get("priority"),
+                            "app_ddate": str(vals.get("due_date")) if vals.get("due_date") is not None else None,
+                            "app_ass": int(vals["assigned_to"]) if vals.get("assigned_to") and str(vals["assigned_to"]).isdigit() else None,
+                            "app_phone": vals.get("contact_phone"),
+                            "app_desc": vals.get("task_description"),
+                            "rev_id": reviewed_by_user_id,
+                            "rev_name": reviewed_by_user_name,
+                            "rev_email": reviewed_by_user_email,
+                            "inc_train": include_in_training,
+                            "is_disc": is_disc
+                        }
+                    )
+                else:
                     conn.execute(
                         text("""
                             INSERT INTO ai_email_ml_dataset

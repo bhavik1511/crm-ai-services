@@ -1,5 +1,6 @@
 import re
 import os
+import logging
 import asyncio
 import json
 import traceback
@@ -7,6 +8,8 @@ from typing import List, Dict, Tuple, Optional, Any, Annotated, Union
 from datetime import datetime
 import hashlib
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 from sqlalchemy import text
 from openai import AsyncOpenAI
 from db.database import get_db_engine
@@ -120,8 +123,8 @@ def _looks_like_sql_write_attempt(user_text: str) -> bool:
 
 
 _client: AsyncOpenAI | None = None
-GROQ_PRIMARY_MODEL = os.getenv("PRIMARY_MODEL") or os.getenv("GROQ_MODEL_PRIMARY", "llama-3.3-70b-versatile")
-GROQ_FALLBACK_MODEL = os.getenv("FAST_MODEL") or os.getenv("GROQ_MODEL_FALLBACK", "llama-3.1-8b-instant")
+GROQ_PRIMARY_MODEL = os.getenv("LLM_MODEL") or os.getenv("PRIMARY_MODEL")
+GROQ_FALLBACK_MODEL = os.getenv("FAST_MODEL") or os.getenv("LLM_MODEL")
 try:
     GROQ_RETRY_ATTEMPTS = max(1, int(os.getenv("GROQ_RETRY_ATTEMPTS", "2")))
 except Exception:
@@ -1693,6 +1696,12 @@ async def ask_question(history: List[Dict], user_context=None) -> Tuple[str, Opt
     if _looks_like_sql_write_attempt(latest_question):
         return "⚠️ I can only answer read-only questions about dashboard data.", None, None, None, None, False, None, None, None, False, None
 
+    # Confidential / Security / Schema Guardrail Check
+    from config.security_guard import check_security_guardrail
+    sec_block = check_security_guardrail(latest_question)
+    if sec_block:
+        return sec_block["answer"], None, None, [], None, False, sec_block["suggested_questions"], None, None, False, None
+
     try:
         # --- NEW: Semantic Cache Check ---
         import asyncio
@@ -2194,6 +2203,23 @@ async def ask_question_streaming(history, user_context=None):
         latest_q = history[-1].get("content", "") if history else ""
         q_lower = latest_q.lower().strip()
 
+        # Confidential / Security / Schema Guardrail Check
+        from config.security_guard import check_security_guardrail
+        sec_block = check_security_guardrail(latest_q)
+        if sec_block:
+            yield {"type": "token", "content": sec_block["content"]}
+            yield {
+                "type": "done",
+                "content": sec_block["content"],
+                "navigate_to": None,
+                "chart_data": None,
+                "navigation_links": [],
+                "suggested_questions": sec_block["suggested_questions"],
+                "export_data": None,
+                "auto_expand": False
+            }
+            return
+
         # Set RBAC context on semantic_layer so tools respect user scope
         from semantic import semantic_layer as _sl
         _sl.set_user_context({
@@ -2504,11 +2530,33 @@ async def ask_question_streaming(history, user_context=None):
             "INTENT: If the user asks for a 'receivable report' or 'ageing summary' without filters, SET `report_intent: 'receivable'` and ask which scope they want: overall, group, pipeline, or customized."
         )
 
-        # Convert history to OpenAI message format
-        messages = [{"role": "system", "content": system_content}]
+        # Privacy Guard: Mask all prompts & history using LocalPseudonymizer prior to calling Groq/LLM
+        from .pseudonymizer import prepare_for_external_llm, unmask_data
+
+        token_map = {}
+        try:
+            privacy_res = prepare_for_external_llm(system_content)
+            masked_system_content = privacy_res.masked_text if privacy_res.safe else system_content
+            if privacy_res.safe and privacy_res.token_mapping:
+                token_map.update(privacy_res.token_mapping)
+        except Exception as pe:
+            logger.warning(f"[Pseudonymizer] Failed to mask system prompt: {pe}")
+            masked_system_content = system_content
+
+        # Convert history to OpenAI message format using masked text
+        messages = [{"role": "system", "content": masked_system_content}]
         for msg in history:
             msg_role = "user" if msg.get("role") == "user" else "assistant"
-            messages.append({"role": msg_role, "content": msg.get("content", "")})
+            msg_text = msg.get("content", "")
+            try:
+                p_msg = prepare_for_external_llm(msg_text)
+                if p_msg.safe:
+                    msg_text = p_msg.masked_text
+                    if p_msg.token_mapping:
+                        token_map.update(p_msg.token_mapping)
+            except Exception:
+                pass
+            messages.append({"role": msg_role, "content": msg_text})
 
         full_answer = ""
         streamed_ok = False
@@ -2519,6 +2567,8 @@ async def ask_question_streaming(history, user_context=None):
         for model_name in _groq_model_candidates():
             for attempt in range(GROQ_RETRY_ATTEMPTS):
                 answer_parts = []
+                stream_buf = ""
+                in_token_tag = False
                 try:
                     llm = _build_llm(model_name=model_name, temperature=0.1, max_tokens=2000)
                     async for chunk in llm.astream(messages):
@@ -2535,7 +2585,29 @@ async def ask_question_streaming(history, user_context=None):
 
                         if chunk.content:
                             answer_parts.append(chunk.content)
-                            yield {"type": "token", "content": chunk.content}
+                            if not token_map:
+                                yield {"type": "token", "content": chunk.content}
+                            else:
+                                for char in chunk.content:
+                                    stream_buf += char
+                                    if char == '<':
+                                        in_token_tag = True
+                                    elif char == '>' and in_token_tag:
+                                        in_token_tag = False
+                                        unmasked = unmask_data(stream_buf, token_map)
+                                        yield {"type": "token", "content": unmasked}
+                                        stream_buf = ""
+                                    elif in_token_tag and len(stream_buf) > 80:
+                                        in_token_tag = False
+                                        yield {"type": "token", "content": unmask_data(stream_buf, token_map)}
+                                        stream_buf = ""
+                                    elif not in_token_tag and len(stream_buf) > 0:
+                                        yield {"type": "token", "content": stream_buf}
+                                        stream_buf = ""
+
+                    if stream_buf:
+                        yield {"type": "token", "content": unmask_data(stream_buf, token_map) if token_map else stream_buf}
+                        stream_buf = ""
 
                     full_answer = "".join(answer_parts)
                     streamed_ok = True
@@ -2561,6 +2633,10 @@ async def ask_question_streaming(history, user_context=None):
 
         if not streamed_ok and last_rate_error is not None:
             raise last_rate_error
+
+        # Unmask full answer back to original real values before parsing JSON metadata
+        if token_map:
+            full_answer = unmask_data(full_answer, token_map)
 
         # Parse metadata JSON blocks from the full streamed answer
         parsed = _parse_llm_json_blocks(full_answer)

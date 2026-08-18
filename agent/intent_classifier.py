@@ -214,9 +214,8 @@ async def classify_intent(question: str, use_cache: bool = True) -> str:
     
     try:
         from .agent import _build_llm
-        import os
-        provider = os.getenv("LLM_PROVIDER", "openai").lower()
-        model_override = "llama-3.1-8b-instant" if provider == "groq" else "gpt-4o-mini"
+        provider = os.getenv("LLM_PROVIDER", "").lower()
+        model_override = os.getenv("FAST_MODEL") or os.getenv("LLM_MODEL")
         llm = _build_llm(model_override, temperature=0.0, max_tokens=30)
         
         classify_prompt = f"""You are a routing agent for a CRM chatbot. Analyze the user's question and pick ONE exact category.
@@ -228,7 +227,7 @@ If the user is asking for a SPECIFIC record (e.g. "recent proposal", "a proposal
 Question: "{question}"
 
 Categories:
-- "analytical": Specific item lookups, comparisons, temporal questions (recent, latest, specific).
+- "analytical": Specific item lookups, top customers by revenue, customer-specific queries, comparisons, temporal questions (recent, latest, specific).
 - "kpi_summary": Generic dashboard requests for KPI report/summary/analysis or budget vs actual.
 - "revenue": Generic dashboard requests for revenue and billing metrics.
 - "receivables": Generic dashboard requests for receivables, aging, outstanding invoices, collections.

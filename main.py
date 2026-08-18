@@ -28,7 +28,17 @@ from typing import List, Dict, Optional, Union, Any
 
 from db.database import get_db_engine
 from sqlalchemy import text
-from agent.intent_classifier import classify_intent, should_show_kpi_filters
+from agent.intent_classifier import (
+    classify_intent,
+    should_show_kpi_filters,
+    should_show_revenue_report,
+    should_show_receivables_report,
+    should_show_proposals_report,
+    should_show_projects_report,
+    should_show_resources_report,
+    should_show_recoverability_report,
+    should_show_staff_billing_report,
+)
 # LAZY IMPORT: agent and semantic_layer cause import hang, so defer to function-level imports
 # They will be imported inside chat_routes when needed
 # from agent import ask_question_async, ask_question_streaming
@@ -1438,6 +1448,12 @@ async def _deterministic_kpi_response(history: Optional[List[dict]], latest_ques
 # Returns None if the query should be handled by the agent instead.
 # --------------------------------------------------------------------------- #
 async def deterministic_dashboard_response(history: Optional[List[dict]], latest_question: str, user_ctx: Optional[dict] = None, auth_token: Optional[str] = None):
+    # ── Confidential / Security / Schema Guardrail Check ────────────────────
+    from config.security_guard import check_security_guardrail
+    sec_block = check_security_guardrail(latest_question)
+    if sec_block:
+        return sec_block
+
     from semantic.semantic_layer import (
         get_revenue_metrics,
         get_receivables_metrics,
@@ -1448,7 +1464,16 @@ async def deterministic_dashboard_response(history: Optional[List[dict]], latest
     
     q = re.sub(r"[^a-z0-9]+", " ", latest_question.lower()).strip()
 
-    from agent.intent_classifier import classify_intent
+    from agent.intent_classifier import (
+        classify_intent,
+        should_show_revenue_report,
+        should_show_receivables_report,
+        should_show_proposals_report,
+        should_show_projects_report,
+        should_show_resources_report,
+        should_show_recoverability_report,
+        should_show_staff_billing_report
+    )
     intent = await classify_intent(latest_question)
 
     # Queries about a specific customer/project record or analytical comparisons → always skip fast-path
@@ -1506,13 +1531,13 @@ async def deterministic_dashboard_response(history: Optional[List[dict]], latest
         try:
             from datetime import date as _dt_date
             from datetime import datetime as _dt_time
-            parsed_end = _dt_time.strptime(end_date, "%Y-%m-%d").date()
+            parsed_end = _dt_time.strptime(end_date[:10], "%Y-%m-%d").date()
             today_date = _dt_date.today()
             if parsed_end > today_date:
                 end_date = today_date.strftime("%Y-%m-%d")
             
             if start_date:
-                parsed_start = _dt_time.strptime(start_date, "%Y-%m-%d").date()
+                parsed_start = _dt_time.strptime(start_date[:10], "%Y-%m-%d").date()
                 if parsed_start > today_date:
                     start_date = end_date
         except Exception:
@@ -1521,11 +1546,22 @@ async def deterministic_dashboard_response(history: Optional[List[dict]], latest
         
     is_active = not bool(re.search(r'\b(non-active|inactive|completed|finished)\b', q))
     
+    # Extract Service Line filter from text or user_ctx
+    active_service_line = None
+    if user_ctx and user_ctx.get("service_line") and str(user_ctx.get("service_line")).lower() != "all":
+        active_service_line = str(user_ctx.get("service_line")).strip()
+    else:
+        _extracted_filters = _extract_kpi_filters_from_text(latest_question)
+        if _extracted_filters.get("service_line") and str(_extracted_filters.get("service_line")).lower() != "all":
+            active_service_line = str(_extracted_filters.get("service_line")).strip()
+
     tool_args = {}
     if start_date:
         tool_args["start_date"] = start_date
     if end_date:
         tool_args["end_date"] = end_date
+    if active_service_line:
+        tool_args["service_line"] = active_service_line
 
     def fmt(x):
         try:
@@ -1569,9 +1605,11 @@ async def deterministic_dashboard_response(history: Optional[List[dict]], latest
     # are NOT disambiguated — they fall through to the keyword-match blocks below
     # which return ACTUAL DATA with charts. This matches the pre-merge behavior.
 
-    # ── LLM Intent Routing ───────────────────────────────────────────────
-    from agent.intent_classifier import should_show_revenue_report, should_show_receivables_report, should_show_proposals_report
-    # intent is already classified at the top of the function
+    # ── Check for deterministic top customers query FIRST ───────────────
+    from memory.memory_manager import _deterministic_top_customers_by_revenue
+    top_cust_res = _deterministic_top_customers_by_revenue(latest_question)
+    if top_cust_res:
+        return top_cust_res
 
     # ── GP / Revenue / Budget / Service Lines ──────────────────────────────
     if should_show_revenue_report(intent):
@@ -1647,16 +1685,105 @@ async def deterministic_dashboard_response(history: Optional[List[dict]], latest
         )
 
     # ── Proposals / Pipeline / Win Rate ────────────────────────────────────
+    # ── Proposals / Pipeline / Win Rate ────────────────────────────────────
     if should_show_proposals_report(intent):
         raw = await get_pipeline_and_proposals.ainvoke(tool_args)
         pipe = parse(raw)
+
+        # Check if user requested a SPECIFIC proposal status filter
+        q_lower = latest_question.lower()
+        requested_status = None
+        if any(w in q_lower for w in ["reject", "rejected", "rejection", "declined", "lost"]):
+            requested_status = "Proposal Rejected"
+        elif any(w in q_lower for w in ["accept", "accepted", "approval", "approved", "won"]):
+            requested_status = "Proposal Accepted"
+        elif any(w in q_lower for w in ["sent", "submitted", "outbound"]):
+            requested_status = "Proposal Sent"
+        elif any(w in q_lower for w in ["verify", "verification", "under review"]):
+            requested_status = "Proposal Verify"
+        elif any(w in q_lower for w in ["created", "draft"]):
+            requested_status = "Proposal Created"
+
+        breakdown = pipe.get("dashboard_proposal_metrics_breakdown") or []
+
+        if requested_status:
+            # Find the specific row for requested status
+            matching_row = next((r for r in breakdown if r.get("status_name", "").lower() == requested_status.lower() or requested_status.lower() in r.get("status_name", "").lower()), None)
+            
+            count_val = int(matching_row.get("total_entries", 0)) if matching_row else 0
+            budget_val = float(matching_row.get("total_budget", 0)) if matching_row else 0.0
+
+            # Status ID mapping matching m_proposal_status
+            status_id_map = {
+                "Proposal Created": 7,
+                "Proposal Verify": 8,
+                "Proposal Sent": 1,
+                "Proposal Accepted": 3,
+                "Proposal Rejected": 4
+            }
+            s_id = status_id_map.get(requested_status)
+            details_list = []
+            if s_id:
+                try:
+                    from semantic.semantic_layer import _run_query, _resolve_rbac_params, _build_ownership_sql
+                    emp_id = user_ctx.get("employee_id") if user_ctx else None
+                    u_tier = user_ctx.get("hierarchy_level") if user_ctx else None
+                    emp_id, u_tier = _resolve_rbac_params(emp_id, u_tier)
+                    prop_ownership_sql = _build_ownership_sql(emp_id, u_tier, "p", True, "created_by")
+
+                    sl_clause = f" AND msl.name LIKE '%{active_service_line.strip()}%'" if active_service_line else ""
+                    dt_clause = f" AND p.created_at BETWEEN '{start_date}' AND '{end_date}'" if start_date and end_date else ""
+                    det_q = f"""
+                        SELECT p.id, p.code, COALESCE(c.customer_name, co.cd_company_name, co.first_name, 'N/A') as client_name, p.agreed_fees, p.created_at
+                        FROM proposal p
+                        LEFT JOIN customers c ON p.client_id = c.id
+                        LEFT JOIN contacts co ON p.contact_id = co.id
+                        LEFT JOIN m_serviceline msl ON msl.id = p.service_line_id
+                        WHERE p.is_active = 1 AND p.proposal_status_id = {s_id} AND {prop_ownership_sql} {dt_clause} {sl_clause}
+                        ORDER BY p.created_at DESC LIMIT 5
+                    """
+                    details_list = await _run_query(det_q)
+                except Exception:
+                    details_list = []
+
+            title_label = requested_status
+            answer_lines = [
+                f"### {title_label}",
+                f"- **Total Count:** {count_val}",
+                f"- **Total Budget:** {fmt(budget_val)}",
+            ]
+
+            if details_list:
+                answer_lines += [
+                    "",
+                    f"#### Recent {title_label}s",
+                    "| Proposal ID | Client Name | Agreed Fees (BHD) | Date |",
+                    "|---|---|---:|---|",
+                ]
+                for d in details_list:
+                    fees = float(d.get("agreed_fees") or 0)
+                    dt_str = str(d.get("created_at") or "")[:10]
+                    client = str(d.get("client_name") or "N/A")
+                    p_code = str(d.get("code") or d.get("id"))
+                    answer_lines.append(f"| {p_code} | {client} | {fees:,.2f} | {dt_str} |")
+
+            return dict(
+                answer="\n".join(answer_lines).strip(),
+                chart_data=None,
+                navigate_to="/proposal",
+                navigation_links=[{"label": "Proposals", "url": "/proposal"}, {"label": "Proposal Status Report", "url": "/crm/reports/proposal-status-report"}],
+                suggested_questions=["Show proposal win rate", "Show proposal status breakdown", "Show open proposals"],
+                export_data=export_data,
+                auto_expand=auto_expand,
+            )
+
+        # General pipeline summary when no specific status was targeted
         open_props = pipe.get("open_proposals") or {"count": 0, "total_budget": 0}
         answer_lines = [
             "### Proposal Pipeline",
             f"- **Open Proposals:** {int(open_props.get('count', 0))}",
             f"- **Total Budget of Open Proposals:** {fmt(open_props.get('total_budget', 0))}",
         ]
-        breakdown = pipe.get("dashboard_proposal_metrics_breakdown") or []
         if breakdown:
             answer_lines += ["", "#### Status Breakdown", "| Status | Count | Budget (BHD) |", "|---|---:|---:|"]
             for row in breakdown:
@@ -2156,6 +2283,24 @@ async def ask_ai(request: QuestionRequest):
     fast = await deterministic_dashboard_response(history, latest_question, user_ctx, request.auth_token)
     if fast:
         print(f"[FASTPATH] Matched deterministic route for: {latest_question!r}")
+        try:
+            from db.database import save_token_usage_async
+            emp_id = user_ctx.get("user_id", 1) if user_ctx else 1
+            await save_token_usage_async(
+                employee_id=emp_id,
+                session_id="ask-ai-session",
+                model_name="deterministic_fast_path",
+                input_tokens=0,
+                output_tokens=0,
+                total_tokens=0,
+                total_cost_usd=0.0,
+                execution_path="fast_path",
+                capability_id=fast.get("report_intent") or "general_query",
+                operation="chat_response",
+                status="success"
+            )
+        except Exception as _e:
+            print(f"[Telemetry] Fast-path log error: {_e}")
         return AnswerResponse(**fast)
 
     # Fall back to LLM agent — use full ask_question() for 10-tuple (with edit intent fields)
@@ -2190,6 +2335,25 @@ async def ask_ai(request: QuestionRequest):
             edit_payload = await handle_edit_intent(entity_type, entity_name, user_ctx.get('user_id', 0) if user_ctx else 0, user_ctx.get('role_name', 'Unknown') if user_ctx else 'Unknown')
         except Exception as e:
             print(f"[EditIntent] Failed to build edit payload: {e}")
+
+    try:
+        from db.database import save_token_usage_async
+        emp_id = user_ctx.get("user_id", 1) if user_ctx else 1
+        await save_token_usage_async(
+            employee_id=emp_id,
+            session_id="ask-ai-session",
+            model_name=os.getenv("LLM_MODEL", "qwen/qwen3.6-27b"),
+            input_tokens=0,
+            output_tokens=0,
+            total_tokens=0,
+            total_cost_usd=0.0,
+            execution_path="llm_agent",
+            capability_id=report_intent or "general_query",
+            operation="chat_response",
+            status="success"
+        )
+    except Exception as _e:
+        print(f"[Telemetry] Agent log error: {_e}")
 
     return AnswerResponse(
         answer=answer_text,
@@ -2252,6 +2416,25 @@ async def ask_ai_stream(request: QuestionRequest):
             yield f"data: {json.dumps(payload)}\n\n"
             yield "data: [DONE]\n\n"
 
+            try:
+                from db.database import save_token_usage_async
+                emp_id = user_ctx.get("user_id", 1) if user_ctx else 1
+                await save_token_usage_async(
+                    employee_id=emp_id,
+                    session_id="ask-ai-stream-session",
+                    model_name="deterministic_fast_path",
+                    input_tokens=0,
+                    output_tokens=0,
+                    total_tokens=0,
+                    total_cost_usd=0.0,
+                    execution_path="fast_path",
+                    capability_id=fast.get("report_intent") or "general_query",
+                    operation="chat_response",
+                    status="success"
+                )
+            except Exception as _e:
+                print(f"[Telemetry] Fast-path stream log error: {_e}")
+
         return StreamingResponse(
             fast_generator(),
             media_type="text/event-stream",
@@ -2270,11 +2453,68 @@ async def ask_ai_stream(request: QuestionRequest):
             yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
         yield "data: [DONE]\n\n"
 
+        try:
+            from db.database import save_token_usage_async
+            emp_id = user_ctx.get("user_id", 1) if user_ctx else 1
+            await save_token_usage_async(
+                employee_id=emp_id,
+                session_id="ask-ai-stream-session",
+                model_name=os.getenv("LLM_MODEL", "qwen/qwen3.6-27b"),
+                input_tokens=0,
+                output_tokens=0,
+                total_tokens=0,
+                total_cost_usd=0.0,
+                execution_path="llm_stream",
+                capability_id="general_query",
+                operation="chat_response",
+                status="success"
+            )
+        except Exception as _e:
+            print(f"[Telemetry] Stream agent log error: {_e}")
+
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
+
+
+@app.get("/usage-logs")
+@app.get("/telemetry")
+@app.get("/api/ai/usage-logs")
+def get_usage_logs_main(limit: int = 50, offset: int = 0):
+    """Public/Admin route to fetch recent ai_chatbot_usage telemetry logs."""
+    try:
+        from db.database import get_db_engine
+        from sqlalchemy import text as _text
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            query = _text("""
+                SELECT 
+                    id, employee_id, session_id, model_name, input_tokens, 
+                    output_tokens, total_tokens, total_cost_usd, status, 
+                    execution_path, capability_id, operation, backend_execution_ms, created_at
+                FROM ai_chatbot_usage
+                ORDER BY id DESC
+                LIMIT :limit OFFSET :offset
+            """)
+            rows = conn.execute(query, {"limit": limit, "offset": offset}).mappings().all()
+            
+            result_logs = []
+            for row in rows:
+                r = dict(row)
+                if r.get("created_at") and hasattr(r["created_at"], "isoformat"):
+                    r["created_at"] = r["created_at"].isoformat()
+                r["total_cost_usd"] = float(r["total_cost_usd"]) if r.get("total_cost_usd") is not None else 0.0
+                result_logs.append(r)
+                
+            return {
+                "status": "success",
+                "count": len(result_logs),
+                "logs": result_logs
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch usage logs: {str(e)}")
 
 
 
@@ -2392,7 +2632,9 @@ async def extract_email_task(request: EmailTaskRequest):
     try:
         from agent.email_parser import strip_html_to_text, parse_forwarded_email, classify_sender, extract_entities_with_llm
         
-        # Resolve Outlook email URL / reference_id
+        import urllib.parse
+        emp_id_str = str(request.employee_id or 0)
+        subj_clean = (request.subject or 'email').strip()
         resolved_ref_id = (
             request.reference_id or 
             request.email_url or 
@@ -2400,7 +2642,7 @@ async def extract_email_task(request: EmailTaskRequest):
             request.webLink or 
             request.message_id or 
             request.email_id or 
-            None
+            f"email_{emp_id_str}_{urllib.parse.quote(subj_clean)}"
         )
 
         # Resolve field alias fallbacks
@@ -2434,25 +2676,12 @@ async def extract_email_task(request: EmailTaskRequest):
         sender_type = classify_sender(real_sender)
         
         # 4. Build prompt text
-        prompt_text = ""
         if is_forwarded:
-            prompt_text += f"=== FORWARDER CONTEXT ===\n"
-            prompt_text += f"Forwarder: {parsed_email.get('forwarder')}\n"
-            prompt_text += f"Forwarded To: {parsed_email.get('forwardedTo')}\n"
-            prompt_text += f"Subject: {request.subject}\n\n"
-            prompt_text += f"=== FULL EMAIL THREAD ===\n"
-            prompt_text += f"Original From: {parsed_email.get('originalFrom')}\n"
-            prompt_text += f"Original To: {parsed_email.get('originalTo')}\n"
-            prompt_text += f"Original Cc: {parsed_email.get('originalCc')}\n"
-            prompt_text += f"Original Subject: {parsed_email.get('originalSubject')}\n\n"
-            prompt_text += parsed_email.get('originalBody', '')
+            prompt_text = (parsed_email.get('originalBody') or clean_text).strip()
+            if not prompt_text:
+                prompt_text = clean_text
         else:
-            prompt_text += f"From: {request.outer_from}\n"
-            prompt_text += f"To: {request.outer_to}\n"
-            if request.outer_cc:
-                prompt_text += f"Cc: {request.outer_cc}\n"
-            prompt_text += f"Subject: {request.subject}\n\n"
-            prompt_text += clean_text
+            prompt_text = clean_text
 
         # 5. Extract with LLM (Vision & Text)
         all_attachments = []
@@ -2463,8 +2692,29 @@ async def extract_email_task(request: EmailTaskRequest):
             
         import time
         import asyncio
-        from db.database import save_ai_email_parsing_async
+        from db.database import save_ai_email_parsing_async, check_duplicate_message_id
+        from agent.email_parser import parse_email_addresses
         
+        # 4b. Pre-check for duplicate Message ID BEFORE calling cloud LLM
+        if resolved_ref_id and not str(resolved_ref_id).startswith("draft_"):
+            dup_result = check_duplicate_message_id(resolved_ref_id)
+            has_valid_customer = dup_result and dup_result.get("customer_name") and "information for your" not in str(dup_result.get("customer_name")).lower()
+            if dup_result and has_valid_customer:
+                print(f"[extract_email_task] Valid duplicate Message ID detected: {resolved_ref_id}. Skipping LLM.")
+                dup_result["sender_type"] = sender_type
+                dup_result["sender_email"] = real_sender
+                dup_result["to_emails"] = parse_email_addresses(to_val)
+                dup_result["cc_emails"] = parse_email_addresses(request.outer_cc)
+                dup_result["is_forwarded"] = is_forwarded
+                return {
+                    "extractedData": dup_result,
+                    "sender": parsed_email.get("originalFrom") or request.outer_from if is_forwarded else request.outer_from,
+                    "subject": request.subject,
+                    "cached": True
+                }
+            elif dup_result:
+                print(f"[extract_email_task] Hollow or stale duplicate record for {resolved_ref_id}. Bypassing cache to execute full dynamic entity extraction.")
+
         start_time = time.time()
         
         json_result = extract_entities_with_llm(
@@ -2487,7 +2737,7 @@ async def extract_email_task(request: EmailTaskRequest):
         parsed_atts = meta.get("parsed_attachments", 0)
         model_name = meta.get("model_name")
         if not model_name or model_name == "unknown":
-            model_name = os.getenv("PRIMARY_MODEL", "llama-3.3-70b-versatile")
+            model_name = os.getenv("LLM_MODEL") or os.getenv("PRIMARY_MODEL") or "qwen/qwen3.6-27b"
         token_tracking = meta.get("token_tracking", {})
         
         if not json_result or not isinstance(json_result, dict) or "intent" not in json_result:
@@ -2513,11 +2763,14 @@ async def extract_email_task(request: EmailTaskRequest):
         json_result["sender_email"] = real_sender
         
         # Determine emails
-        from agent.email_parser import parse_email_addresses
         json_result["to_emails"] = parse_email_addresses(to_val)
         json_result["cc_emails"] = parse_email_addresses(request.outer_cc)
         json_result["is_forwarded"] = is_forwarded
         json_result["forwarded_by_email"] = parsed_email.get("forwarderEmail") if is_forwarded else None
+        
+        # Preserve original attachments payload for UI display and post-approval S3 upload
+        if all_attachments:
+            json_result["attachments"] = all_attachments
         
         # Validate project name like Node.js did
         import re
@@ -2527,11 +2780,16 @@ async def extract_email_task(request: EmailTaskRequest):
             if len(trimmed) < 6 or re.match(r'^[A-Z]{2,4}$', trimmed):
                 json_result["project_name"] = None
         
-        # Node.js also needs 'sender' and 'emailSubject' for the draft wrapper
+        raw_body_content = request.html_body or request.text_body or clean_text
+        json_result["email_body"] = raw_body_content
         return {
             "extractedData": json_result,
+            "rawEmailBody": raw_body_content,
             "sender": parsed_email.get("originalFrom") or request.outer_from if is_forwarded else request.outer_from,
-            "subject": request.subject
+            "subject": request.subject,
+            "reference_id": resolved_ref_id,
+            "message_id": resolved_ref_id,
+            "source_email_id": resolved_ref_id
         }
         
     except Exception as e:
@@ -2541,9 +2799,6 @@ async def extract_email_task(request: EmailTaskRequest):
 
 # Endpoint for AI Lead Extraction via agent/lead_parser.py
 @app.post("/api/extract-email-lead", dependencies=[Depends(verify_internal_api_key)])
-@app.post("/extract-email-lead", dependencies=[Depends(verify_internal_api_key)])
-@app.post("/api/email-lead", dependencies=[Depends(verify_internal_api_key)])
-@app.post("/email-lead", dependencies=[Depends(verify_internal_api_key)])
 async def extract_email_lead(request: EmailLeadRequest):
     try:
         from agent.lead_parser import extract_lead_from_email
