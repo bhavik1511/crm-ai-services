@@ -1,0 +1,184 @@
+[
+  {
+    "test_id": "REV-001",
+    "category": "Revenue",
+    "query": "Show revenue this month",
+    "passed": false,
+    "reasons": [
+      "Capability mismatch: expected 'revenue_analysis', got 'None'",
+      "Missing expected parameter: 'time_filter'",
+      "Unexpected clarification: \u23f3 The AI service is temporarily at capacity. Please try again in **37m45.408s**.\n\n_If this persists, the daily token quota may be exhausted \u2014 please contact your system administrator._"
+    ],
+    "expected_capability": "revenue_analysis",
+    "actual_capability": null,
+    "confidence": 0.0,
+    "execution_time_ms": 134.21,
+    "trace": {}
+  },
+  {
+    "test_id": "REV-002",
+    "category": "Revenue",
+    "query": "Top 10 customers by revenue",
+    "passed": false,
+    "reasons": [
+      "Capability mismatch: expected 'analytical_query', got 'None'",
+      "Missing expected parameter: 'ranking'",
+      "Missing expected parameter: 'metric'",
+      "Missing expected parameter: 'entity'",
+      "Unexpected clarification: \u23f3 The AI service is temporarily at capacity. Please try again in **37m47.136s**.\n\n_If this persists, the daily token quota may be exhausted \u2014 please contact your system administrator._"
+    ],
+    "expected_capability": "analytical_query",
+    "actual_capability": null,
+    "confidence": 0.0,
+    "execution_time_ms": 61.99,
+    "trace": {}
+  },
+  {
+    "test_id": "REV-003",
+    "category": "Revenue",
+    "query": "Compare FY2025 vs FY2024",
+    "passed": false,
+    "reasons": [
+      "Capability mismatch: expected 'analytical_query', got 'None'",
+      "Missing expected parameter: 'comparison'",
+      "Missing expected parameter: 'time_filter'",
+      "Unexpected clarification: \u23f3 The AI service is temporarily at capacity. Please try again in **37m48.864s**.\n\n_If this persists, the daily token quota may be exhausted \u2014 please contact your system administrator._"
+    ],
+    "expected_capability": "analytical_query",
+    "actual_capability": null,
+    "confidence": 0.0,
+    "execution_time_ms": 62.08,
+    "trace": {}
+  },
+  {
+    "test_id": "KPI-001",
+    "category": "KPI",
+    "query": "KPI report",
+    "passed": false,
+    "reasons": [
+      "Capability mismatch: expected 'kpi_summary', got 'None'"
+    ],
+    "expected_capability": "kpi_summary",
+    "actual_capability": null,
+    "confidence": 0.0,
+    "execution_time_ms": 194.69,
+    "trace": {}
+  },
+  {
+    "test_id": "KPI-002",
+    "category": "KPI",
+    "query": "KPI report for January",
+    "passed": false,
+    "reasons": [
+      "Capability mismatch: expected 'kpi_summary', got 'None'",
+      "Missing expected parameter: 'time_filter'"
+    ],
+    "expected_capability": "kpi_summary",
+    "actual_capability": null,
+    "confidence": 0.0,
+    "execution_time_ms": 132.79,
+    "trace": {}
+  },
+  {
+    "test_id": "KPI-003",
+    "category": "KPI",
+    "query": "Lowest KPI projects",
+    "passed": false,
+    "reasons": [
+      "Capability mismatch: expected 'analytical_query', got 'None'",
+      "Missing expected parameter: 'ranking'",
+      "Missing expected parameter: 'metric'",
+      "Missing expected parameter: 'entity'",
+      "Unexpected clarification: \u23f3 The AI service is temporarily at capacity. Please try again in **37m46.272s**.\n\n_If this persists, the daily token quota may be exhausted \u2014 please contact your system administrator._"
+    ],
+    "expected_capability": "analytical_query",
+    "actual_capability": null,
+    "confidence": 0.0,
+    "execution_time_ms": 66.34,
+    "trace": {}
+  },
+  {
+    "test_id": "PROP-001",
+    "category": "Proposal Analytics",
+    "query": "Proposal win rate",
+    "passed": false,
+    "reasons": [
+      "Capability mismatch: expected 'analytical_query', got 'None'",
+      "Missing expected parameter: 'metric'",
+      "Missing expected parameter: 'entity'",
+      "Unexpected clarification: \u23f3 The AI service is temporarily at capacity. Please try again in **36m36.288s**.\n\n_If this persists, the daily token quota may be exhausted \u2014 please contact your system administrator._"
+    ],
+    "expected_capability": "analytical_query",
+    "actual_capability": null,
+    "confidence": 0.0,
+    "execution_time_ms": 71.4,
+    "trace": {}
+  },
+  {
+    "test_id": "PROP-002",
+    "category": "Proposal Analytics",
+    "query": "Proposal win rate for January",
+    "passed": false,
+    "reasons": [
+      "Capability mismatch: expected 'analytical_query', got 'None'",
+      "Missing expected parameter: 'metric'",
+      "Missing expected parameter: 'entity'",
+      "Missing expected parameter: 'time_filter'",
+      "Unexpected clarification: \u23f3 The AI service is temporarily at capacity. Please try again in **37m45.408s**.\n\n_If this persists, the daily token quota may be exhausted \u2014 please contact your system administrator._"
+    ],
+    "expected_capability": "analytical_query",
+    "actual_capability": null,
+    "confidence": 0.0,
+    "execution_time_ms": 108.41,
+    "trace": {}
+  },
+  {
+    "test_id": "REC-001",
+    "category": "Recoverability",
+    "query": "Highest recoverability",
+    "passed": false,
+    "reasons": [
+      "Capability mismatch: expected 'analytical_query', got 'None'",
+      "Missing expected parameter: 'metric'",
+      "Missing expected parameter: 'ranking'",
+      "Unexpected clarification: \u23f3 The AI service is temporarily at capacity. Please try again in **35m16.8s**.\n\n_If this persists, the daily token quota may be exhausted \u2014 please contact your system administrator._"
+    ],
+    "expected_capability": "analytical_query",
+    "actual_capability": null,
+    "confidence": 0.0,
+    "execution_time_ms": 110.97,
+    "trace": {}
+  },
+  {
+    "test_id": "RCV-001",
+    "category": "Receivables",
+    "query": "Outstanding receivables",
+    "passed": false,
+    "reasons": [
+      "Capability mismatch: expected 'receivables_analysis', got 'None'",
+      "Unexpected clarification: \u23f3 The AI service is temporarily at capacity. Please try again in **36m37.152s**.\n\n_If this persists, the daily token quota may be exhausted \u2014 please contact your system administrator._"
+    ],
+    "expected_capability": "receivables_analysis",
+    "actual_capability": null,
+    "confidence": 0.0,
+    "execution_time_ms": 58.18,
+    "trace": {}
+  },
+  {
+    "test_id": "NAV-001",
+    "category": "Navigation",
+    "query": "Executive Dashboard",
+    "passed": false,
+    "reasons": [
+      "Capability mismatch: expected 'ui_navigation', got 'None'",
+      "Missing expected parameter: 'target'",
+      "Unexpected clarification: \u23f3 The AI service is temporarily at capacity. Please try again in **37m42.816s**.\n\n_If this persists, the daily token quota may be exhausted \u2014 please contact your system administrator._",
+      "Navigation mismatch: expected 'executive_dashboard', got 'None'"
+    ],
+    "expected_capability": "ui_navigation",
+    "actual_capability": null,
+    "confidence": 0.0,
+    "execution_time_ms": 64.31,
+    "trace": {}
+  }
+]

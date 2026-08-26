@@ -1,0 +1,50 @@
+{
+  "run_at": "2026-07-17T17:55:53.119717",
+  "total_planned": 100,
+  "total_executed": 1,
+  "rate_limited": 1,
+  "passed": 0,
+  "failed": 1,
+  "accuracy_pct": 0.0,
+  "avg_ms": 52260,
+  "sql_pct": 0,
+  "api_pct": 100,
+  "results": [
+    {
+      "test_id": 1,
+      "category": "Revenue",
+      "question": "What is the total revenue for this fiscal year?",
+      "planner_output": {},
+      "capability_id": "unknown",
+      "registry_decision": "unknown",
+      "selected_impl": "api_or_wrapper",
+      "sql_used": false,
+      "generated_sql": null,
+      "elapsed_ms": 52260,
+      "answer": "I encountered an error while formatting your response, but here is the raw data I retrieved:\n\n```json\n[\n  {\n    \"capability\": \"revenue_analysis\",\n    \"result\": {\n      \"total_revenue_ytd\": 1057021.56,\n      \"gp_performance_ytd_breakdown\": [\n        {\n          \"name\": \"Audit\",\n          \"short_code\": \"A&A\",\n          \"performing\": 599821.12,\n          \"target\": 1860000.0\n        },\n        {\n          \"name\": \"Business Risk Services\",\n          \"short_code\": \"BRS\",\n          \"performing\": 96079.",
+      "status": "FAIL",
+      "passed": false,
+      "root_cause": "Error message in response",
+      "error_code": null,
+      "retry_after": null
+    },
+    {
+      "test_id": 2,
+      "category": "Revenue",
+      "question": "Show me revenue by month for FY 2025-26",
+      "planner_output": {},
+      "capability_id": "unknown",
+      "registry_decision": "unknown",
+      "selected_impl": "api_or_wrapper",
+      "sql_used": false,
+      "generated_sql": null,
+      "elapsed_ms": 716,
+      "answer": "\u23f3 The AI service is temporarily at capacity. Please try again in **33m11.52s**.\n\n_If this persists, the daily token quota may be exhausted \u2014 please contact your system administrator._",
+      "status": "RATE_LIMITED",
+      "passed": null,
+      "root_cause": "Groq TPD/TPM rate limit. Retry in 33m11.52s",
+      "error_code": "rate_limit_exceeded",
+      "retry_after": "33m11.52s"
+    }
+  ]
+}

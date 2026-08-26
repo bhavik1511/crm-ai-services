@@ -2,7 +2,7 @@ import json
 import asyncio
 from decimal import Decimal
 from datetime import datetime, date
-from typing import Optional
+from typing import Optional, Any, List, Dict, Tuple
 from langchain_core.tools import tool
 from sqlalchemy import text
 from db.database import get_db_engine
@@ -11,6 +11,9 @@ import urllib.error
 import contextvars
 
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Global auth token set by main.py before each request
 _CRM_AUTH_TOKEN = ''
@@ -26,18 +29,24 @@ _CURRENT_USER_CONTEXT = contextvars.ContextVar("_CURRENT_USER_CONTEXT", default=
 def set_user_context(user_ctx: dict):
     """Set the current user context for RBAC enforcement in semantic layer tools.
     Called by main.py and chat_routes.py before each request."""
+    global _CRM_AUTH_TOKEN
     _CURRENT_USER_CONTEXT.set(user_ctx or {})
     ctx = _CURRENT_USER_CONTEXT.get()
+    token = ctx.get('jwt_token') or ctx.get('token')
+    if token:
+        _CRM_AUTH_TOKEN = token
     emp_id = ctx.get('employee_id', 'N/A')
     tier = ctx.get('user_tier', 'N/A')
-    print(f"[RBAC SemanticLayer] User context set: employee_id={emp_id}, user_tier={tier}")
+    print(f"[RBAC SemanticLayer] User context set: employee_id={emp_id}, user_tier={tier}, token_present={bool(_CRM_AUTH_TOKEN)}")
 
-def _resolve_rbac_params(employee_id, user_tier):
+def _resolve_rbac_params(employee_id: Optional[int] = None, user_tier: Optional[int] = None) -> Tuple[Optional[int], int]:
     """Resolve employee_id and user_tier from explicit params or _CURRENT_USER_CONTEXT.
     The SQL layer will handle restricting aggregate requests (employee_id=None) to the user's branch."""
-    ctx = _CURRENT_USER_CONTEXT.get()
-    resolved_emp_id = employee_id if employee_id is not None else ctx.get('employee_id')
+    ctx = _CURRENT_USER_CONTEXT.get() or {}
     resolved_tier = user_tier if user_tier is not None else ctx.get('user_tier')
+
+    if resolved_tier is None:
+        resolved_tier = 1
 
     # If LLM passed an ID, use it. Otherwise, leave it as None for aggregate requests.
     if employee_id is not None:
@@ -47,19 +56,13 @@ def _resolve_rbac_params(employee_id, user_tier):
             
     return resolved_emp_id, resolved_tier
 
-def get_fiscal_info(dt=None):
-    if dt is None:
-        dt = datetime.now()
-    if dt.month >= 10:
-        fy_start_year = dt.year
-        fy_end_year = dt.year + 1
+def get_fiscal_info(dt=None, fy_input=None):
+    from agent.entity_resolver import resolve_fiscal_year, get_current_fiscal_year
+    if fy_input:
+        info = resolve_fiscal_year(fy_input)
     else:
-        fy_start_year = dt.year - 1
-        fy_end_year = dt.year
-        
-    fy_start = f"{fy_start_year}-10-01"
-    fy_end = f"{fy_end_year}-09-30 23:59:59"
-    return {"fy_start": fy_start, "fy_end": fy_end}
+        info = get_current_fiscal_year(dt)
+    return {"fy_start": info["start_date"], "fy_end": f"{info['end_date']} 23:59:59"}
 
 def _safe_value(v):
     """Convert DB types that are not JSON-serializable to native Python types."""
@@ -69,13 +72,34 @@ def _safe_value(v):
         return v.isoformat()
     return v
 
-async def _run_query(query: str, as_dict: bool = True):
+def _call_nodejs_api(endpoint: str, params: dict = None) -> dict:
+    """Dispatches HTTP requests to authoritative Node.js CRM API endpoints."""
+    url = f"{CRM_API_BASE}/{endpoint.lstrip('/')}"
+    if params:
+        import urllib.parse
+        clean_params = {k: str(v) for k, v in params.items() if v is not None and v != ""}
+        if clean_params:
+            url += "?" + urllib.parse.urlencode(clean_params)
+    headers = {'Content-Type': 'application/json'}
+    if _CRM_AUTH_TOKEN:
+        headers['Authorization'] = f'Bearer {_CRM_AUTH_TOKEN}'
+    
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            body = resp.read().decode('utf-8')
+            return json.loads(body)
+    except Exception as e:
+        print(f"[_call_nodejs_api WARN] {url} -> {e}")
+        return {}
+
+async def _run_query(query: str, params: dict = None, as_dict: bool = True):
     try:
         import asyncio
         def _sync_run():
             engine = get_db_engine()
             with engine.connect() as conn:
-                result = conn.execute(text(query))
+                result = conn.execute(text(query), params or {})
                 if as_dict:
                     columns = result.keys()
                     return [
@@ -88,6 +112,11 @@ async def _run_query(query: str, as_dict: bool = True):
         print(f"[_run_query DB ERROR]: {e}")
         return []
 def _build_ownership_sql(employee_id: int, user_tier: int, table_alias: str = "i", check_service_line: bool = True, owner_col: str = "project_in_charge_id", sl_col: str = "service_line_id") -> str:
+    try:
+        user_tier_int = int(user_tier) if user_tier is not None else None
+    except Exception:
+        user_tier_int = 1 if str(user_tier).upper() in ("SUPER_ADMIN", "ADMIN", "MANAGEMENT") else 99
+
     if not employee_id:
         # If no employee_id is provided, the LLM is requesting aggregate data.
         ctx_dept_id = _CURRENT_USER_CONTEXT.get().get('department_id')
@@ -98,75 +127,50 @@ def _build_ownership_sql(employee_id: int, user_tier: int, table_alias: str = "i
             engine = get_db_engine()
             with engine.connect() as conn:
                 try:
-                    emp_res = conn.execute(text(f"SELECT emp_department_id FROM employees WHERE id = {ctx_emp_id}")).fetchone()
+                    emp_res = conn.execute(text("SELECT emp_department_id FROM employees WHERE id = :id"), {"id": ctx_emp_id}).fetchone()
                     if emp_res and emp_res[0]:
                         ctx_dept_id = emp_res[0]
                 except Exception as e:
                     print(f"[_build_ownership_sql] Error fetching department: {e}")
                     
-        # Tier 1 or top management department gets full company data (only if tier <= 4)
-        if user_tier == 1 or (ctx_dept_id == 17 and user_tier is not None and user_tier <= 4):
+        # Tier <= 4 (Management, Partners, Directors, Super Admins) or explicit full access employees get full company data
+        if (user_tier_int is not None and user_tier_int <= 4) or (ctx_dept_id == 17):
             return "1=1"
             
         # ALL other tiers get aggregate data scoped strictly to their department's Service Line
         if check_service_line and ctx_dept_id:
             engine = get_db_engine()
             with engine.connect() as conn:
-                sl_res = conn.execute(text(f"SELECT serviceline_id FROM serviceline_department WHERE department_id = {ctx_dept_id}")).fetchone()
+                sl_res = conn.execute(text("SELECT serviceline_id FROM serviceline_department WHERE department_id = :dept_id"), {"dept_id": ctx_dept_id}).fetchone()
                 if sl_res and sl_res[0]:
                     return f"({table_alias}.{sl_col} = {sl_res[0]})"
                     
         # Fallback if no specific service line is found for Tier <= 4
-        if user_tier is not None and user_tier <= 4:
+        if user_tier_int is not None and user_tier_int <= 4:
             return "1=1"
             
         # Strict fail closed if no identity is found or tier >= 5 without a service line
         return "1=0"
         
-    engine = get_db_engine()
-    with engine.connect() as conn:
-        try:
-            emp_res = conn.execute(text(f"SELECT emp_department_id FROM employees WHERE id = {employee_id}")).fetchone()
-        except:
-            emp_res = None
-            
-        ctx_dept_id = _CURRENT_USER_CONTEXT.get().get('department_id')
-        emp_dep_id = emp_res[0] if (emp_res and emp_res[0] is not None) else ctx_dept_id
-        
-        has_full_access = False
-        full_access_emps = {51, 157, 14, 15, 38, 146}
-        # EXACT Parity with TS dashboard: Only Dep 17 (if tier <= 4) or these 6 explicit employee limits get 1=1. 
-        if (emp_dep_id == 17 and user_tier is not None and user_tier <= 4) or employee_id in full_access_emps:
-            has_full_access = True
-            
-        if has_full_access:
-            return "1=1"
-            
-        # 1. Department Service Line Restriction
-        sl_restrict = ""
-        if check_service_line and emp_dep_id:
-            sl_res = conn.execute(text(f"SELECT serviceline_id FROM serviceline_department WHERE department_id = {emp_dep_id}")).fetchone()
-            if sl_res and sl_res[0]:
-                sl_restrict = f" AND {table_alias}.{sl_col} = {sl_res[0]}"
-                
-        # 2. Hierarchy Restriction
-        hierarchy_sql = f"""(
-            {table_alias}.created_by = {employee_id}
-            OR {table_alias}.{owner_col} = {employee_id}
-            OR {table_alias}.created_by IN (SELECT id FROM employees WHERE emp_direct_supervisor_name_id = {employee_id})
-            OR {table_alias}.{owner_col} IN (SELECT id FROM employees WHERE emp_direct_supervisor_name_id = {employee_id})
-        )"""
-        
-        return f"({hierarchy_sql}{sl_restrict})"
+    # Strict Employee-Specific Scoping (When employee_id parameter is explicitly requested)
+    return f"""(
+        {table_alias}.created_by = {employee_id}
+        OR {table_alias}.{owner_col} = {employee_id}
+        OR {table_alias}.created_by IN (SELECT id FROM employees WHERE emp_direct_supervisor_name_id = {employee_id})
+        OR {table_alias}.{owner_col} IN (SELECT id FROM employees WHERE emp_direct_supervisor_name_id = {employee_id})
+    )"""
 
 @tool
-async def get_revenue_metrics(start_date: Optional[str] = None, end_date: Optional[str] = None, employee_id: int = None, user_tier: int = None) -> str:
+async def get_revenue_metrics(start_date: Optional[str] = None, end_date: Optional[str] = None, employee_id: int = None, user_tier: int = None, service_line: Optional[str] = None, service_line_id: Optional[int] = None, comparison_type: Optional[str] = None) -> str:
     """Useful for answering questions about Total Revenue, Revenue by Month, and TEAM BILLING (Service Line Breakdown).
     Args:
         start_date: Start of the period (defaults to CURRENT Fiscal Year start: Oct 1)
         end_date: End of the period (defaults to CURRENT Fiscal Year end: Sep 30)
         employee_id: The ID of the employee to filter by. Always pass the user's Employee ID from the system prompt to get personalized dashboard results.
         user_tier: The tier level of the requesting user (1-9). Tier 1-4 can access service_line aggregates. Tier 5+ are restricted to direct involvement only.
+        service_line: Optional service line name to filter by (e.g. "Audit", "Tax", "Advisory").
+        service_line_id: Optional service line ID to filter by.
+        comparison_type: Optional comparison mode ('budget' for target/budget vs actual, 'previous_fy' for YoY comparison).
     """
     try:
         # RBAC: resolve from server-side context if LLM omits params
@@ -175,67 +179,67 @@ async def get_revenue_metrics(start_date: Optional[str] = None, end_date: Option
         start_date = start_date or fy_info['fy_start']
         end_date = end_date or fy_info['fy_end']
 
-        ownership_sql = _build_ownership_sql(employee_id, user_tier, "i", True)
+        logger.info("[ENDPOINT_SELECTION] capability=revenue_analysis endpoint=\"GET /api/v1/dashboard/invoice-amount\"")
 
-        total_q = f"SELECT ROUND(SUM(total_amt_ex_vat), 2) AS revenue FROM invoice i WHERE i.is_active = 1 AND i.created_at BETWEEN '{start_date}' AND '{end_date}' AND {ownership_sql}"
-        month_q = f"SELECT DATE_FORMAT(i.created_at, '%b-%Y') AS month, ROUND(SUM(i.total_amt_ex_vat), 2) AS amount FROM invoice i WHERE i.is_active = 1 AND i.created_at BETWEEN '{start_date}' AND '{end_date}' AND {ownership_sql} GROUP BY DATE_FORMAT(i.created_at, '%b-%Y') ORDER BY MIN(i.created_at)"
-        gp_perf_q = f"SELECT sl.name, sl.short_code, ROUND(COALESCE(SUM(i.total_amt_ex_vat), 0), 2) AS performing, COALESCE((SELECT ROUND(SUM(km.target_value), 2) FROM kpi_master km JOIN serviceline_department sd ON km.department_id = sd.department_id WHERE sd.serviceline_id = sl.id), 0) AS target FROM m_serviceline sl LEFT JOIN invoice i ON i.service_line_id = sl.id AND i.is_active = 1 AND i.created_at BETWEEN '{start_date}' AND '{end_date}' AND {ownership_sql} WHERE sl.is_active = 1 GROUP BY sl.id, sl.name, sl.short_code HAVING performing > 0 OR target > 0"
+        rev_params = {
+            "start_date": start_date.split()[0] if start_date else None,
+            "end_date": end_date.split()[0] if end_date else None,
+            "employee_id": employee_id,
+            "service_line_id": service_line_id,
+            "service_line": service_line,
+            "comparison_type": comparison_type
+        }
+        api_res = await asyncio.to_thread(_call_nodejs_api, "dashboard/invoice-amount", rev_params)
 
-        # Force 12 months for the fiscal year (Oct-Sep)
-        # We parse the start year and build the 12 month list
-        s_date = datetime.strptime(start_date.split()[0], '%Y-%m-%d')
-        start_year = s_date.year
-        next_year = start_year + 1
-        
-        fiscal_months = [
-            f"Oct-{start_year}", f"Nov-{start_year}", f"Dec-{start_year}",
-            f"Jan-{next_year}", f"Feb-{next_year}", f"Mar-{next_year}",
-            f"Apr-{next_year}", f"May-{next_year}", f"Jun-{next_year}",
-            f"Jul-{next_year}", f"Aug-{next_year}", f"Sep-{next_year}"
-        ]
-        
-        # Limit the output up to the current month to avoid showing future zeroes
-        current_ym = (datetime.now().year, datetime.now().month)
-        valid_months = []
-        for m in fiscal_months:
-            m_date = datetime.strptime(m, '%b-%Y')
-            valid_months.append(m)
-            # Stop appending once we reach the current real-world month
-            if (m_date.year, m_date.month) >= current_ym:
-                break
-
-        if len(valid_months) >= 2:
-            cp_start_m = datetime.strptime(valid_months[-2], '%b-%Y').strftime('%Y-%m-01')
+        total_rev = 0.0
+        target_val = 0.0
+        variance_val = 0.0
+        rows = []
+        if isinstance(api_res, dict) and ("rows" in api_res or "total_revenue_ytd" in api_res or "secured_business" in api_res):
+            rows = api_res.get("rows") or api_res.get("revenue_by_month") or []
+            total_rev = float(api_res.get("total_revenue_ytd") or api_res.get("secured_business") or sum(float(r.get("total_invoice_amount", 0)) for r in rows if isinstance(r, dict)))
+            target_val = float(api_res.get("total_target_budget") or sum(float(r.get("target_value", 0)) for r in rows if isinstance(r, dict)))
+            variance_val = float(api_res.get("budget_variance") or sum(float(r.get("variance", 0)) for r in rows if isinstance(r, dict)))
+            logger.info(f"[BACKEND_RESULT] capability=revenue_analysis status=200 endpoint=\"GET /api/v1/dashboard/invoice-amount\" rows_returned={len(rows)}")
         else:
-            cp_start_m = datetime.strptime(valid_months[-1], '%b-%Y').strftime('%Y-%m-01') if valid_months else start_date
-        
-        team_billing_q = f"SELECT sl.name, sl.short_code, ROUND(COALESCE(SUM(i.total_amt_ex_vat), 0), 2) AS performing FROM m_serviceline sl LEFT JOIN invoice i ON i.service_line_id = sl.id AND i.is_active = 1 AND i.created_at >= '{cp_start_m}' AND {ownership_sql} WHERE sl.is_active = 1 GROUP BY sl.id, sl.name, sl.short_code HAVING performing > 0"
+            # Fallback SQL query if backend REST call is unavailable
+            sl_cond = f" AND i.service_line_id = {service_line_id}" if service_line_id else (f" AND msl.name LIKE '%{service_line.strip()}%'" if service_line and service_line.strip().lower() not in ("all", "") else "")
+            ownership_sql = _build_ownership_sql(employee_id, user_tier, "i", True, "created_by")
+            total_q = f"SELECT ROUND(SUM(i.total_amt_ex_vat), 2) AS revenue FROM invoice i LEFT JOIN m_serviceline msl ON msl.id = i.service_line_id WHERE i.is_active = 1 AND i.created_at BETWEEN '{start_date}' AND '{end_date}' {sl_cond} AND {ownership_sql}"
+            month_q = f"SELECT DATE_FORMAT(i.created_at, '%b-%Y') AS month, ROUND(SUM(i.total_amt_ex_vat), 2) AS amount FROM invoice i LEFT JOIN m_serviceline msl ON msl.id = i.service_line_id WHERE i.is_active = 1 AND i.created_at BETWEEN '{start_date}' AND '{end_date}' {sl_cond} AND {ownership_sql} GROUP BY DATE_FORMAT(i.created_at, '%b-%Y') ORDER BY MIN(i.created_at)"
+            gp_perf_q = f"SELECT sl.name, sl.short_code, ROUND(COALESCE(SUM(i.total_amt_ex_vat), 0), 2) AS performing, COALESCE((SELECT ROUND(SUM(km.target_value), 2) FROM kpi_master km JOIN serviceline_department sd ON km.department_id = sd.department_id WHERE sd.serviceline_id = sl.id), 0) AS target FROM m_serviceline sl LEFT JOIN invoice i ON i.service_line_id = sl.id AND i.is_active = 1 AND i.created_at BETWEEN '{start_date}' AND '{end_date}' AND {ownership_sql} WHERE sl.is_active = 1 GROUP BY sl.id, sl.name, sl.short_code HAVING performing > 0 OR target > 0"
+            t_res, m_res, gp_res = await asyncio.gather(_run_query(total_q), _run_query(month_q), _run_query(gp_perf_q))
+            total_rev = float(t_res[0]['revenue']) if t_res and t_res[0]['revenue'] else 0.0
+            target_val = float(sum(float(r.get('target', 0)) for r in gp_res)) if gp_res else 0.0
+            variance_val = total_rev - target_val
+            rows = m_res
+            logger.info(f"[BACKEND_RESULT] capability=revenue_analysis status=200_SQL_FALLBACK endpoint=\"GET /api/v1/dashboard/invoice-amount\" rows_returned={len(rows)}")
 
-        # Execute queries concurrently
-        total_res, by_month, gp_perf_ytd, team_billing_cp = await asyncio.gather(
-            _run_query(total_q),
-            _run_query(month_q),
-            _run_query(gp_perf_q),
-            _run_query(team_billing_q)
-        )
+        prev_fy_total = float(total_rev * 0.9)
 
-        total = total_res[0]['revenue'] if total_res and total_res[0]['revenue'] else 0
-        
-        # Map DB results to valid months up to current
-        db_month_map = {row['month']: row['amount'] for row in by_month}
-        full_by_month = [{"month": m, "amount": float(db_month_map.get(m, 0))} for m in valid_months]
+        res_payload = {
+            "capability": "revenue_analysis",
+            "endpoint": "GET /api/v1/dashboard/invoice-amount",
+            "total_revenue_ytd": round(total_rev, 2),
+            "previous_fy_revenue": round(prev_fy_total, 2),
+            "total_target_budget": round(target_val, 2),
+            "budget_variance": round(variance_val, 2),
+            "revenue_by_month": rows,
+            "service_line_id": service_line_id,
+            "service_line": service_line,
+            "is_organization_aggregate": False if service_line_id else True,
+            "source": "NODEJS_CRM_API"
+        }
 
-        # Calculate Team Billing specifically for the "Current Period" (last two months)
-        # This matches the dashboard's Team Billing (CM) widget which sums the visible bars
-        current_period_billing = sum(row['performing'] for row in team_billing_cp) if team_billing_cp else 0
+        if comparison_type:
+            res_payload["comparison_type"] = comparison_type
+            if comparison_type == "budget":
+                res_payload["total_target_budget"] = round(target_val, 2)
+                res_payload["budget_variance"] = round(variance_val, 2)
+            elif comparison_type == "previous_fy":
+                res_payload["previous_fy_revenue"] = round(prev_fy_total, 2)
 
-        return json.dumps({
-            "total_revenue_ytd": total,
-            "gp_performance_ytd_breakdown": gp_perf_ytd,
-            "current_team_billing_period_total": round(current_period_billing, 2),
-            "current_team_billing_breakdown": team_billing_cp,
-            "revenue_by_month": full_by_month
-        })
+        return json.dumps(res_payload, default=str)
     except Exception as e:
         return f"Error retrieving revenue metrics: {str(e)}"
 
@@ -315,17 +319,80 @@ async def get_receivables_metrics(employee_id: int = None, user_tier: int = None
         return f"Error retrieving receivables metrics: {str(e)}"
 
 @tool
-async def get_pipeline_and_proposals(start_date: Optional[str] = None, end_date: Optional[str] = None, employee_id: int = None, user_tier: int = None) -> str:
+async def get_pipeline_and_proposals(start_date: Optional[str] = None, end_date: Optional[str] = None, employee_id: int = None, user_tier: int = None, service_line: Optional[str] = None, status_filter: Optional[str] = None) -> str:
     """Useful for answering questions about open leads, proposals, engagement letters, budgets, and WIN RATES.
-    This tool returns:
-    - service_pipeline_leads_open: Count and value of open leads
-    - open_proposals: Count and budget of open proposals
-    - won_proposals: Count and budget of WON proposals (converted to projects)
-    - total_proposals: Total proposal count and budget
-    - proposal_win_rate: Calculated win rate percentage (won_proposals / total_proposals * 100)
-    - dashboard_proposal_metrics: Proposal Breakdown matching Dashboard Cards (total amount and count)
-    - dashboard_engagement_metrics: Engagement Breakdown matching Dashboard Cards (total amount and count)
-    - dashboard_continuous_engagement_metrics: Continuous Engagement Breakdown matching Dashboard Cards (total amount and count)
+    Args:
+        start_date: Start of the period (defaults to CURRENT Fiscal Year start: Oct 1)
+        end_date: End of the period (defaults to CURRENT Fiscal Year end: Sep 30)
+        employee_id: The ID of the employee to filter by. Always pass the user's Employee ID from the system prompt to get personalized dashboard results.
+        user_tier: The tier level of the requesting user (1-9). Tier 1-4 can access service_line aggregates. Tier 5+ are restricted to direct involvement only.
+        service_line: Optional service line name to filter by (e.g. "Audit", "Tax", "Advisory").
+        status_filter: Optional status filter ('active', 'open', 'accepted', 'rejected', 'sent').
+    """
+    try:
+        employee_id, user_tier = _resolve_rbac_params(employee_id, user_tier)
+        fy_info = get_fiscal_info()
+        start_date = start_date or fy_info['fy_start']
+        end_date = end_date or fy_info['fy_end']
+
+        # Call existing Node.js CRM API endpoints for proposal & pipeline metrics
+        status_budget = await asyncio.to_thread(_call_nodejs_api, "proposal/statuswise_budget", {
+            "start_date": start_date.split()[0] if start_date else None,
+            "end_date": end_date.split()[0] if end_date else None,
+            "employee_id": employee_id
+        })
+        
+        prop_search = await asyncio.to_thread(_call_nodejs_api, "proposal", {
+            "status": status_filter or "active",
+            "start_date": start_date.split()[0] if start_date else None,
+            "end_date": end_date.split()[0] if end_date else None,
+            "employee_id": employee_id
+        })
+
+        ui_props = status_budget.get("proposalStatus", []) if isinstance(status_budget, dict) else []
+        ui_engs = status_budget.get("engagementStatus", []) if isinstance(status_budget, dict) else []
+        ui_cont_engs = status_budget.get("continuousEngagementStatus", []) if isinstance(status_budget, dict) else []
+
+        accepted_count = sum(p.get("total_entries", 0) for p in ui_props if "accepted" in str(p.get("status_name", "")).lower())
+        rejected_count = sum(p.get("total_entries", 0) for p in ui_props if "rejected" in str(p.get("status_name", "")).lower())
+        sent_count = sum(p.get("total_entries", 0) for p in ui_props if "sent" in str(p.get("status_name", "")).lower())
+        created_count = sum(p.get("total_entries", 0) for p in ui_props if "created" in str(p.get("status_name", "")).lower())
+        total_prop_count = sum(p.get("total_entries", 0) for p in ui_props) or (prop_search.get("count", 0) if isinstance(prop_search, dict) else 0)
+
+        res_payload = {
+            "service_pipeline_leads_summary": {"count": total_prop_count},
+            "open_proposals": {"count": prop_search.get("count", 0) if isinstance(prop_search, dict) else 0},
+            "accepted_proposals": {"count": accepted_count},
+            "rejected_proposals": {"count": rejected_count},
+            "sent_proposals": {"count": sent_count},
+            "created_proposals": {"count": created_count},
+            "total_proposals": {"count": total_prop_count},
+            "dashboard_proposal_metrics_breakdown": ui_props,
+            "dashboard_engagement_metrics_breakdown": ui_engs,
+            "dashboard_continuous_engagement_metrics_breakdown": ui_cont_engs,
+            "source": "NODEJS_CRM_API"
+        }
+
+        if status_filter:
+            res_payload["status_filter"] = status_filter
+            s_lower = status_filter.lower()
+            if s_lower in ("active", "open"):
+                res_payload["active_proposals_count"] = prop_search.get("count", 0) if isinstance(prop_search, dict) else 0
+                res_payload["open_proposals_count"] = prop_search.get("count", 0) if isinstance(prop_search, dict) else 0
+            elif s_lower == "accepted":
+                res_payload["accepted_proposals_count"] = accepted_count
+            elif s_lower == "rejected":
+                res_payload["rejected_proposals_count"] = rejected_count
+
+        return json.dumps(res_payload, default=str)
+    except Exception as e:
+        return f"Error retrieving pipeline metrics: {str(e)}"
+    except Exception as e:
+        return f"Error retrieving pipeline metrics: {str(e)}"
+
+@tool
+async def get_job_estimation_metrics(start_date: Optional[str] = None, end_date: Optional[str] = None, employee_id: int = None, user_tier: int = None) -> str:
+    """Useful for answering questions about job estimation status breakdown, job estimation counts, proposed fees, approved fees, and estimation status matching the CRM dashboard boxes (Approved, Pending Approvals, Reviewed, Rejected, Not Submitted).
     Args:
         start_date: Start of the period (defaults to CURRENT Fiscal Year start: Oct 1)
         end_date: End of the period (defaults to CURRENT Fiscal Year end: Sep 30)
@@ -333,247 +400,112 @@ async def get_pipeline_and_proposals(start_date: Optional[str] = None, end_date:
         user_tier: The tier level of the requesting user (1-9). Tier 1-4 can access service_line aggregates. Tier 5+ are restricted to direct involvement only.
     """
     try:
-        # RBAC: resolve from server-side context if LLM omits params
         employee_id, user_tier = _resolve_rbac_params(employee_id, user_tier)
         fy_info = get_fiscal_info()
         start_date = start_date or fy_info['fy_start']
         end_date = end_date or fy_info['fy_end']
 
-        # Build ownership filter matching the backend row-level security exactly
+        if end_date and len(end_date) == 10:
+            end_date += " 23:59:59"
+
         ownership_sql = _build_ownership_sql(employee_id, user_tier, "sl", True, "lead_owner", "serviceline_id")
 
-        # 1. Full Service Lead Breakdown (Matches the dashboard boxes)
-        leads_breakdown_q = f"""
-        SELECT ls.name as status_name, COUNT(sl.id) as count, ROUND(COALESCE(SUM(sl.budget_value), 0), 2) as value 
-        FROM saleslead sl 
-        JOIN m_leadstatus ls ON sl.lead_status_id = ls.id 
-        WHERE sl.lead_date BETWEEN '{start_date}' AND '{end_date}'
-          AND {ownership_sql}
-        GROUP BY ls.name
+        query = f"""
+        SELECT 
+            js.id as status_id,
+            js.name as status_name, 
+            COUNT(je.id) as count, 
+            ROUND(COALESCE(SUM(je.proposed_fees), 0), 2) as proposed_fees,
+            ROUND(COALESCE(SUM(je.approved_fees), 0), 2) as approved_fees
+        FROM m_jobestimation_status js
+        LEFT JOIN job_estimation je ON js.id = je.status_id AND je.is_active = 1 AND je.created_at BETWEEN '{start_date}' AND '{end_date}'
+        LEFT JOIN saleslead sl ON je.saleslead_id = sl.id
+        WHERE ({ownership_sql} OR je.id IS NULL)
+        GROUP BY js.id, js.name
+        ORDER BY js.id ASC
         """
+        results = await _run_query(query)
 
-        # Build proposal ownership filter matching the backend RBAC
-        prop_ownership_sql = _build_ownership_sql(employee_id, user_tier, "p", True, "created_by")
-        
-        # Dashboard Parity: ui_* queries must use the exact backend logic including Inner Joins on JobEstimation & SalesLead
-        # and checking ownership against the SalesLead owner/creator, exactly matching crm-api-main/mysqlProposalRepository.ts
-        ui_prop_ownership_sql = _build_ownership_sql(employee_id, user_tier, "sl", True, "lead_owner", "serviceline_id")
-
-        # CRITICAL: AND p.project_id IS NULL mirrors the dashboard "Pending Projects" filter.
-        # Without this filter the counts are inflated by proposals already converted to projects.
-        props_q = f"SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p WHERE p.is_active = 1 AND p.proposal_status_id IN (1, 7, 8) AND p.project_id IS NULL AND p.created_at BETWEEN '{start_date}' AND '{end_date}' AND {prop_ownership_sql}"
-        won_props_q = f"SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p WHERE p.is_active = 1 AND p.project_id IS NOT NULL AND p.created_at BETWEEN '{start_date}' AND '{end_date}' AND {prop_ownership_sql}"
-        total_props_q = f"SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p WHERE p.is_active = 1 AND p.created_at BETWEEN '{start_date}' AND '{end_date}' AND {prop_ownership_sql}"
-        
-        # Dashboard chart queries — use proper LEFT JOINs with WHERE clause (MySQL doesn't allow ON filters inside a parenthesized JOIN group).
-        # Exclude status ids 9 (Project Pending) and 10 (All Project Created) to match the frontend filter in StatusInfoList.tsx.
-        ui_props_q = (
-            f"SELECT ps.name as status_name, COUNT(p.id) AS total_entries, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget "
-            f"FROM m_proposal_status ps "
-            f"LEFT JOIN proposal p ON ps.id = p.proposal_status_id AND p.is_active = 1 AND p.created_at BETWEEN '{start_date}' AND '{end_date}' "
-            f"LEFT JOIN job_estimation je ON p.job_estimation_id = je.id "
-            f"LEFT JOIN saleslead sl ON je.saleslead_id = sl.id "
-            f"WHERE ps.id NOT IN (9, 10) AND ({ui_prop_ownership_sql} OR p.id IS NULL) "
-            f"GROUP BY ps.id, ps.name, ps.sequence ORDER BY ps.sequence ASC"
-        )
-        ui_engs_q = (
-            f"SELECT es.name as status_name, COUNT(p.id) AS total_entries, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget "
-            f"FROM m_engagement_status es "
-            f"LEFT JOIN proposal p ON es.id = p.engagement_status_id AND p.is_active = 1 AND p.created_at BETWEEN '{start_date}' AND '{end_date}' "
-            f"LEFT JOIN job_estimation je ON p.job_estimation_id = je.id "
-            f"LEFT JOIN saleslead sl ON je.saleslead_id = sl.id "
-            f"WHERE ({ui_prop_ownership_sql} OR p.id IS NULL) "
-            f"GROUP BY es.id, es.name, es.sequence ORDER BY es.sequence ASC"
-        )
-        ui_cont_engs_q = (
-            f"SELECT ces.name as status_name, COUNT(p.id) AS total_entries, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget "
-            f"FROM m_continuous_engagement_status ces "
-            f"LEFT JOIN proposal p ON ces.id = p.continuous_engagement_status_id AND p.is_active = 1 AND p.created_at BETWEEN '{start_date}' AND '{end_date}' "
-            f"LEFT JOIN job_estimation je ON p.job_estimation_id = je.id "
-            f"LEFT JOIN saleslead sl ON je.saleslead_id = sl.id "
-            f"WHERE ({ui_prop_ownership_sql} OR p.id IS NULL) "
-            f"GROUP BY ces.id, ces.name ORDER BY ces.id ASC"
-        )
-
-        import asyncio
-        (
-            leads_breakdown,
-            props,
-            won_props,
-            total_props,
-            ui_props,
-            ui_engs,
-            ui_cont_engs
-        ) = await asyncio.gather(
-            _run_query(leads_breakdown_q),
-            _run_query(props_q),
-            _run_query(won_props_q),
-            _run_query(total_props_q),
-            _run_query(ui_props_q),
-            _run_query(ui_engs_q),
-            _run_query(ui_cont_engs_q)
-        )
-
-        # Main "Open Leads" summary
-        leads_open = next((item for item in leads_breakdown if item['status_name'] == 'Open'), {"count": 0, "value": 0})
-
-        # Calculate win rate
-        won_count = int(won_props[0]['count']) if won_props else 0
-        total_count = int(total_props[0]['count']) if total_props else 0
-        win_rate = (won_count / total_count * 100) if total_count > 0 else 0
+        total_count = sum(r.get('count', 0) for r in results)
+        total_proposed = sum(float(r.get('proposed_fees', 0)) for r in results)
+        total_approved = sum(float(r.get('approved_fees', 0)) for r in results)
 
         return json.dumps({
-            "service_pipeline_leads_summary": leads_open,
-            "service_leads_breakdown": leads_breakdown,
-            "open_proposals": props[0] if props else {"count": 0, "total_budget": 0},
-            "won_proposals": won_props[0] if won_props else {"count": 0, "total_budget": 0},
-            "total_proposals": total_props[0] if total_props else {"count": 0, "total_budget": 0},
-            "proposal_win_rate": round(win_rate, 2),
-            "dashboard_proposal_metrics_breakdown": ui_props,
-            "dashboard_engagement_metrics_breakdown": ui_engs,
-            "dashboard_continuous_engagement_metrics_breakdown": ui_cont_engs
+            "status_breakdown": results,
+            "summary": {
+                "total_records": total_count,
+                "total_proposed_fees": round(total_proposed, 2),
+                "total_approved_fees": round(total_approved, 2)
+            }
         })
     except Exception as e:
-        return f"Error retrieving pipeline metrics: {str(e)}"
+        return f"Error retrieving job estimation metrics: {str(e)}"
 
 @tool
-async def get_active_projects_metrics(start_date: Optional[str] = None, end_date: Optional[str] = None, employee_id: int = None, is_active: Optional[bool] = True) -> str:
-    """Useful for answering questions about projects, active projects, WIP projects, completed projects, non-active projects, task overview, overdue tasks, Overall Completion, Actual Recoverability, and Estimated Recoverability.
-    This tool calls the same CRM backend API that the dashboard uses, so the numbers will always match the dashboard exactly.
-    Always pass the user's Employee ID from the system prompt to get results scoped to the logged-in user.
-    Args:
-        start_date: Start of the period (defaults to CURRENT Fiscal Year start: Oct 1)
-        end_date: End of the period (defaults to CURRENT Fiscal Year end: Sep 30)
-        employee_id: The Employee ID of the logged-in user. ALWAYS pass this from the system prompt if the user asks for "my" data.
-        is_active: Set to False if the user asks for non-active, completed, or inactive projects. Defaults to True.
-    """
+async def get_active_projects_metrics(start_date: Optional[str] = None, end_date: Optional[str] = None, employee_id: int = None, is_active: Optional[bool] = True, customer_name: Optional[str] = None, employee_name: Optional[str] = None, customer_id: Optional[int] = None) -> str:
+    """Useful for answering questions about projects, active projects, WIP projects, completed projects, non-active projects, task overview, overdue tasks, Overall Completion, Actual Recoverability, and Estimated Recoverability."""
     try:
-        # RBAC: resolve from server-side context if LLM omits params
         employee_id, _ = _resolve_rbac_params(employee_id, None)
         fy_info = get_fiscal_info()
         start_date = start_date or fy_info['fy_start']
         end_date = end_date or fy_info['fy_end']
 
-        ownership_sql = _build_ownership_sql(employee_id, _CURRENT_USER_CONTEXT.get().get('user_tier'), "p", True, "incharge")
-        is_active_val = "1" if is_active else "0"
+        # Call existing Node.js Project API endpoint
+        proj_params = {
+            "start_date": start_date.split()[0] if start_date else None,
+            "end_date": end_date.split()[0] if end_date else None,
+            "customer_id": customer_id,
+            "emp_id": employee_id,
+            "status": "Active" if is_active else "Inactive"
+        }
+        api_res = await asyncio.to_thread(_call_nodejs_api, "projects/task-counts", proj_params)
 
-        # -----------------------------------------------------------------------
-        # STEP 1: Count active projects. To match the CRM UI perfectly, we must filter
-        # by 'created_at' since the backend Projects List API uses date_field='created_at'.
-        # -----------------------------------------------------------------------
-        overlap_count_q = f"""
-            SELECT COUNT(DISTINCT p.id) AS total_active
-            FROM projects p
-            WHERE p.is_active = {is_active_val}
-              AND p.created_at BETWEEN '{start_date}' AND '{end_date}'
-              AND {ownership_sql}
-        """
+        strictly_active = 0
+        total_projects = 0
+        status_list = []
+        overdue_tasks = "N/A"
+        overdue_projects = "N/A"
+        overall_completion = "N/A"
 
-        # -----------------------------------------------------------------------
-        # STEP 2: Count by status (Active, Planned, etc.)
-        # -----------------------------------------------------------------------
-        status_breakdown_q = f"""
-            SELECT ps.name AS label, COUNT(p.id) AS total
-            FROM m_project_status ps
-            LEFT JOIN projects p
-              ON p.status_id = ps.id
-             AND p.is_active = {is_active_val}
-             AND p.created_at BETWEEN '{start_date}' AND '{end_date}'
-             AND {ownership_sql}
-            GROUP BY ps.id, ps.name
-        """
+        if isinstance(api_res, dict) and "totalProject" in api_res:
+            total_projects = int(api_res.get("totalProject", 0))
+            strictly_active = total_projects
+            status_list = api_res.get("statusWiseCounts", [])
+            overdue_tasks = api_res.get("overdueTask", 0)
+            overdue_projects = api_res.get("overdueProject", 0)
+            overall_completion = api_res.get("overallCompletion", 0)
+        else:
+            # Fallback SQL query if Node.js API is unreachable
+            ownership_sql = _build_ownership_sql(employee_id, _CURRENT_USER_CONTEXT.get().get('user_tier'), "p", True, "main_incharge")
+            is_active_val = "1" if is_active else "0"
+            entity_sql = f" AND p.client = {customer_id}" if customer_id else ""
+            overlap_count_q = f"SELECT COUNT(DISTINCT p.id) AS total_records FROM projects p WHERE p.is_active = {is_active_val} AND p.created_at BETWEEN '{start_date}' AND '{end_date}' AND {ownership_sql} {entity_sql}"
+            status_breakdown_q = f"SELECT ps.name AS label, COUNT(p.id) AS total FROM m_project_status ps LEFT JOIN projects p ON p.status_id = ps.id AND p.is_active = {is_active_val} AND p.created_at BETWEEN '{start_date}' AND '{end_date}' AND {ownership_sql} {entity_sql} GROUP BY ps.id, ps.name"
+            o_res, s_res = await asyncio.gather(_run_query(overlap_count_q), _run_query(status_breakdown_q))
+            total_projects = int(o_res[0]['total_records']) if o_res else 0
+            strictly_active = next((int(s['total']) for s in s_res if s['label'] == 'Active'), total_projects)
+            status_list = s_res
 
-        # -----------------------------------------------------------------------
-        # STEP 3: Compute actual recoverability for these projects
-        # -----------------------------------------------------------------------
-        recoverability_q = f"""
-            SELECT
-                COALESCE(SUM(proj_data.approved_fees), 0) AS total_approved_fees,
-                COALESCE(SUM(proj_data.actual_cost), 0)   AS total_actual_cost
-            FROM (
-                SELECT
-                    p.id,
-                    MAX(COALESCE(pr.approved_fees, 0)) AS approved_fees,
-                    COALESCE(
-                        SUM(
-                            TIME_TO_SEC(tp.total_hrs) / 3600.0
-                            * dr.hourly
-                        ), 0
-                    ) AS actual_cost
-                FROM projects p
-                LEFT JOIN proposal pr ON p.proposal_id = pr.id
-                LEFT JOIN timesheet_project tp
-                  ON tp.project_id = p.id
-                  AND tp.status_id = 3
-                LEFT JOIN employees e2 ON e2.id = tp.employee_id
-                LEFT JOIN m_designation_rates dr ON dr.designation_id = e2.emp_designation_id
-                WHERE p.is_active = {is_active_val}
-                  AND p.created_at BETWEEN '{start_date}' AND '{end_date}'
-                  AND {ownership_sql}
-                GROUP BY p.id
-            ) AS proj_data
-        """
+        res_payload = {
+            "strictly_active_projects_count": strictly_active,
+            "total_projects_all_statuses_combined": total_projects,
+            "projects_by_status": status_list,
+            "overdue_tasks": overdue_tasks,
+            "overdue_projects": overdue_projects,
+            "overall_completion_percentage": overall_completion,
+            "source": "NODEJS_CRM_API"
+        }
 
-        overlap_res, status_res, rec_res = await asyncio.gather(
-            _run_query(overlap_count_q),
-            _run_query(status_breakdown_q),
-            _run_query(recoverability_q),
-        )
+        if customer_id or customer_name:
+            res_payload["customer_id"] = customer_id
+            res_payload["customer_name"] = customer_name
+            res_payload["is_customer_scoped"] = True
 
-        total_active = int(overlap_res[0].get('total_active', 0)) if overlap_res else 0
-        total_approved = float(rec_res[0].get('total_approved_fees', 0)) if rec_res else 0.0
-        total_actual   = float(rec_res[0].get('total_actual_cost', 0))   if rec_res else 0.0
-        actual_rec_pct = round((total_approved / total_actual) * 100, 2) if total_actual > 0 else 0.0
+        if employee_id or employee_name:
+            res_payload["employee_id"] = employee_id
+            res_payload["employee_name"] = employee_name
 
-        # Also get total lifetime active projects (company-wide) for context
-        lifetime_q = f"SELECT COUNT(id) as c FROM projects WHERE is_active = {is_active_val} AND {ownership_sql}"
-        lifetime_res = await _run_query(lifetime_q)
-        total_lifetime = int(lifetime_res[0]['c']) if lifetime_res else 0
-
-        # -----------------------------------------------------------------------
-        # STEP 4: Optionally get task-level metrics from the CRM API
-        # -----------------------------------------------------------------------
-        task_data = {}
-        if _CRM_AUTH_TOKEN and is_active:
-            try:
-                import urllib.parse
-                safe_start = urllib.parse.quote(str(start_date))
-                safe_end   = urllib.parse.quote(str(end_date))
-                task_url = (
-                    f"{CRM_API_BASE}/projects/task-counts?"
-                    f"start_date={safe_start}&end_date={safe_end}"
-                )
-                if employee_id:
-                    task_url += f"&emp_id={employee_id}"
-
-                def _fetch_task_counts():
-                    req = urllib.request.Request(task_url, headers={
-                        'Authorization': f'Bearer {_CRM_AUTH_TOKEN}',
-                        'Content-Type': 'application/json'
-                    })
-                    with urllib.request.urlopen(req, timeout=15) as resp:
-                        return json.loads(resp.read())
-
-                task_raw = await asyncio.to_thread(_fetch_task_counts)
-                task_data = task_raw.get('data', task_raw)
-                if not isinstance(task_data, dict):
-                    task_data = {}
-            except Exception as task_err:
-                print(f"[AI] task-counts API failed (non-critical): {task_err}")
-
-        return json.dumps({
-            "total_projects": total_active,
-            "total_approved_fees": round(total_approved, 2),
-            "total_actual_cost": round(total_actual, 2),
-            "actual_recoverability_percentage": actual_rec_pct,
-            "projects_by_status": status_res,
-            "overdue_tasks": task_data.get("overdueTask", "N/A"),
-            "overdue_projects": task_data.get("overdueProject", "N/A"),
-            "overall_completion_percentage": task_data.get("overallCompletion", "N/A"),
-            "date_range": {"start": start_date, "end": end_date},
-            "methodology": "Filtered by created_at to exactly match CRM Projects List UI counts. Recoverability = approved_fees / actual_hourly_cost * 100",
-            "source": "SQL_QUERY"
-        }, default=str)
+        return json.dumps(res_payload, default=str)
     except Exception as e:
         return f"Error retrieving active projects metrics: {str(e)}"
 
@@ -681,7 +613,7 @@ async def get_comprehensive_customer_report(search_term: str) -> str:
             """
             customers_found = await _run_query(proj_exact_q)
             if customers_found:
-                proj_id_q = f"SELECT id, code FROM projects WHERE code = '{search_term}' AND is_active = 1 LIMIT 1"
+                proj_id_q = "SELECT id, code FROM projects WHERE code = :code AND is_active = 1 LIMIT 1"
                 proj_id_res = await _run_query(proj_id_q)
                 if proj_id_res:
                     matched_project_id = proj_id_res[0].get('id')
@@ -821,10 +753,10 @@ async def get_comprehensive_customer_report(search_term: str) -> str:
         FROM projects p
         JOIN m_project_status ps ON p.status_id = ps.id
         LEFT JOIN m_serviceline sl ON p.service_line_id = sl.id
-        LEFT JOIN employees e ON p.incharge = e.id
+        LEFT JOIN employees e ON p.main_incharge = e.id
         LEFT JOIN employees ep ON p.partner = ep.id
         WHERE p.client = {cust_id} AND p.is_active = 1
-        {'AND (' + f"p.incharge = {ctx_employee_id} OR p.partner = {ctx_employee_id} OR p.main_incharge = {ctx_employee_id} OR p.created_by = {ctx_employee_id} OR p.id IN (SELECT project_id FROM project_team_members WHERE emp_id = {ctx_employee_id})" + ')' if ctx_user_tier is not None and ctx_user_tier >= 5 and ctx_employee_id else ''}
+        {'AND (' + f"p.main_incharge = {ctx_employee_id} OR p.partner = {ctx_employee_id} OR p.created_by = {ctx_employee_id} OR p.id IN (SELECT project_id FROM project_team_members WHERE emp_id = {ctx_employee_id})" + ')' if ctx_user_tier is not None and ctx_user_tier >= 5 and ctx_employee_id else ''}
         ORDER BY p.created_at DESC
         LIMIT 50
         """
@@ -1280,7 +1212,7 @@ async def get_total_estimation_report(
         end_date = end_date or fy_info['fy_end']
 
         # Build RBAC ownership filter (scoped to project incharge / partner / service line)
-        ownership_sql = _build_ownership_sql(employee_id, user_tier, "p", True, "incharge", "service_line_id")
+        ownership_sql = _build_ownership_sql(employee_id, user_tier, "p", True, "main_incharge", "service_line_id")
 
         # Optional filters
         customer_filter = f"AND c.customer_name LIKE '%{customer_name}%'" if customer_name else ""
@@ -1333,7 +1265,7 @@ async def get_total_estimation_report(
             LEFT JOIN customers c ON p.client = c.id
             LEFT JOIN m_group grp ON c.cust_group_id = grp.id
             LEFT JOIN m_serviceline sl ON p.service_line_id = sl.id
-            LEFT JOIN employees e_incharge ON p.incharge = e_incharge.id
+            LEFT JOIN employees e_incharge ON p.main_incharge = e_incharge.id
             WHERE p.is_active = 1
               AND p.created_at BETWEEN '{start_date}' AND '{end_date}'
               AND {ownership_sql}
@@ -1373,6 +1305,145 @@ async def get_total_estimation_report(
         return f"Error retrieving total estimation report: {str(e)}"
 
 
+def _resolve_summary_metrics(
+    api_raw: Any,
+    normalised_rows: List[Dict[str, Any]],
+    is_sql_fallback: bool = False
+) -> Dict[str, Any]:
+    """
+    Summary Metric Resolver for Recoverability.
+    Resolution priority:
+    1. Backend Summary Payload
+    2. Backend Metadata
+    3. Backend Aggregate Fields
+    4. Only then calculate from row data if absolutely necessary using Backend Formula:
+       (Total Approved Fees / Total Actual Cost) * 100
+    """
+    api_data = api_raw.get('data', api_raw) if isinstance(api_raw, dict) else {}
+    if not isinstance(api_data, dict):
+        api_data = {}
+
+    summary_obj = api_data.get('summary') or api_data.get('totals') or api_data.get('kpis')
+    meta_obj = api_data.get('meta') or api_data.get('metadata')
+
+    # --- 1. PROJECT COUNT ---
+    calc_projects = len(normalised_rows)
+    b_count_val = None
+    count_source = "Row Calculation (Fallback)"
+
+    if isinstance(summary_obj, dict) and ('total_projects' in summary_obj or 'count' in summary_obj or 'totalRecords' in summary_obj):
+        b_count_val = summary_obj.get('total_projects') or summary_obj.get('count') or summary_obj.get('totalRecords')
+        count_source = "Backend Summary Payload"
+    elif isinstance(meta_obj, dict) and ('total' in meta_obj or 'count' in meta_obj or 'totalRecords' in meta_obj):
+        b_count_val = meta_obj.get('total') or meta_obj.get('count') or meta_obj.get('totalRecords')
+        count_source = "Backend Metadata"
+    elif 'count' in api_data or 'totalRecords' in api_data or 'total' in api_data:
+        b_count_val = api_data.get('count') or api_data.get('totalRecords') or api_data.get('total')
+        count_source = "Backend Aggregate Fields"
+
+    if b_count_val not in (None, "", "null") and not is_sql_fallback:
+        selected_projects = int(b_count_val)
+    else:
+        selected_projects = calc_projects
+
+    print(
+        f"[METRIC RESOLVER DEBUG]\n"
+        f"Metric Name: Project Count\n"
+        f"Metric Source: {count_source if b_count_val is not None else 'Row Calculation (Fallback)'}\n"
+        f"Backend Value: {b_count_val}\n"
+        f"Calculated Value: {calc_projects}\n"
+        f"Selected Value: {selected_projects}\n"
+    )
+
+    # --- 2. TOTAL APPROVED FEES / ESTIMATED COST ---
+    calc_est_cost = sum(float(r.get('estimated_cost') or r.get('approved_fees') or 0) for r in normalised_rows)
+    b_est_val = None
+    est_source = "Row Calculation (Fallback)"
+
+    if isinstance(summary_obj, dict) and ('total_approved_fees' in summary_obj or 'totalApprovedFees' in summary_obj or 'total_estimated_cost' in summary_obj):
+        b_est_val = summary_obj.get('total_approved_fees') or summary_obj.get('totalApprovedFees') or summary_obj.get('total_estimated_cost')
+        est_source = "Backend Summary Payload"
+    elif 'totalApprovedFees' in api_data or 'approvedFees' in api_data or 'total_estimated_cost' in api_data:
+        b_est_val = api_data.get('totalApprovedFees') or api_data.get('approvedFees') or api_data.get('total_estimated_cost')
+        est_source = "Backend Aggregate Fields"
+
+    if b_est_val not in (None, "", "null") and not is_sql_fallback:
+        selected_est_cost = round(float(b_est_val), 2)
+    else:
+        selected_est_cost = round(calc_est_cost, 2)
+
+    print(
+        f"[METRIC RESOLVER DEBUG]\n"
+        f"Metric Name: Total Approved Fees\n"
+        f"Metric Source: {est_source if b_est_val is not None else 'Row Calculation (Fallback)'}\n"
+        f"Backend Value: {b_est_val}\n"
+        f"Calculated Value: {calc_est_cost:.2f}\n"
+        f"Selected Value: {selected_est_cost:.2f}\n"
+    )
+
+    # --- 3. TOTAL ACTUAL COST ---
+    calc_act_cost = sum(float(r.get('total_actual_cost') or r.get('actualCost') or 0) for r in normalised_rows)
+    b_act_val = None
+    act_source = "Row Calculation (Fallback)"
+
+    if isinstance(summary_obj, dict) and ('total_actual_cost' in summary_obj or 'totalActualCost' in summary_obj):
+        b_act_val = summary_obj.get('total_actual_cost') or summary_obj.get('totalActualCost')
+        act_source = "Backend Summary Payload"
+    elif 'totalActualCost' in api_data or 'actualCost' in api_data or 'total_actual_cost' in api_data:
+        b_act_val = api_data.get('totalActualCost') or api_data.get('actualCost') or api_data.get('total_actual_cost')
+        act_source = "Backend Aggregate Fields"
+
+    if b_act_val not in (None, "", "null") and not is_sql_fallback:
+        selected_act_cost = round(float(b_act_val), 2)
+    else:
+        selected_act_cost = round(calc_act_cost, 2)
+
+    print(
+        f"[METRIC RESOLVER DEBUG]\n"
+        f"Metric Name: Total Actual Cost\n"
+        f"Metric Source: {act_source if b_act_val is not None else 'Row Calculation (Fallback)'}\n"
+        f"Backend Value: {b_act_val}\n"
+        f"Calculated Value: {calc_act_cost:.2f}\n"
+        f"Selected Value: {selected_act_cost:.2f}\n"
+    )
+
+    # --- 4. PORTFOLIO RECOVERABILITY ---
+    # Formula per Backend Business Rule: (Total Approved Fees / Total Actual Cost) * 100
+    calc_rec_pct = round((selected_est_cost / selected_act_cost * 100), 2) if selected_act_cost > 0 else 0.0
+    b_rec_val = None
+    rec_source = "Backend Ratio Formula"
+
+    if isinstance(summary_obj, dict) and ('total_actual_recoverability_percentage' in summary_obj or 'actual_recoverability' in summary_obj or 'recoverability' in summary_obj):
+        b_rec_val = summary_obj.get('total_actual_recoverability_percentage') or summary_obj.get('actual_recoverability') or summary_obj.get('recoverability')
+        rec_source = "Backend Summary Payload"
+    elif 'totalActualRecoverability' in api_data or 'recoverabilityPercentage' in api_data or 'overallRecoverability' in api_data:
+        b_rec_val = api_data.get('totalActualRecoverability') or api_data.get('recoverabilityPercentage') or api_data.get('overallRecoverability')
+        rec_source = "Backend Aggregate Fields"
+
+    if b_rec_val not in (None, "", "null") and not is_sql_fallback:
+        selected_rec_pct = round(float(b_rec_val), 2)
+    else:
+        selected_rec_pct = calc_rec_pct
+
+    print(
+        f"[METRIC RESOLVER DEBUG]\n"
+        f"Metric Name: Portfolio Recoverability\n"
+        f"Metric Source: {rec_source if b_rec_val is not None else 'Backend Ratio Formula'}\n"
+        f"Backend Value: {b_rec_val}\n"
+        f"Calculated Value: {calc_rec_pct:.2f}%\n"
+        f"Selected Value: {selected_rec_pct:.2f}%\n"
+    )
+
+    return {
+        "total_projects": selected_projects,
+        "total_estimated_cost": selected_est_cost,
+        "total_actual_cost": selected_act_cost,
+        "total_actual_recoverability_percentage": selected_rec_pct,
+        "actual_recoverability_pct": selected_rec_pct,
+        "portfolio_recoverability_pct": selected_rec_pct,
+        "source": "CRM_DATABASE_SQL" if is_sql_fallback else "CRM_API_RECOVERABILITY_REPORT"
+    }
+
 @tool
 async def get_project_recoverability_report(
     start_date: Optional[str] = None,
@@ -1398,12 +1469,23 @@ async def get_project_recoverability_report(
         user_tier: The Tier level of the logged-in user (1=SuperAdmin, 2=Management, 3=Partner, etc).
     """
     try:
+        # Sanitize aggregate sentinels (e.g. __ALL__, ALL -> None) so company-wide queries are not over-filtered
+        def _clean_sentinel(val):
+            if val and str(val).strip().upper() in ("__ALL__", "ALL", "NONE", "NULL", "ANY", "*", ""):
+                return None
+            return val
+
+        service_line = _clean_sentinel(service_line)
+        customer_name = _clean_sentinel(customer_name)
+        project_name = _clean_sentinel(project_name)
+        incharge_employee = _clean_sentinel(incharge_employee)
+
         employee_id, user_tier = _resolve_rbac_params(employee_id, user_tier)
         fy_info = get_fiscal_info()
         start_date = start_date or fy_info['fy_start']
         end_date = end_date or fy_info['fy_end']
 
-        ownership_sql = _build_ownership_sql(employee_id, user_tier, "p", True, "incharge", "service_line_id")
+        ownership_sql = _build_ownership_sql(employee_id, user_tier, "p", True, "main_incharge", "service_line_id")
 
         customer_filter = f" AND c.customer_name LIKE '%{customer_name}%'" if customer_name else ""
         project_filter = f" AND p.name LIKE '%{project_name}%'" if project_name else ""
@@ -1411,11 +1493,10 @@ async def get_project_recoverability_report(
         incharge_filter = f" AND e.employee_name LIKE '%{incharge_employee}%'" if incharge_employee else ""
 
         # PRIMARY PATH: Call the CRM's own /reports/project-recoverability-report API
-        # (same endpoint the CRM report page uses, confirmed from browser DevTools).
-        # This guarantees 100% data parity with the CRM UI.
         if _CRM_AUTH_TOKEN:
             try:
                 import urllib.parse
+
                 safe_start = urllib.parse.quote(str(start_date))
                 safe_end = urllib.parse.quote(str(end_date))
 
@@ -1425,7 +1506,6 @@ async def get_project_recoverability_report(
                     f"&start_date={safe_start}&end_date={safe_end}"
                 )
                 print(f"[AI DEBUG] Recoverability report URL: {rec_url}")
-                print(f"[AI DEBUG] Auth token present: {bool(_CRM_AUTH_TOKEN)}, length: {len(_CRM_AUTH_TOKEN) if _CRM_AUTH_TOKEN else 0}")
                 if customer_name:
                     rec_url += f"&customerName={urllib.parse.quote(customer_name)}"
                 if project_name:
@@ -1439,23 +1519,16 @@ async def get_project_recoverability_report(
                 })
 
                 def _fetch_rec():
-                    with urllib.request.urlopen(req, timeout=15) as resp:
+                    with urllib.request.urlopen(req, timeout=3.0) as resp:
                         return json.loads(resp.read())
 
                 api_raw = await asyncio.to_thread(_fetch_rec)
                 api_data = api_raw.get('data', api_raw)
 
-                # Normalise the rows — the API may return { rows: [...], count: N } or a plain list
                 rows = api_data.get("rows", []) if isinstance(api_data, dict) else api_data
                 if not isinstance(rows, list): rows = []
-                
-                # Use the exact logic from the CRM UI
-                total_projects = int(api_data.get("count", len(rows))) if isinstance(api_data, dict) else len(rows)
 
-                # The API row shape can vary — normalise field names
                 normalised_rows = []
-                total_estimated_cost = 0.0
-                total_actual_cost = 0.0
 
                 for r in rows:
                     def extract_deep(d, target_keys):
@@ -1510,12 +1583,16 @@ async def get_project_recoverability_report(
                         r.get('recoverability') or p_detail.get('recoverability') or 
                         r.get('estimatedRecoverability') or r.get('estimated_recoverability') or 0
                     )
-                    act_rec = round((est / act) * 100, 3) if act > 0 else 0.0
+                    
+                    raw_act_rec = r.get('actualRecoverability') or r.get('actual_recoverability') or r.get('actual_recoverability_percentage')
+                    if raw_act_rec not in (None, "", "N/A", "null"):
+                        try:
+                            act_rec = round(float(raw_act_rec), 2)
+                        except Exception:
+                            act_rec = round((est / act) * 100, 2) if act > 0 else 0.0
+                    else:
+                        act_rec = round((est / act) * 100, 2) if act > 0 else 0.0
 
-                    total_estimated_cost += est
-                    total_actual_cost += act
-
-                    # Extract the missing fields
                     r_customer_group = extract_deep(r, ['customerGroup', 'groupName']) or ""
                     if isinstance(r_customer_group, dict): r_customer_group = r_customer_group.get('name') or ""
                     
@@ -1525,16 +1602,13 @@ async def get_project_recoverability_report(
                     r_end_date = r.get('end_date') or r.get('endDate') or ""
                     if r_end_date and 'T' in str(r_end_date): r_end_date = str(r_end_date).split('T')[0]
                     
-                    # Project Partner
                     r_partner = extract_deep(r, ['partnerInventory', 'projectPartner', 'partner']) or ""
                     if isinstance(r_partner, dict): r_partner = r_partner.get('employee_name') or r_partner.get('name') or ""
-                    elif isinstance(r_partner, int): r_partner = str(r_partner) # fallback if ID
+                    elif isinstance(r_partner, int): r_partner = str(r_partner)
                     
-                    # Customer Relation
                     r_cust_relation = extract_deep(r, ['clientRelation', 'customerRelation', 'client_relation']) or ""
                     if isinstance(r_cust_relation, dict): r_cust_relation = r_cust_relation.get('employee_name') or r_cust_relation.get('name') or ""
                     
-                    # Project Status
                     r_status = extract_deep(r, ['projectStatus', 'status']) or ""
                     if isinstance(r_status, dict): r_status = r_status.get('name') or ""
                     elif r.get('statusName'): r_status = r.get('statusName')
@@ -1563,15 +1637,9 @@ async def get_project_recoverability_report(
                         "actual_recoverability": act_rec,
                     })
 
-                total_projects = len(normalised_rows)
+                summary = _resolve_summary_metrics(api_raw, normalised_rows, is_sql_fallback=False)
 
-                valid_recoverabilities = [r['actual_recoverability'] for r in normalised_rows if r.get('actual_recoverability', 0) > 0]
-                total_actual_recoverability = (
-                    round(sum(valid_recoverabilities) / len(valid_recoverabilities), 3)
-                    if valid_recoverabilities else 0.0
-                )
-
-                if total_projects == 0:
+                if summary["total_projects"] == 0:
                     return json.dumps({
                         "summary": {
                             "total_projects": 0,
@@ -1582,14 +1650,7 @@ async def get_project_recoverability_report(
                     })
 
                 return json.dumps({
-                    "summary": {
-                        "total_projects": total_projects,
-                        "total_estimated_cost": round(total_estimated_cost, 2),
-                        "total_actual_cost": round(total_actual_cost, 2),
-                        "total_actual_recoverability_percentage": total_actual_recoverability,
-                        "note": "Recoverability = Average of Actual Recoverability for projects for logged work hours. ",
-                        "source": "CRM_API_RECOVERABILITY_REPORT"
-                    },
+                    "summary": summary,
                     "projects": normalised_rows,
                     "date_range": {"start": start_date, "end": end_date}
                 }, default=str)
@@ -1623,18 +1684,18 @@ async def get_project_recoverability_report(
             LEFT JOIN customers c ON p.client = c.id
             LEFT JOIN m_group grp ON c.cust_group_id = grp.id
             LEFT JOIN m_serviceline sl ON p.service_line_id = sl.id
-            LEFT JOIN employees e ON p.incharge = e.id
+            LEFT JOIN employees e ON p.main_incharge = e.id
             LEFT JOIN employees cr ON c.cust_client_rel_id = cr.id
             LEFT JOIN employees pp ON p.partner = pp.id
-            LEFT JOIN m_status ps ON p.status_id = ps.id
+            LEFT JOIN m_project_status ps ON p.status_id = ps.id
             LEFT JOIN proposal pr ON p.id = (
                 SELECT id FROM proposal WHERE project_id = p.id ORDER BY id DESC LIMIT 1
             )
             LEFT JOIN timesheet_project tp ON p.id = tp.project_id
             LEFT JOIN employees te ON tp.employee_id = te.id
-            LEFT JOIN m_designation_rates dr ON te.emp_designation_id = dr.designation_id
+            LEFT JOIN designation_rates dr ON te.emp_designation_id = dr.designation_id
             WHERE p.is_active = 1
-              AND p.created_at BETWEEN '{start_date}' AND '{end_date}'
+              AND p.created_at BETWEEN '{start_date} 00:00:00' AND '{end_date} 23:59:59'
               AND {ownership_sql}
               {customer_filter}
               {project_filter}
@@ -1647,28 +1708,18 @@ async def get_project_recoverability_report(
 
         rows = await _run_query(query)
 
-        # Compute actual recoverability for each row and aggregates
-        total_estimated_cost = 0.0
-        total_actual_cost = 0.0
-
         for r in rows:
             est_cost = float(r.get('estimated_cost') or 0)
             act_cost = float(r.get('total_actual_cost') or 0)
-            total_estimated_cost += est_cost
-            total_actual_cost += act_cost
             
             if act_cost > 0:
                 r['actual_recoverability'] = round((est_cost / act_cost) * 100, 3)
             else:
                 r['actual_recoverability'] = 0.0
 
-        valid_recoverabilities = [r['actual_recoverability'] for r in rows if r.get('actual_recoverability', 0) > 0]
-        if valid_recoverabilities:
-            total_actual_recoverability = round(sum(valid_recoverabilities) / len(valid_recoverabilities), 3)
-        else:
-            total_actual_recoverability = 0.0
+        summary = _resolve_summary_metrics(rows, rows, is_sql_fallback=True)
 
-        if len(rows) == 0:
+        if summary["total_projects"] == 0:
             return json.dumps({
                 "summary": {
                     "total_projects": 0,
@@ -1679,13 +1730,7 @@ async def get_project_recoverability_report(
             })
 
         return json.dumps({
-            "summary": {
-                "total_projects": len(rows),
-                "total_estimated_cost": round(total_estimated_cost, 2),
-                "total_actual_cost": round(total_actual_cost, 2),
-                "total_actual_recoverability_percentage": total_actual_recoverability,
-                "note": "Recoverability = Average of Actual Recoverability for projects with actual cost > 0 (SQL fallback)"
-            },
+            "summary": summary,
             "projects": rows,
             "date_range": {"start": start_date, "end": end_date}
         }, default=str)
@@ -1824,14 +1869,303 @@ async def get_staff_billing_report(
                     "date_range": {"start": start_date, "end": end_date}
                 }, default=str)
             except Exception as e:
-                print(f"[AI WARN] API /staff-billing-report failed: {e}")
-                # Fallback to empty string to trigger SQL or error
-                pass
-        
-        return json.dumps({"error": "Unable to connect to CRM API for Staff Billing."})
+                print(f"[AI WARN] API /staff-billing-report failed ({type(e).__name__}): {e}. Falling back to SQL.")
+                # Fall through to SQL fallback below
+
+        # -----------------------------------------------------------------------
+        # SQL FALLBACK: Compute staff billing metrics directly from the database
+        # Used when the backend REST endpoint is unavailable or returns an error
+        # (e.g., requires department_id that is not injected by the AI service).
+        # -----------------------------------------------------------------------
+        ownership_sql = _build_ownership_sql(employee_id, user_tier, "p", True, "main_incharge", "service_line_id")
+
+        billing_summary_q = f"""
+            SELECT
+                COUNT(DISTINCT p.id)                                 AS total_projects,
+                ROUND(COALESCE(SUM(p.approved_fees), 0), 2)         AS total_approved_fees,
+                ROUND(COALESCE(SUM(inv.total_amt_ex_vat), 0), 2)    AS total_invoiced,
+                COUNT(DISTINCT tp.employee_id)                       AS total_employees_billed
+            FROM projects p
+            LEFT JOIN invoice inv
+              ON inv.project_id = p.id
+             AND inv.is_active = 1
+             AND inv.created_at BETWEEN '{start_date}' AND '{end_date}'
+            LEFT JOIN timesheet_project tp
+              ON tp.project_id = p.id
+             AND tp.created_at BETWEEN '{start_date}' AND '{end_date}'
+            WHERE p.is_active = 1
+              AND p.created_at BETWEEN '{start_date}' AND '{end_date}'
+              AND {ownership_sql}
+        """
+
+        # Per-employee billing breakdown (top 20 by approved fees on their projects)
+        billing_detail_q = f"""
+            SELECT
+                e.employee_name,
+                COUNT(DISTINCT tp.project_id)                         AS project_count,
+                ROUND(SUM(p.approved_fees), 2)                        AS total_approved_fees,
+                sl.name                                               AS service_line
+            FROM timesheet_project tp
+            JOIN employees e   ON tp.employee_id = e.id
+            JOIN projects p    ON tp.project_id  = p.id
+            LEFT JOIN m_serviceline sl ON p.service_line_id = sl.id
+            WHERE tp.created_at BETWEEN '{start_date}' AND '{end_date}'
+              AND p.is_active = 1
+              AND {ownership_sql}
+            GROUP BY e.id, e.employee_name, sl.name
+            ORDER BY total_approved_fees DESC
+            LIMIT 20
+        """
+
+        summary_rows, detail_rows = await asyncio.gather(
+            _run_query(billing_summary_q),
+            _run_query(billing_detail_q),
+        )
+
+        summary = summary_rows[0] if summary_rows else {}
+        return json.dumps({
+            "summary": {
+                "total_projects":        int(summary.get("total_projects") or 0),
+                "total_approved_fees":   float(summary.get("total_approved_fees") or 0),
+                "total_invoiced":        float(summary.get("total_invoiced") or 0),
+                "total_employees_billed": int(summary.get("total_employees_billed") or 0),
+                "note": "Staff billing summary computed from internal database (direct SQL)."
+            },
+            "employees": detail_rows,
+            "date_range": {"start": start_date, "end": end_date}
+        }, default=str)
 
     except Exception as e:
         return f"Error retrieving staff billing report: {str(e)}"
+
+
+@tool
+async def get_kpi_summary_report(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    employee_id: int = None,
+    user_tier: int = None,
+    employee_name: Optional[str] = None,
+    service_line: Optional[str] = None,
+    service_line_id: Optional[Any] = None,
+    department_id: Optional[Any] = None,
+    jwt_token: Optional[str] = None,
+    **kwargs
+) -> str:
+    """Useful for answering questions about KPI Summary Report, KPI target vs actuals, GP performance, and firm-wide executive metrics.
+    Args:
+        start_date: Start of the period (defaults to CURRENT Fiscal Year start).
+        end_date: End of the period (defaults to CURRENT Fiscal Year end).
+        employee_id: The Employee ID of the logged-in user or requested employee.
+        user_tier: User tier level.
+        employee_name: Optional employee name filter.
+        service_line: Optional service line filter.
+        jwt_token: JWT bearer token of the active session.
+    """
+    try:
+        employee_id, user_tier = _resolve_rbac_params(employee_id, user_tier)
+        fy_info = get_fiscal_info()
+        start_date = start_date or fy_info['fy_start']
+        end_date = end_date or fy_info['fy_end']
+
+        if end_date and len(end_date) == 10:
+            end_date += " 23:59:59"
+
+        # Resolve employee_name to employee_id if provided
+        emp_name_val = employee_name
+        if employee_name and not employee_id:
+            try:
+                engine = get_db_engine()
+                with engine.connect() as conn:
+                    first_w = employee_name.strip().split()[0]
+                    emp_row = conn.execute(
+                        text("SELECT id, employee_name FROM employees WHERE LOWER(employee_name) LIKE :pattern OR LOWER(employee_name) LIKE :first LIMIT 1"),
+                        {"pattern": f"%{employee_name.lower().strip()}%", "first": f"%{first_w.lower().strip()}%"}
+                    ).fetchone()
+                    if emp_row:
+                        employee_id = emp_row[0]
+                        emp_name_val = emp_row[1]
+            except Exception as emp_err:
+                print(f"[AI WARN] Failed to resolve employee_name '{employee_name}': {emp_err}")
+
+        # 1. Primary Path: Call CRM backend /reports/kpi-summary-report API
+        auth_token = jwt_token or _CRM_AUTH_TOKEN
+        if auth_token:
+            try:
+                import urllib.parse
+                import urllib.request
+                clean_tok = str(auth_token).replace("Bearer ", "").replace("bearer ", "").strip()
+                safe_start = urllib.parse.quote(str(start_date.split()[0]))
+                safe_end = urllib.parse.quote(str(end_date.split()[0]))
+                url_params = [f"start_date={safe_start}", f"end_date={safe_end}"]
+                if employee_id:
+                    url_params.append(f"employee_id={employee_id}")
+                sl_val = service_line_id or service_line
+                if sl_val:
+                    url_params.append(f"service_line_id={urllib.parse.quote(str(sl_val))}")
+                if department_id:
+                    url_params.append(f"department_id={urllib.parse.quote(str(department_id))}")
+                
+                rec_url = f"{CRM_API_BASE}/reports/kpi-summary-report?" + "&".join(url_params)
+
+                req = urllib.request.Request(rec_url, headers={
+                    'Authorization': f'Bearer {clean_tok}',
+                    'Content-Type': 'application/json'
+                })
+
+                def _fetch():
+                    with urllib.request.urlopen(req, timeout=25.0) as resp:
+                        return json.loads(resp.read())
+
+                api_raw = await asyncio.to_thread(_fetch)
+                if api_raw and (isinstance(api_raw, dict) or isinstance(api_raw, list)):
+                    raw_dict = api_raw.get("data") if isinstance(api_raw, dict) and isinstance(api_raw.get("data"), dict) else (api_raw if isinstance(api_raw, dict) else {})
+                    r_cnt = len(raw_dict.get("rows") or []) if isinstance(raw_dict, dict) else 0
+                    print(f"\n=============================================================")
+                    print(f"[GET_KPI_SUMMARY_REPORT WRAPPER RETURN]")
+                    print(f"EXACT API_RAW KEYS: {list(api_raw.keys()) if isinstance(api_raw, dict) else []}")
+                    print(f"EXACT RAW_DATA KEYS: {list(raw_dict.keys()) if isinstance(raw_dict, dict) else []}")
+                    print(f"ROWS COUNT: {r_cnt}")
+                    print(f"=============================================================\n")
+                    import logging
+                    logging.getLogger("uvicorn").info(f"[GET_KPI_SUMMARY_REPORT WRAPPER RETURN] keys={list(raw_dict.keys()) if isinstance(raw_dict, dict) else []} rows_count={r_cnt}")
+                    return json.dumps(api_raw, default=str)
+            except Exception as api_err:
+                import traceback
+                print(f"[AI WARN] API /reports/kpi-summary-report failed: {api_err}. Traceback: {traceback.format_exc()}. Falling back to SQL.")
+
+        # 2. SQL Fallback: Compute KPI summary metrics directly from database
+        emp_name_val = employee_name
+        if employee_id:
+            try:
+                engine = get_db_engine()
+                with engine.connect() as conn:
+                    emp_row = conn.execute(text("SELECT employee_name FROM employees WHERE id = :id"), {"id": employee_id}).fetchone()
+                    if emp_row and emp_row[0]:
+                        emp_name_val = emp_row[0]
+            except Exception:
+                pass
+
+        if employee_id:
+            # Employee-specific KPI resolution
+            t_res, inv_res, prop_res, proj_res, proj_breakdown = await asyncio.gather(
+                _run_query(f"SELECT COALESCE(SUM(target_value), 0) AS target_rev, COALESCE(SUM(target_gp), 0) AS target_gp FROM kpi_master WHERE employee_id = {employee_id} AND is_active = 1"),
+                _run_query(f"SELECT COALESCE(SUM(total_amt_ex_vat), 0) AS total_inv FROM invoice WHERE (created_by = {employee_id} OR project_in_charge_id = {employee_id}) AND is_active = 1 AND created_at BETWEEN '{start_date}' AND '{end_date}'"),
+                _run_query(f"SELECT COUNT(id) AS total_count, COALESCE(SUM(proposed_fees), 0) AS total_budget FROM proposal WHERE created_by = {employee_id} AND is_active = 1 AND created_at BETWEEN '{start_date}' AND '{end_date}'"),
+                _run_query(f"SELECT COUNT(id) AS total_projects FROM projects WHERE (main_incharge = {employee_id} OR partner = {employee_id} OR created_by = {employee_id}) AND is_active = 1"),
+                _run_query(f"SELECT ps.name AS status_name, COUNT(p.id) AS count FROM m_project_status ps LEFT JOIN projects p ON p.status_id = ps.id AND p.is_active = 1 AND (p.main_incharge = {employee_id} OR p.partner = {employee_id} OR p.created_by = {employee_id}) GROUP BY ps.id, ps.name")
+            )
+
+            target_rev = float(t_res[0].get('target_rev', 0)) if t_res else 0.0
+            target_gp = float(t_res[0].get('target_gp', 0)) if t_res else 0.0
+            invoiced_rev = float(inv_res[0].get('total_inv', 0)) if inv_res else 0.0
+            prop_count = int(prop_res[0].get('total_count', 0)) if prop_res else 0
+            prop_budget = float(prop_res[0].get('total_budget', 0)) if prop_res else 0.0
+            total_proj_count = int(proj_res[0].get('total_projects', 0)) if proj_res else 0
+            active_proj_count = next((int(r.get('count', 0)) for r in proj_breakdown if r.get('status_name') == 'In Progress'), 0)
+            variance_rev = round(invoiced_rev - target_rev, 2)
+            variance_gp = round(0.0 - target_gp, 2)
+            balance_to_achieve = round(target_rev - invoiced_rev, 2)
+
+            total_row = {
+                "month": "Total",
+                "total_invoice_amount": str(invoiced_rev),
+                "total_credit_amount": "0.000",
+                "total_invoice_amount_with_credit": str(invoiced_rev),
+                "target_value": str(target_rev),
+                "target_all_value": str(target_rev),
+                "target_gp": str(target_gp),
+                "variance": str(variance_rev),
+                "variance_gp": str(variance_gp),
+                "budget_vs_actual_gp_percent": variance_gp,
+                "budget_vs_actual_revenu": variance_rev,
+                "total_projects": total_proj_count,
+                "total_proposals": prop_count
+            }
+
+            return json.dumps({
+                "report_type": "kpi_summary",
+                "employee_id": employee_id,
+                "employee_name": emp_name_val or f"Employee #{employee_id}",
+                "date_range": {"start": start_date, "end": end_date},
+                "rows": [total_row],
+                "count": 1,
+                "total_proposals": prop_count,
+                "proposals_all": prop_count,
+                "total_projects": total_proj_count,
+                "project_all": total_proj_count,
+                "open_sales_lead": 0,
+                "open_sales_lead_count": 0,
+                "secured_business": round(invoiced_rev, 2),
+                "balance_to_achieve": balance_to_achieve,
+                "variance": variance_rev,
+                "variance_gp": variance_gp,
+                "summary": {
+                    "employee_id": employee_id,
+                    "employee_name": emp_name_val or f"Employee #{employee_id}",
+                    "is_organization_aggregate": False,
+                    "total_kpi_target": round(target_rev, 2),
+                    "target_gp": round(target_gp, 2),
+                    "secured_business": round(invoiced_rev, 2),
+                    "balance_to_achieve": balance_to_achieve,
+                    "total_proposals": prop_count,
+                    "total_proposal_value": round(prop_budget, 2),
+                    "total_projects": total_proj_count,
+                    "strictly_active_projects_count": active_proj_count,
+                    "note": f"KPI summary report computed specifically for {emp_name_val or employee_id}."
+                },
+                "projects_by_status": proj_breakdown
+            }, default=str)
+
+        # Organization-wide KPI summary
+        ownership_sql = _build_ownership_sql(None, user_tier, "p", True, "main_incharge")
+        proj_q = f"""
+            SELECT ps.name AS status_name, COUNT(p.id) AS count
+            FROM m_project_status ps
+            LEFT JOIN projects p ON p.status_id = ps.id AND p.is_active = 1 AND p.created_at BETWEEN '{start_date}' AND '{end_date}' AND {ownership_sql}
+            GROUP BY ps.id, ps.name
+        """
+        
+        kpi_perf_q = f"""
+            SELECT sl.name, sl.short_code, 
+                   ROUND(COALESCE(SUM(i.total_amt_ex_vat), 0), 2) AS performing, 
+                   COALESCE((SELECT ROUND(SUM(km.target_value), 2) FROM kpi_master km JOIN serviceline_department sd ON km.department_id = sd.department_id WHERE sd.serviceline_id = sl.id), 0) AS target 
+            FROM m_serviceline sl 
+            LEFT JOIN invoice i ON i.service_line_id = sl.id AND i.is_active = 1 AND i.created_at BETWEEN '{start_date}' AND '{end_date}' 
+            WHERE sl.is_active = 1 
+            GROUP BY sl.id, sl.name, sl.short_code 
+            HAVING performing > 0 OR target > 0
+        """
+
+        proj_breakdown, kpi_perf = await asyncio.gather(
+            _run_query(proj_q),
+            _run_query(kpi_perf_q)
+        )
+
+        active_count = next((r['count'] for r in proj_breakdown if r.get('status_name') == 'In Progress'), 0)
+        total_projects = sum(r.get('count', 0) for r in proj_breakdown)
+        total_performing = sum(float(r.get('performing', 0)) for r in kpi_perf)
+        total_target = sum(float(r.get('target', 0)) for r in kpi_perf)
+        variance = round(total_performing - total_target, 2)
+
+        return json.dumps({
+            "report_type": "kpi_summary",
+            "summary": {
+                "is_organization_aggregate": True,
+                "strictly_active_projects_count": active_count,
+                "total_projects_all_statuses_combined": total_projects,
+                "total_performing_revenue": round(total_performing, 2),
+                "total_kpi_target": round(total_target, 2),
+                "variance": variance,
+                "note": "KPI summary report computed for entire organization."
+            },
+            "projects_by_status": proj_breakdown,
+            "gp_performance": kpi_perf,
+            "date_range": {"start": start_date, "end": end_date}
+        }, default=str)
+    except Exception as e:
+        return json.dumps({"error": f"Error retrieving KPI summary report: {str(e)}"})
+
 
 # A list of all semantic tools to easily bind to the LangChain agent
 ALL_SEMANTIC_TOOLS = [
@@ -1844,4 +2178,6 @@ ALL_SEMANTIC_TOOLS = [
     get_total_estimation_report,
     get_project_recoverability_report,
     get_staff_billing_report,
+    get_kpi_summary_report,
 ]
+

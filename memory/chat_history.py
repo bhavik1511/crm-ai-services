@@ -127,23 +127,47 @@ async def get_session_history(
 # Delete user history
 # ---------------------------------------------------------------------------
 async def delete_user_history(
-    user_id: int, session_id: Optional[str] = None
+    user_id: int,
+    session_id: Optional[str] = None,
+    entry_id: Optional[str] = None,
+    clear_all: bool = False
 ) -> int:
     """
-    Delete chat history entries.
-    - If session_id provided: delete only that session's entries for user_id.
-    - If no session_id: delete ALL records for user_id.
+    Delete chat history entries safely.
+    - If entry_id provided: delete only that single document by ObjectId.
+    - If session_id provided: delete only that specific session's entries for user_id.
+    - If clear_all=True: delete ALL records for user_id.
+    - If invalid or empty session_id/entry_id and clear_all=False: safety guard aborts and returns 0.
     Returns count of deleted documents.
     """
-    query: dict = {"user_id": user_id}
-    if session_id:
-        query["session_id"] = session_id
+    # Sanitize inputs against stringified "null", "undefined", "none", or empty strings
+    if session_id and str(session_id).strip().lower() in ("none", "null", "undefined", ""):
+        session_id = None
+    if entry_id and str(entry_id).strip().lower() in ("none", "null", "undefined", ""):
+        entry_id = None
+
+    if entry_id:
+        from bson import ObjectId
+        try:
+            query: dict = {"user_id": user_id, "_id": ObjectId(entry_id)}
+        except Exception:
+            logger.warning(f"[ChatHistory Guard] Invalid ObjectId format for entry_id={entry_id}")
+            return 0
+    elif session_id:
+        query: dict = {"user_id": user_id, "session_id": str(session_id).strip()}
+    elif clear_all:
+        query: dict = {"user_id": user_id}
+    else:
+        logger.warning(
+            f"[ChatHistory Guard] delete_user_history invoked without valid session_id, entry_id, or clear_all=True for user_id={user_id}. Aborting to prevent full deletion."
+        )
+        return 0
 
     col = get_chat_history_collection()
     result = await col.delete_many(query)
 
     logger.info(
-        f"[ChatHistory] Deleted {result.deleted_count} entries for "
-        f"user_id={user_id}" + (f", session={session_id}" if session_id else "")
+        f"[ChatHistory] Deleted {result.deleted_count} entries for user_id={user_id}"
+        + (f", entry_id={entry_id}" if entry_id else (f", session={session_id}" if session_id else " (ALL history)"))
     )
     return result.deleted_count

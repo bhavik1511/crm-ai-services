@@ -63,88 +63,149 @@ def _is_company_name(name: str) -> bool:
 _MONTH_NAMES_SET = {'january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december', 'jan', 'feb', 'mar', 'apr', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'}
 _MONTH_NAMES_DICT = {'jan':1,'feb':2,'mar':3,'apr':4,'may':5,'jun':6, 'jul':7,'aug':8,'sep':9,'oct':10,'nov':11,'dec':12}
 
+KNOWN_SERVICE_LINES = {
+    "audit", "tax", "advisory", "consulting", "deals", "strategy", 
+    "risk advisory", "financial advisory", "accounting", "legal", 
+    "technology", "assurance", "corporate finance",
+    "tech", "brs", "bps", "a&a", "growth", "growth advisory"
+}
+
+def _extract_service_line_name(question: str) -> str:
+    """Extracts known service line names from question text."""
+    if not question:
+        return ""
+    q_lower = question.lower()
+    for sl in KNOWN_SERVICE_LINES:
+        pattern = r'\b' + re.escape(sl) + r'\b'
+        if re.search(pattern, q_lower):
+            return sl.title()
+    return ""
+
+_TEMPORAL_NOISE_REGEX = re.compile(
+    r'\b('
+    r'report|summary|kpi|data|details?|active|projects?|invoices?|proposals?|'
+    r'for|in|on|during|since|from|to|until|last|next|this|current|year|month|quarter|'
+    r'fy|financial|fiscal|20\d\d|q[1-4]|ytd|year\s*to\s*date|'
+    r'january|february|march|april|may|june|july|august|september|october|november|december|'
+    r'jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec|'
+    r'please|download|show|give|button|thanks|ok|okay|tell|can\s+you'
+    r')\b.*$',
+    re.IGNORECASE
+)
+
+def _clean_entity_candidate(candidate: str) -> str:
+    """Strips articles, leading/trailing punctuation, and trailing temporal noise/prepositions from candidate entity names."""
+    if not candidate:
+        return ""
+    cleaned = re.sub(r'^(the|a|an)\s+', '', candidate, flags=re.IGNORECASE).strip()
+    cleaned = _TEMPORAL_NOISE_REGEX.sub('', cleaned).strip()
+    cleaned = re.sub(r'[^a-zA-Z0-9\s]', '', cleaned).strip()
+    return cleaned
+
 def _extract_person_name(question: str) -> str:
+    """Extracts person name (from possessives, 'for X', 'of X', 'KPI for X', etc.)."""
+    if not question:
+        return ""
+
+    q_lower = question.lower()
+    if "gp" in q_lower or "gross profit" in q_lower or "gp_performance" in q_lower:
+        if not any(kw in q_lower for kw in ["employee", "staff", "consultant", "resource", "developer", "manager", "partner"]):
+            return ""
+
+    # 0. Possessive pattern (e.g., "Shashank's active projects", "Shashank Arya's KPI")
+    poss_m = re.search(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\'s\b', question)
+    if poss_m:
+        candidate = _clean_entity_candidate(poss_m.group(1))
+        if len(candidate) > 2 and candidate.lower() not in _MONTH_NAMES_SET and candidate.lower() not in KNOWN_SERVICE_LINES:
+            return candidate
+
+    from agent.entity_resolver import has_employee_trigger
+    if not has_employee_trigger(question):
+        return ""
     lines = question.strip().splitlines()
     if any(re.match(r'^\s*(Date Range|Financial Year|Service Line|Duration|Employee Name|Project Name)\s*:', l, re.IGNORECASE) for l in lines):
         question = lines[0] if lines else question
 
     m = _FOR_PATTERN.search(question)
     if m:
-        candidate = m.group(1).strip()
-        candidate = re.sub(r'^(the|a|an)\s+', '', candidate, flags=re.IGNORECASE).strip()
-        candidate = re.sub(r'\b(report|summary|data|details?|for|in|on|last|next|this|year|month|quarter|fy|20\d\d)\b.*$', '', candidate, flags=re.IGNORECASE).strip()
-        if len(candidate) > 2 and not _is_company_name(candidate) and candidate.lower() not in _MONTH_NAMES_SET:
+        candidate = _clean_entity_candidate(m.group(1))
+        if len(candidate) > 2 and not _is_company_name(candidate) and candidate.lower() not in _MONTH_NAMES_SET and candidate.lower() not in KNOWN_SERVICE_LINES:
             return candidate
 
     m = _OF_PATTERN.search(question)
     if m:
-        candidate = m.group(1).strip()
-        candidate = re.sub(r'^(the|a|an)\s+', '', candidate, flags=re.IGNORECASE).strip()
-        candidate = re.sub(r'\b(report|summary|data|details?|for|in|on|last|next|this|year|month|quarter|fy|20\d\d)\b.*$', '', candidate, flags=re.IGNORECASE).strip()
-        if len(candidate) > 2 and not _is_company_name(candidate) and candidate.lower() not in _MONTH_NAMES_SET:
+        candidate = _clean_entity_candidate(m.group(1))
+        if len(candidate) > 2 and not _is_company_name(candidate) and candidate.lower() not in _MONTH_NAMES_SET and candidate.lower() not in KNOWN_SERVICE_LINES:
             return candidate
     return ""
 
+def _extract_company_name(question: str) -> str:
+    """Extracts customer / company name from question text."""
+    if not question:
+        return ""
+
+    q_lower = question.lower()
+    if "gp" in q_lower or "gross profit" in q_lower or "gp_performance" in q_lower:
+        if not any(kw in q_lower for kw in ["customer", "client", "company", "account"]):
+            return ""
+
+    q = question.strip()
+
+    _STOP_WORDS = {'all', 'service line', 'department', 'last month', 'this month', 'last year', 'this year', 'active projects', 'projects', 'revenue', 'receivables'}
+
+    def _is_valid_customer_candidate(candidate: str) -> bool:
+        if not candidate or len(candidate) < 3:
+            return False
+        cand_lower = candidate.lower()
+        if cand_lower in _STOP_WORDS or cand_lower in _MONTH_NAMES_SET or cand_lower in KNOWN_SERVICE_LINES:
+            return False
+        from agent.entity_resolver import is_aggregate_value, is_reserved_business_term
+        if is_aggregate_value(candidate) or is_reserved_business_term(candidate):
+            return False
+        # If candidate matches an active employee in CRM database, it's an employee, NOT a customer
+        if _lookup_employee_by_name(candidate):
+            return False
+        return True
+
+    # 1. Pattern: 'does <Name> have/has' (e.g. 'how many active projects does Dr. Hasan Ali Radhi has')
+    m_does = re.search(r'\bdoes\s+([A-Za-z0-9\.\,\'\&\-\s]{3,40}?)\s+(?:have|has)\b', q, re.IGNORECASE)
+    if m_does:
+        candidate = _clean_entity_candidate(m_does.group(1))
+        if _is_valid_customer_candidate(candidate):
+            return candidate
+
+    # 2. Pattern: '<Name>\'s active projects/proposals/invoices/revenue'
+    m_poss = re.search(r'\b([A-Za-z0-9\.\,\&\-\s]{3,40})\'s\s+(?:active\s+)?(?:projects|proposals|invoices|revenue|receivables|details|summary|report)\b', q, re.IGNORECASE)
+    if m_poss:
+        candidate = _clean_entity_candidate(m_poss.group(1))
+        if _is_valid_customer_candidate(candidate):
+            return candidate
+    
+    # 3. Pattern: 'customer/client <Name>' or 'customer/client is <Name>'
+    m_cust = re.search(r'\b(?:customer|client)\s+(?:name\s+)?(?:is\s+)?([A-Za-z0-9\.\,\'\&\-\s]{3,40})', q, re.IGNORECASE)
+    if m_cust:
+        candidate = _clean_entity_candidate(m_cust.group(1))
+        if _is_valid_customer_candidate(candidate):
+            return candidate
+
+    # 4. Pattern: 'of <Name>' or 'for <Name>' (e.g., 'projects of Dr. Hasan Ali Radhi', 'active of Dr. Hasan Ali Radhi')
+    m_of = re.search(r'\b(?:of|for)\s+([A-Za-z0-9\.\,\'\&\-\s]{3,40})', q, re.IGNORECASE)
+    if m_of:
+        candidate = _clean_entity_candidate(m_of.group(1))
+        if _is_valid_customer_candidate(candidate):
+            return candidate
+
+    return ""
+
+
 def _extract_date_range(question: str) -> tuple[Optional[str], Optional[str], bool]:
-    q = question.lower()
-    from datetime import datetime
-    now = datetime.now()
-
-    dd_mm_range = re.search(r'(\d{2}-\d{2}-\d{4})\s+to\s+(\d{2}-\d{2}-\d{4})', q)
-    if dd_mm_range:
-        def _dmy_to_ymd(s: str) -> str:
-            d, m, y = s.split('-')
-            return f"{y}-{m}-{d}"
-        return _dmy_to_ymd(dd_mm_range.group(1)), _dmy_to_ymd(dd_mm_range.group(2)), True
-
-    range_m = re.search(r'(\d{4}[-/]\d{2}[-/]\d{2})\s+(?:to|until|-)\s+(\d{4}[-/]\d{2}[-/]\d{2})', q)
-    if range_m:
-        return range_m.group(1).replace('/', '-'), range_m.group(2).replace('/', '-'), True
-
-    month_m = re.search(
-        r'\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|'
-        r'jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)'
-        r'\s+(\d{4})\b', q)
-    month_no_year_m = re.search(
-        r'\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|'
-        r'jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b', q)
-
-    if month_m or month_no_year_m:
-        if month_m:
-            m_str = month_m.group(1)[:3]
-            y_val = int(month_m.group(2))
-        else:
-            m_str = month_no_year_m.group(1)[:3]
-            y_val = now.year
-        m_val = _MONTH_NAMES_DICT[m_str]
-        if not month_m and m_val > now.month:
-            y_val = now.year - 1
-        import calendar
-        last_day = calendar.monthrange(y_val, m_val)[1]
-        return f"{y_val}-{m_val:02d}-01", f"{y_val}-{m_val:02d}-{last_day:02d}", True
-
-    year_m = re.search(r'\b(20\d{2})\b', q)
-    if year_m:
-        yr = int(year_m.group(1))
-        return f"{yr}-10-01", f"{yr+1}-09-30", True
-
-    if 'last month' in q:
-        if now.month == 1:
-            return f"{now.year-1}-12-01", f"{now.year-1}-12-31", True
-        import calendar
-        m = now.month - 1
-        last = calendar.monthrange(now.year, m)[1]
-        return f"{now.year}-{m:02d}-01", f"{now.year}-{m:02d}-{last}", True
-
-    if any(x in q for x in ['this year', 'current year', 'fy', 'financial year', 'fiscal year']):
-        if now.month >= 10:
-            return f"{now.year}-10-01", f"{now.year+1}-09-30", True
-        else:
-            return f"{now.year-1}-10-01", f"{now.year}-09-30", True
-
-    if now.month >= 10:
-        return f"{now.year}-10-01", f"{now.year+1}-09-30", False
-    return f"{now.year-1}-10-01", f"{now.year}-09-30", False
+    """
+    Extract start_date and end_date from query text using universal canonical temporal resolver.
+    Guarantees 'current month' maps to current calendar month (start/end dates), not full FY.
+    """
+    from agent.temporal_resolver import resolve_temporal_scope
+    res = resolve_temporal_scope(question)
+    return res["start_date"], res["end_date"], res["is_explicit"]
 # ---------------------------------------------------------------------------
 # Typo / abbreviation normalizer — maps common CRM mistyping to canonical phrases
 # ---------------------------------------------------------------------------
@@ -263,14 +324,21 @@ def _lookup_employee_by_name(name: str) -> Optional[tuple[int, str]]:
         if not rows:
             return None
             
+        # Strip filler words & trailing non-alphanumeric noise from target name
+        cleaned_target = re.sub(r'\b(got\s+it|please|download|show|give|button|thanks|ok|okay|report|summary|kpi|the|a|an)\b.*$', '', name, flags=re.IGNORECASE).strip()
+        cleaned_target = re.sub(r'[^a-zA-Z0-9\s]', '', cleaned_target).strip()
+        if not cleaned_target:
+            cleaned_target = name.strip()
+
         # Map lowercased names to their actual data
         name_map = {str(r[1]).lower(): (int(r[0]), str(r[1])) for r in rows}
-        target_name = name.lower().strip()
+        target_name = cleaned_target.lower()
         
-        # 1. Exact match (case/space insensitive by stripping spaces)
+        # 1. Exact match (case/space insensitive by stripping spaces) — check BOTH directions
         target_no_spaces = target_name.replace(' ', '')
         for emp_name_lower, emp_data in name_map.items():
-            if target_no_spaces in emp_name_lower.replace(' ', ''):
+            emp_no_spaces = emp_name_lower.replace(' ', '')
+            if target_no_spaces in emp_no_spaces or emp_no_spaces in target_no_spaces:
                 return emp_data
                 
         # 2. Fuzzy match full name
@@ -292,6 +360,57 @@ def _lookup_employee_by_name(name: str) -> Optional[tuple[int, str]]:
     except Exception as e:
         logger.warning(f"[QueryParser] Employee lookup failed: {e}")
     return None
+
+
+def _lookup_customer_by_name(name: str) -> Optional[tuple[int, str]]:
+    """Lookup customer by name or code in CRM database."""
+    if not name or len(name) < 2:
+        return None
+    try:
+        from db.database import get_db_engine
+        from sqlalchemy import text
+        import difflib
+        
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(text("SELECT id, customer_name, cust_code FROM customers WHERE is_active = 1")).fetchall()
+            
+        if not rows:
+            return None
+            
+        cleaned_target = re.sub(r'\b(got\s+it|please|download|show|give|button|thanks|ok|okay|report|summary|the|a|an)\b.*$', '', name, flags=re.IGNORECASE).strip()
+        cleaned_target = re.sub(r'[^a-zA-Z0-9\s]', '', cleaned_target).strip()
+        if not cleaned_target:
+            cleaned_target = name.strip()
+
+        target_name = cleaned_target.lower()
+        target_no_spaces = target_name.replace(' ', '')
+        
+        name_map = {}
+        for r in rows:
+            c_id = int(r[0])
+            c_name = str(r[1]).strip() if r[1] else ""
+            c_code = str(r[2]).strip() if r[2] else ""
+            if c_name:
+                name_map[c_name.lower()] = (c_id, c_name)
+            if c_code:
+                name_map[c_code.lower()] = (c_id, c_name)
+
+        # 1. Substring / exact match
+        for cust_key, cust_data in name_map.items():
+            key_no_spaces = cust_key.replace(' ', '')
+            if target_no_spaces == key_no_spaces or target_no_spaces in key_no_spaces or key_no_spaces in target_no_spaces:
+                return cust_data
+
+        # 2. Fuzzy match
+        matches = difflib.get_close_matches(target_name, name_map.keys(), n=1, cutoff=0.7)
+        if matches:
+            return name_map[matches[0]]
+
+        return None
+    except Exception as e:
+        logger.warning(f"[QueryParser] Customer lookup failed: {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -524,7 +643,7 @@ LIMIT 1
 def _build_parser_llm():
     from config.llm_factory import get_llm
     import os
-    fast_model = os.getenv("FAST_MODEL", "llama-3.1-8b-instant")
+    fast_model = os.getenv("FAST_MODEL") or os.getenv("LLM_MODEL")
     return get_llm(model_name=fast_model, temperature=0.0)
 
 # ---------------------------------------------------------------------------
@@ -581,6 +700,15 @@ Example: "What is Bhavik's utilization?"
         intent.date_from = parsed.date_from or current_fy_start
         intent.date_to = parsed.date_to or current_fy_end
         intent.date_was_specified = parsed.date_was_specified
+
+        from agent.temporal_resolver import resolve_temporal_scope
+        temp_info = resolve_temporal_scope(question)
+        if temp_info.get("is_explicit"):
+            intent.date_from = temp_info["start_date"]
+            intent.date_to = temp_info["end_date"]
+            intent.date_was_specified = True
+            intent.extra["temporal_scope"] = temp_info["temporal_scope"]
+            intent.extra["financial_year"] = temp_info["financial_year"]
     except Exception as e:
         logger.error(f"[QueryParser] LLM extraction failed, falling back to legacy: {e}")
         # Extremely basic fallback
@@ -644,58 +772,68 @@ Example: "What is Bhavik's utilization?"
         "resource_utilization", "leave", "salary", "project_tasks", "project_summary", "kpi", "receivables", "revenue"
     }
     if intent.metric_type in employee_metrics and intent.entity_type == "employee":
-        name = intent.entity_name
-        if name:
-            intent.entity_type = "employee"
-            intent.entity_name = name
+        from agent.entity_resolver import has_employee_trigger
+        if not has_employee_trigger(question):
+            sl_cand = _extract_service_line_name(question)
+            if sl_cand:
+                intent.entity_type = "service_line"
+                intent.entity_name = sl_cand
+            else:
+                intent.entity_type = "general"
+                intent.entity_name = ""
+        else:
+            name = intent.entity_name
+            if name:
+                intent.entity_type = "employee"
+                intent.entity_name = name
 
-            # Verify in DB
-            result = _lookup_employee_by_name(name)
-            if result:
-                emp_id, emp_name = result
-                intent.entity_id    = emp_id
-                intent.entity_name  = emp_name   # use canonical DB name
-                logger.info(f"[QueryParser] Resolved '{name}' → employee_id={emp_id} ({emp_name})")
+                # Verify in DB
+                result = _lookup_employee_by_name(name)
+                if result:
+                    emp_id, emp_name = result
+                    intent.entity_id    = emp_id
+                    intent.entity_name  = emp_name   # use canonical DB name
+                    logger.info(f"[QueryParser] Resolved '{name}' → employee_id={emp_id} ({emp_name})")
 
-                # Build confirmed SQL
-                if intent.metric_type == "resource_utilization":
-                    intent.verified_sql = _build_resource_utilization_sql(
-                        emp_id, emp_name, date_from, date_to
-                    )
+                    # Build confirmed SQL
+                    if intent.metric_type == "resource_utilization":
+                        intent.verified_sql = _build_resource_utilization_sql(
+                            emp_id, emp_name, date_from, date_to
+                        )
+                        intent.context_hint = (
+                            f"Employee '{emp_name}' (id={emp_id}) verified in DB. "
+                            f"Query provides month-wise and overall breakdown including exact Standard Hours and Utilization %. "
+                            f"NOTE: Display this exact data professionally as a Markdown table."
+                        )
+
+                    elif "leave balance" in q_lower:
+                        intent.verified_sql = _build_leave_balance_sql(emp_id)
+                        intent.context_hint = f"Employee '{emp_name}' id={emp_id}. Query employee_leave_balance."
+
+                    elif intent.metric_type == "leave":
+                        intent.verified_sql = _build_leave_sql(emp_id, emp_name)
+                        intent.context_hint = f"Employee '{emp_name}' id={emp_id}. Query leave_request."
+
+                    elif intent.metric_type == "salary":
+                        intent.verified_sql = _build_salary_sql(emp_id)
+                        intent.context_hint = f"Employee '{emp_name}' id={emp_id}. Use emp_basic_salary, emp_gross_salary from employees."
+
+                else:
+                    logger.info(f"[QueryParser] Could not find employee '{name}' in DB")
                     intent.context_hint = (
-                        f"Employee '{emp_name}' (id={emp_id}) verified in DB. "
-                        f"Query provides month-wise and overall breakdown including exact Standard Hours and Utilization %. "
+                        f"WARNING: Employee '{name}' not found in database. "
+                        f"Use LIKE '%{name}%' search on employees.employee_name. "
+                        f"If still not found, return 'No employee named {name!r} was found.'"
+                    )
+            else:
+                # No specific employee — aggregate query
+                intent.entity_type = "all_employees"
+                if intent.metric_type == "resource_utilization":
+                    intent.context_hint = (
+                        f"Aggregate resource utilization for ALL employees. "
+                        f"Query timesheet_project JOIN ts_project_date (tpd) JOIN employees (status_id=3). "
                         f"NOTE: Display this exact data professionally as a Markdown table."
                     )
-
-                elif "leave balance" in q_lower:
-                    intent.verified_sql = _build_leave_balance_sql(emp_id)
-                    intent.context_hint = f"Employee '{emp_name}' id={emp_id}. Query employee_leave_balance."
-
-                elif intent.metric_type == "leave":
-                    intent.verified_sql = _build_leave_sql(emp_id, emp_name)
-                    intent.context_hint = f"Employee '{emp_name}' id={emp_id}. Query leave_request."
-
-                elif intent.metric_type == "salary":
-                    intent.verified_sql = _build_salary_sql(emp_id)
-                    intent.context_hint = f"Employee '{emp_name}' id={emp_id}. Use emp_basic_salary, emp_gross_salary from employees."
-
-            else:
-                logger.info(f"[QueryParser] Could not find employee '{name}' in DB")
-                intent.context_hint = (
-                    f"WARNING: Employee '{name}' not found in database. "
-                    f"Use LIKE '%{name}%' search on employees.employee_name. "
-                    f"If still not found, return 'No employee named {name!r} was found.'"
-                )
-        else:
-            # No specific employee — aggregate query
-            intent.entity_type = "all_employees"
-            if intent.metric_type == "resource_utilization":
-                intent.context_hint = (
-                    f"Aggregate resource utilization for ALL employees. "
-                    f"Query timesheet_project JOIN ts_project_date (tpd) JOIN employees (status_id=3). "
-                    f"NOTE: Display this exact data professionally as a Markdown table."
-                )
 
     # ── Set a generic hint for LLM fallback ───────────────────────────────
     if not intent.context_hint:

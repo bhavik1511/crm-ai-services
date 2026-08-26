@@ -289,6 +289,7 @@ CRITICAL SQL RULES:
 - For leave balance: query employee_leave_balance table (columns: employee_id, leave_type_id, balance, year).
 - For payroll: query emp_payroll table (employee_id, month, year, basic_salary, total_allowances, total_deductions, net_salary).
 - For salary: query employee_salary_details or employees (emp_basic_salary, emp_gross_salary).
+- kpi_master table contains target metrics for service_line_id, department_id, and employee_id ONLY. It has NO project_id column and CANNOT be joined to projects! For project performance/recoverability/score queries, measure recoverability (approved_fees vs actual cost from timesheet_project) or project status on projects table.
 
 --- RESOURCE UTILIZATION QUERY TEMPLATE ---
 -- The Resource Utilization Report dashboard uses timesheet_project AND ts_project_date.
@@ -335,7 +336,7 @@ SEEK_EXAMPLE:
 - invoice.client_name_id -> customers.id (NOT invoice.client_id).
 - receipt_details.client_id -> customers.id.
 - projects.client -> customers.id (NOT projects.client_id).
-- projects.incharge -> employees.id | projects.partner -> employees.id.
+- projects.main_incharge -> employees.id | projects.partner -> employees.id.
 - saleslead.lead_owner -> employees.id.
 - leave_request.status_id -> m_leave_status.id.
 - leave_request.leave_type_id -> m_leave_request_type.id.
@@ -478,7 +479,7 @@ _JOIN_HINTS = [
     ("proposal", "m_serviceline",   "proposal.service_line_id -> m_serviceline.id"),
     # Projects
     ("projects", "m_project_status","projects.status_id -> m_project_status.id"),
-    ("projects", "employees",       "projects.incharge -> employees.id | projects.partner -> employees.id"),
+    ("projects", "employees",       "projects.main_incharge -> employees.id | projects.partner -> employees.id"),
     ("projects", "customers",       "projects.client -> customers.id"),
     ("projects", "m_serviceline",   "projects.service_line_id -> m_serviceline.id"),
     ("project_tasks", "projects",   "project_tasks.project_id -> projects.id"),

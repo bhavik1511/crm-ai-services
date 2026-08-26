@@ -23,6 +23,7 @@ from sqlalchemy import text
 from rag import vector_store_v2 as vector_store
 from agent.agent import ask_question
 from db.database_mongo import get_vector_cache_collection, get_chat_history_collection
+from cache import get_secure_cache_manager, generate_secure_cache_key
 
 from dotenv import load_dotenv
 
@@ -44,6 +45,7 @@ def _is_kpi_summary_query(question: str) -> bool:
         "resource utilization", "utilization report", "utilisation report",
         "resource report", "resource allocation", "billable hours",
         "timesheet", "staff utilization", "staff utilisation",
+        "project", "projects",
     ]
     if any(pat in q for pat in _EXCLUSION_PATTERNS):
         return False
@@ -521,15 +523,31 @@ def _deterministic_top_customers_by_revenue(question: str) -> Optional[dict]:
     if m:
         n = min(int(m.group(1)), 20)  # cap at 20
 
+    # Extract date range if user selected a timeframe/FY
+    start_date, end_date = None, None
+    try:
+        from agent.query_parser import _extract_date_range
+        s, e, date_specified = _extract_date_range(question)
+        if date_specified and s and e:
+            start_date, end_date = f"{s} 00:00:00", f"{e} 23:59:59"
+    except Exception:
+        pass
+
+    date_filter = "AND i.created_at BETWEEN :start_date AND :end_date" if start_date else ""
+    params = {"n": n}
+    if start_date:
+        params["start_date"] = start_date
+        params["end_date"] = end_date
+
     query = text(
-        """
+        f"""
         SELECT
             c.customer_name,
             ROUND(SUM(i.total_amt_ex_vat), 2) AS total_revenue,
             COUNT(DISTINCT i.id) AS invoice_count
         FROM customers c
         JOIN invoice i ON i.client_name_id = c.id
-        WHERE i.is_active = 1
+        WHERE i.is_active = 1 {date_filter}
         GROUP BY c.id, c.customer_name
         ORDER BY total_revenue DESC
         LIMIT :n
@@ -539,26 +557,37 @@ def _deterministic_top_customers_by_revenue(question: str) -> Optional[dict]:
     try:
         engine = get_db_engine()
         with engine.connect() as conn:
-            rows = conn.execute(query, {"n": n}).fetchall()
+            rows = conn.execute(query, params).fetchall()
 
         if not rows:
             # Try alternate join column
             query2 = text(
-                """
+                f"""
                 SELECT
                     c.customer_name,
                     ROUND(SUM(i.total_amt_ex_vat), 2) AS total_revenue,
                     COUNT(DISTINCT i.id) AS invoice_count
                 FROM customers c
                 JOIN invoice i ON i.client_id = c.id
-                WHERE i.is_active = 1
+                WHERE i.is_active = 1 {date_filter}
                 GROUP BY c.id, c.customer_name
                 ORDER BY total_revenue DESC
                 LIMIT :n
                 """
             )
             with engine.connect() as conn:
-                rows = conn.execute(query2, {"n": n}).fetchall()
+                rows = conn.execute(query2, params).fetchall()
+
+        # If date filtering produced no rows (e.g. historical data outside selected FY), fallback to all-time query
+        if not rows and start_date:
+            with engine.connect() as conn:
+                rows = conn.execute(
+                    text("""
+                        SELECT c.customer_name, ROUND(SUM(i.total_amt_ex_vat), 2) AS total_revenue, COUNT(DISTINCT i.id) AS invoice_count
+                        FROM customers c JOIN invoice i ON i.client_name_id = c.id WHERE i.is_active = 1 GROUP BY c.id, c.customer_name ORDER BY total_revenue DESC LIMIT :n
+                    """),
+                    {"n": n}
+                ).fetchall()
 
         if not rows:
             return {
@@ -618,6 +647,8 @@ def _deterministic_top_customers_by_revenue(question: str) -> Optional[dict]:
 # Live-data detection — these questions must NEVER be served from cache
 # ---------------------------------------------------------------------------
 _LIVE_DATA_KEYWORDS = {
+    # KPI reports & insights
+    "kpi", "kpi summary", "kpi report", "kpi summary report", "report", "summary",
     # Financial metrics
     "revenue", "billing", "invoice", "invoices", "receivable", "receivables",
     "outstanding", "aging", "ageing", "overdue", "collection", "payment",
@@ -679,30 +710,37 @@ async def resolve_answer(
 
     # KPI Filter-First Gate (applies to both cached and fresh paths)
     if _is_kpi_summary_query(question) and not _is_kpi_filter_submission_text(question):
-        # ── Smart Gate: if the query already names a specific employee, only ask for FY ──
-        # e.g. "Generate KPI report for Damcy" → only FY clarification needed
         quick_filters = _extract_kpi_filters_from_text(question)
-        named_employee = quick_filters.get("employee_name")  # e.g. "Damcy"
+        named_employee = quick_filters.get("employee_name")  # e.g. "Shashank Arya"
+        q_low = question.lower()
+        has_direct_action = any(w in q_low for w in ["generate", "download", "show", "run", "get", "create", "export"])
 
-        if named_employee and named_employee.lower() not in ("all", ""):
-            # The user already told us WHO — just ask for the financial year
-            return {
-                "answer": f"Sure! Which Financial Year should I use for **{named_employee}**'s KPI report?",
-                "chart_data": None,
-                "navigate_to": KPI_SUMMARY_ROUTE,
-                "navigation_links": [{"label": "KPI Summary Report", "url": KPI_SUMMARY_ROUTE}],
-                "export_data": None,
-                "auto_expand": False,
-                "suggested_questions": [],
-                "report_intent": "kpi_fy_only",
-                "entity_name": named_employee,
-                "sql_executed": None,
-                "cache_tier": "fresh",
-                "was_cached": False,
-                "latency_ms": int((time.time() - start) * 1000),
-            }
+        if has_direct_action or (named_employee and named_employee.lower() not in ("all", "")):
+            # Direct report generation requested — execute _deterministic_kpi_response immediately with complete defaults
+            from main import _deterministic_kpi_response
+            question_filters = _extract_kpi_filters_from_text(question)
+            history_filters = _extract_kpi_filters_from_history(history)
+            merged_filters = _merge_kpi_filters(question_filters, history_filters)
+            if named_employee and not merged_filters.get("employee_name"):
+                merged_filters["employee_name"] = named_employee
+            if not merged_filters.get("financial_year"):
+                merged_filters["financial_year"] = "2025-2026"
+            if not merged_filters.get("date_range"):
+                merged_filters["date_range"] = "01-10-2025 to 30-09-2026"
+            if not merged_filters.get("service_line"):
+                merged_filters["service_line"] = "All"
+            if not merged_filters.get("department"):
+                merged_filters["department"] = "All"
 
-        # No specific employee → show the full filter panel
+            auth_token = user_context.get("jwt_token") if isinstance(user_context, dict) else None
+            res = await _deterministic_kpi_response(history, question, user_context, auth_token)
+            if res:
+                res["cache_tier"] = "fresh"
+                res["was_cached"] = False
+                res["latency_ms"] = int((time.time() - start) * 1000)
+                return _apply_kpi_overrides(res, question)
+
+        # No specific action or employee -> show the full filter panel
         return {
             "answer": KPI_FILTER_SETUP_PROMPT,
             "chart_data": None,
@@ -792,9 +830,9 @@ async def resolve_answer(
     # Proactive anomaly check — once per 30 minutes per session
     anomaly_note = ""
     try:
-        redis = get_redis()
-        anomaly_key = f"anomaly_checked:{session_id}"
-        already_checked = await redis.get(anomaly_key)
+        scm = get_secure_cache_manager()
+        anomaly_key = generate_secure_cache_key("anomaly", user_context, str(session_id))
+        already_checked = await scm.get_secure(anomaly_key)
         
         if not already_checked:
             from agent.tools_new import get_anomaly_alerts
@@ -813,7 +851,7 @@ async def resolve_answer(
                 anomaly_note += " — want me to pull the full details?"
             
             # Mark as checked for 30 minutes
-            await redis.setex(anomaly_key, 1800, "1")
+            await scm.set_secure(anomaly_key, {"checked": True}, 1800)
     except Exception as e:
         logger.warning(f"[Anomaly] Check failed (non-fatal): {e}")
         anomaly_note = ""
@@ -834,7 +872,7 @@ async def resolve_answer(
         cache_key_input = f"{q_norm}:{scope_key}"
         vector_scope_key = scope_key
         
-    redis_key = f"qa:{hashlib.sha256(cache_key_input.encode()).hexdigest()}"
+    redis_key = generate_secure_cache_key("qa", user_context, cache_key_input)
 
     KNOWLEDGE_KEYWORDS = ["formula", "how does", "what is the rule", 
                           "how is calculated", "what formula", "gosi rule",
@@ -891,19 +929,18 @@ async def resolve_answer(
         return _apply_kpi_overrides(result, question)
     # ── END LIVE DATA GATE ────────────────────────────────────────────────────
 
-    redis = get_redis()
+    scm = get_secure_cache_manager()
 
     # ═══════════════════════════════════════════════
-    # TIER 1 — Redis exact match
+    # TIER 1 — Encrypted Redis exact match
     # ═══════════════════════════════════════════════
     try:
-        cached = await redis.get(redis_key)
-        if cached:
-            data = json.loads(cached)
+        data = await scm.get_secure(redis_key)
+        if data and isinstance(data, dict):
             if data.get("role_scope") == vector_scope_key:
                 # Increment hit count and refresh TTL
                 data["hit_count"] = data.get("hit_count", 0) + 1
-                await redis.setex(redis_key, ttl, json.dumps(data))
+                await scm.set_secure(redis_key, data, ttl)
                 logger.info(f"[Memory] Tier 1 Redis hit for: {question[:60]}…")
                 return _apply_kpi_overrides({
                     "answer": data["answer"],
@@ -966,7 +1003,7 @@ async def resolve_answer(
                 "timestamp": datetime.utcnow().isoformat(),
             }
             try:
-                await redis.setex(redis_key, ttl, json.dumps(payload))
+                await scm.set_secure(redis_key, payload, ttl)
             except Exception as e:
                 logger.warning(f"[Memory] Redis warm-up after vector hit failed: {e}")
 
@@ -1050,10 +1087,10 @@ async def resolve_answer(
 
     async def _store_redis():
         try:
-            # Cache full payload including navigation and suggested questions
-            await redis.setex(redis_key, ttl, json.dumps(payload))
+            scm = get_secure_cache_manager()
+            await scm.set_secure(redis_key, payload, ttl)
         except Exception as e:
-            logger.warning(f"[Memory] Redis cache store failed: {e}")
+            logger.warning(f"[Memory] Secure Redis cache store failed: {e}")
 
     async def _store_vector():
         try:

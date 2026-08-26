@@ -37,10 +37,6 @@ async def classify_intent(question: str, use_cache: bool = True) -> str:
         - "other": Anything else
     """
     q_normalized = (question or "").strip().lower()
-    
-    # Cache lookup
-    if use_cache and q_normalized in _INTENT_CACHE:
-        return _INTENT_CACHE[q_normalized]
 
     # ── Typo normalization (runs before ALL other checks) ─────────────────
     # Normalize CRM-specific typos so patterns below always see canonical text
@@ -90,10 +86,11 @@ async def classify_intent(question: str, use_cache: bool = True) -> str:
     _REVENUE_PATTERNS = [
         "gp performance", "gross profit", "gross margin", "billing revenue",
         "service line performance", "service line revenue", "revenue by service line",
-        "service line breakdown",
+        "service line breakdown", "monthly revenue trend", "monthly revenue",
+        "revenue trend", "revenue by month"
     ]
     _PROPOSAL_PATTERNS = [
-        "proposal", "pipeline", "win rate", "engagement letter"
+        "proposal", "pipeline", "win rate", "engagement letter", "service lead", "leads"
     ]
     _PROJECT_PATTERNS = [
         "active project", "project portfolio", "project task", "milestone"
@@ -122,7 +119,28 @@ async def classify_intent(question: str, use_cache: bool = True) -> str:
         "of the", "for the", "revenue of", "revenue for", "billing of", "billing for",
         "invoices of", "invoices for", "receivable of", "receivable for",
         "projects of", "projects for", "proposals of", "proposals for",
+        "how many", "count",
     ]
+
+    _FORMULA_KNOWLEDGE_PATTERNS = [
+        "formula", "how is it calculated", "how do you calculate", "what is the formula",
+        "calculation method", "how to calculate", "how is recoverability calculated", "definition of"
+    ]
+    
+    if any(p in q_clean for p in _FORMULA_KNOWLEDGE_PATTERNS):
+        intent = "other"
+        if use_cache:
+            _INTENT_CACHE[q_normalized] = intent
+        logger.info(f"[Intent Classifier] Fast-guard: '{question[:60]}' → other (formula/methodology question)")
+        return intent
+
+    # Recoverability report data check (for actual metrics/reports)
+    if any(p in q_clean for p in _RECOVERABILITY_PATTERNS) or ("recover" in q_clean and "abil" in q_clean):
+        intent = "recoverability"
+        if use_cache:
+            _INTENT_CACHE[q_normalized] = intent
+        logger.info(f"[Intent Classifier] Fast-guard: '{question[:60]}' → recoverability")
+        return intent
 
     skip_fast_guard = any(p in q_clean for p in _ANALYTICAL_MARKERS)
     if skip_fast_guard:
@@ -142,13 +160,6 @@ async def classify_intent(question: str, use_cache: bool = True) -> str:
             if use_cache:
                 _INTENT_CACHE[q_normalized] = intent
             logger.info(f"[Intent Classifier] Fast-guard: '{question[:60]}' → revenue (service line)")
-            return intent
-
-        if any(p in q_clean for p in _RECOVERABILITY_PATTERNS) or ("recover" in q_clean and "abil" in q_clean):
-            intent = "recoverability"
-            if use_cache:
-                _INTENT_CACHE[q_normalized] = intent
-            logger.info(f"[Intent Classifier] Fast-guard: '{question[:60]}' → recoverability")
             return intent
 
         if any(p in q_clean for p in _STAFF_BILLING_PATTERNS) or ("staff" in q_clean and "billing" in q_clean):
@@ -205,6 +216,13 @@ async def classify_intent(question: str, use_cache: bool = True) -> str:
                 _INTENT_CACHE[q_normalized] = intent
             return intent
 
+        if any(p in q_clean for p in _RECOVERABILITY_PATTERNS):
+            intent = "recoverability"
+            if use_cache:
+                _INTENT_CACHE[q_normalized] = intent
+            logger.info(f"[Intent Classifier] Fast-guard: '{question[:60]}' → recoverability")
+            return intent
+
         if any(p in q_clean for p in _PROJECT_PATTERNS):
             intent = "projects"
             if use_cache:
@@ -212,11 +230,14 @@ async def classify_intent(question: str, use_cache: bool = True) -> str:
             return intent
     # ── End fast pre-guard ────────────────────────────────────────────────
     
+    # Cache lookup for non-fast-guard queries
+    if use_cache and q_normalized in _INTENT_CACHE:
+        return _INTENT_CACHE[q_normalized]
+    
     try:
         from .agent import _build_llm
-        import os
-        provider = os.getenv("LLM_PROVIDER", "openai").lower()
-        model_override = "llama-3.1-8b-instant" if provider == "groq" else "gpt-4o-mini"
+        provider = os.getenv("LLM_PROVIDER", "").lower()
+        model_override = os.getenv("FAST_MODEL") or os.getenv("LLM_MODEL")
         llm = _build_llm(model_override, temperature=0.0, max_tokens=30)
         
         classify_prompt = f"""You are a routing agent for a CRM chatbot. Analyze the user's question and pick ONE exact category.
@@ -228,7 +249,7 @@ If the user is asking for a SPECIFIC record (e.g. "recent proposal", "a proposal
 Question: "{question}"
 
 Categories:
-- "analytical": Specific item lookups, comparisons, temporal questions (recent, latest, specific).
+- "analytical": Specific item lookups, top customers by revenue, customer-specific queries, comparisons, temporal questions (recent, latest, specific).
 - "kpi_summary": Generic dashboard requests for KPI report/summary/analysis or budget vs actual.
 - "revenue": Generic dashboard requests for revenue and billing metrics.
 - "receivables": Generic dashboard requests for receivables, aging, outstanding invoices, collections.

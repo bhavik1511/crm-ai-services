@@ -1,5 +1,6 @@
 import re
 import os
+import logging
 import asyncio
 import json
 import traceback
@@ -7,6 +8,8 @@ from typing import List, Dict, Tuple, Optional, Any, Annotated, Union
 from datetime import datetime
 import hashlib
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 from sqlalchemy import text
 from openai import AsyncOpenAI
 from db.database import get_db_engine
@@ -120,8 +123,8 @@ def _looks_like_sql_write_attempt(user_text: str) -> bool:
 
 
 _client: AsyncOpenAI | None = None
-GROQ_PRIMARY_MODEL = os.getenv("PRIMARY_MODEL") or os.getenv("GROQ_MODEL_PRIMARY", "llama-3.3-70b-versatile")
-GROQ_FALLBACK_MODEL = os.getenv("FAST_MODEL") or os.getenv("GROQ_MODEL_FALLBACK", "llama-3.1-8b-instant")
+GROQ_PRIMARY_MODEL = os.getenv("LLM_MODEL") or os.getenv("PRIMARY_MODEL")
+GROQ_FALLBACK_MODEL = os.getenv("FAST_MODEL") or os.getenv("LLM_MODEL")
 try:
     GROQ_RETRY_ATTEMPTS = max(1, int(os.getenv("GROQ_RETRY_ATTEMPTS", "2")))
 except Exception:
@@ -182,13 +185,11 @@ LEADS & PROPOSALS:
 - saleslead(id, lead_date, lead_owner, industry_id, client_type, enquiry_details, code, budget_value, currency_id, lead_status_id, job_estimation_id, serviceline_id, servicetype_id, sub_servicetype_id, lead_source, lead_source_external_id, lead_source_existing_client_id, lead_source_internal_id, customer_id, contact_id, is_active, created_at, created_by)
 - m_leadstatus(id, name, is_active)
 - job_estimation(id, saleslead_id, proposal_id, from_date, to_date, remarks, total_costs, total_hours, proposed_fees, approved_fees, recoverability, contact_id, customer_id, code, ref_no, status_id, is_active, is_vendor, approved_by, created_at, created_by)
-- m_jobestimation_status(id, name, is_active)
-- proposal(id, job_estimation_id, organization_id, project_id, proposal_template_id, engagement_template_id, proposal_status_id, engagement_status_id, continuous_engagement_status_id, scope, proposal_year, proposed_fees, approved_fees, agreed_fees, recoverability, proposal_date, total_costs, code, ref_no, is_active, contact_id, customer_id, client_id, service_line_id, created_at, created_by)
-- m_proposal_status(id, name, is_active, sequence)
-- m_engagement_status(id, name, is_active, sequence)
+- m_proposal_status(id, name, is_active, sequence) -- IDs: 1=Proposal Sent, 2=Proposal Draft/In Review, 3=Proposal Accepted (Won), 4=Proposal Rejected (Lost), 7=Proposal Created, 8=Proposal Verify, 9=Project Pending, 10=All Project Created
+- m_engagement_status(id, name, is_active, sequence) -- IDs: 1=Engagement Accepted (Won), 2=Engagement Rejected (Lost), 3=Engagement Sent, 4=Engagement Created, 5=Engagement Verify
 
 PROJECTS:
-- projects(id, name, code, incharge, partner, client, client_relation, start_date, end_date, report_sign_date, audit_year, approved_fees, service_line_id, service_type_id, sub_service_type_id, proposal_id, status_id, is_active, main_incharge, created_at, created_by)
+- projects(id, name, code, main_incharge, partner, client, client_relation, start_date, end_date, report_sign_date, audit_year, approved_fees, service_line_id, service_type_id, sub_service_type_id, proposal_id, status_id, is_active, created_at, created_by)
 - m_project_status(id, name)
 - project_tasks(id, project_id, milestone_id, assignee_id, task_id, name, description, due_date, priority, status, tags, created_at, created_by)
 - project_team_members(id, project_id, emp_id)
@@ -214,6 +215,7 @@ TIMESHEET & KPI:
 - ts_project_date(id, timesheet_id, project_date, task_name, hours, description)
   NOTE: ts_project_date.timesheet_id -> timesheet_project.id. project_date is the actual work date.
 - kpi_master(id, service_line_id, department_id, employee_id, target_month, target_value, target_gp, is_active)
+  NOTE: kpi_master contains target metrics ONLY for service lines, departments, and employees. It has NO project_id column and NEVER links to projects directly!
 - serviceline_department(id, serviceline_id, department_id)
 - serviceline_incharge(id, serviceline_id, incharge_id)
 
@@ -223,9 +225,9 @@ OTHER:
 - client_survey(id, service_line, project_manager, project_name, client_name, remarks, created_at)
 - assign_client_survey_question(id, client_survey_id, questions, answers)
 
-ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 KEY JOINS & RELATIONSHIPS
-ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 - invoice.client_name_id -> customers.id
 - invoice.project_id -> projects.id
 - invoice.project_in_charge_id -> employees.id
@@ -248,7 +250,7 @@ KEY JOINS & RELATIONSHIPS
 - proposal.project_id -> projects.id (NULL = pending/open)
 - proposal.service_line_id -> m_serviceline.id
 - projects.status_id -> m_project_status.id (NOTE: column is status_id NOT project_status_id)
-- projects.incharge -> employees.id
+- projects.main_incharge -> employees.id
 - projects.partner -> employees.id
 - projects.client -> customers.id
 - projects.service_line_id -> m_serviceline.id
@@ -265,9 +267,9 @@ KEY JOINS & RELATIONSHIPS
 - serviceline_department.serviceline_id -> m_serviceline.id
 - serviceline_department.department_id -> m_department.id
 
-ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 EXACT SQL FOR EVERY DASHBOARD KPI
-ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 --- SERVICE PIPELINE ---
 -- Open service leads count:
@@ -283,15 +285,21 @@ SELECT COUNT(*) FROM saleslead WHERE lead_date BETWEEN '2025-10-01' AND '2026-09
 SELECT ls.name AS status, COUNT(sl.id) AS total FROM m_leadstatus ls LEFT JOIN saleslead sl ON sl.lead_status_id = ls.id AND sl.lead_date BETWEEN '2025-10-01' AND '2026-09-30 23:59:59' GROUP BY ls.id, ls.name
 
 --- JOB ESTIMATION PIPELINE ---
--- Job estimation by status:
-SELECT js.name AS status, COUNT(je.id) AS total FROM m_jobestimation_status js LEFT JOIN job_estimation je ON je.status_id = js.id AND je.created_at BETWEEN '2025-10-01' AND '2026-09-30 23:59:59' GROUP BY js.id, js.name
+-- Job estimation by status (Always filter by je.is_active = 1):
+SELECT js.name AS status, COUNT(je.id) AS total FROM m_jobestimation_status js LEFT JOIN job_estimation je ON je.status_id = js.id AND je.is_active = 1 AND je.created_at BETWEEN '2025-10-01' AND '2026-09-30 23:59:59' GROUP BY js.id, js.name
 
 -- Total job estimations this FY:
-SELECT COUNT(*) FROM job_estimation WHERE created_at BETWEEN '2025-10-01' AND '2026-09-30 23:59:59'
+SELECT COUNT(*) FROM job_estimation WHERE is_active = 1 AND created_at BETWEEN '2025-10-01' AND '2026-09-30 23:59:59'
 
 --- OPEN PROPOSALS / ENGAGEMENT LETTERS ---
 -- Open proposals (status IDs 1,7,8 = proposal statuses, project_id IS NULL means pending):
 SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p WHERE p.proposal_status_id IN (1, 7, 8) AND p.project_id IS NULL AND p.created_at BETWEEN '2025-10-01' AND '2026-09-30 23:59:59'
+
+-- Rejected proposals (status ID 4 = Proposal Rejected):
+SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p WHERE p.is_active = 1 AND p.proposal_status_id = 4 AND p.created_at BETWEEN '2025-10-01' AND '2026-09-30 23:59:59'
+
+-- Accepted / Won proposals (status ID 3 = Proposal Accepted):
+SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p WHERE p.is_active = 1 AND p.proposal_status_id = 3 AND p.created_at BETWEEN '2025-10-01' AND '2026-09-30 23:59:59'
 
 -- Open engagement letters (engagement_status_id IN 3,4,5, project_id IS NULL):
 SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p WHERE p.engagement_status_id IN (3, 4, 5) AND p.project_id IS NULL AND p.created_at BETWEEN '2025-10-01' AND '2026-09-30 23:59:59'
@@ -331,7 +339,7 @@ SELECT CASE WHEN ps.id IN (1, 2) THEN 'Active' WHEN ps.id = 5 THEN 'WIP' WHEN ps
 SELECT COUNT(*) FROM projects WHERE status_id IN (1, 2) AND is_active = 1
 
 -- Project details with client and service line:
-SELECT p.name, p.code, c.customer_name AS client, sl.name AS service_line, ps.name AS status, e.employee_name AS incharge FROM projects p JOIN customers c ON p.client = c.id JOIN m_serviceline sl ON p.service_line_id = sl.id JOIN m_project_status ps ON p.status_id = ps.id JOIN employees e ON p.incharge = e.id WHERE p.is_active = 1 ORDER BY p.created_at DESC LIMIT 50
+SELECT p.name, p.code, c.customer_name AS client, sl.name AS service_line, ps.name AS status, e.employee_name AS incharge FROM projects p JOIN customers c ON p.client = c.id JOIN m_serviceline sl ON p.service_line_id = sl.id JOIN m_project_status ps ON p.status_id = ps.id JOIN employees e ON p.main_incharge = e.id WHERE p.is_active = 1 ORDER BY p.created_at DESC LIMIT 50
 
 --- LEAD SOURCE ---
 -- Lead source breakdown (Internal/Existing Client/External):
@@ -744,8 +752,8 @@ NAVIGATION ROUTES — use these EXACT paths in navigate_to JSON field:
 NEVER navigate to a page that is NOT explicitly listed above. If the user asks for a report or page that does not exist in this list (for example, "Total Estimation Report"), you MUST set `navigate_to` to the closest parent category (like "/projects/reports") or "/". NEVER invent, guess, or hallucinate URLs. If you output a URL that is not on this list, the application will crash.
 """
 
-    # Use true employee_id from context, fallback to user_id (if 0 or missing, it's 0)
-    employee_id = (user_context or {}).get("employee_id") or (user_context or {}).get("user_id", 0)
+    # Use true employee_id from context (if None/0, keep 0 for unassigned)
+    employee_id = (user_context or {}).get("employee_id") or 0
     employee_id_str = str(employee_id) if employee_id else "0"
 
     from config.role_tier_config import get_tier_for_role
@@ -1264,7 +1272,17 @@ Provide a clear, professional answer based ONLY on the raw data above."""
         t0 = time.time()
 
         history = inputs["messages"]
-        last_msg_content = history[-1].content if hasattr(history[-1], 'content') else history[-1]["content"]
+        if history:
+            _user_history_texts = [
+                m.content if hasattr(m, 'content') else m.get('content', '')
+                for m in (history or [])
+                if (getattr(m, 'type', '') == 'human' or (isinstance(m, dict) and m.get('role') == 'user'))
+            ]
+            full_context = "\n".join(_user_history_texts[-3:]) if _user_history_texts else ""
+            last_msg_content = history[-1].content if hasattr(history[-1], 'content') else history[-1]["content"]
+        else:
+            full_context = ""
+            last_msg_content = ""
 
         # Step 1: Fast classification (keyword heuristic first, LLM fallback)
         category = _fast_classify(last_msg_content)
@@ -1302,7 +1320,10 @@ Provide a clear, professional answer based ONLY on the raw data above."""
             is_estimation_query = any(sig in q_lower_adhoc for sig in _ESTIMATION_SIGNALS)
 
             _RECOVERABILITY_SIGNALS = [
-                "recoverability report", "project recoverability", "actual recoverability", "estimated recoverability", "recoverability", "recoverablity"
+                "recoverability report", "project recoverability", "actual recoverability",
+                "estimated recoverability", "recoverability", "recoverablity",
+                "lowest kpi", "lowest kpi scores", "lowest kpi projects", "kpi score", "kpi scores",
+                "lowest recoverability", "lowest project", "lowest performing project"
             ]
             is_recoverability_query = any(sig in q_lower_adhoc for sig in _RECOVERABILITY_SIGNALS)
 
@@ -1414,9 +1435,37 @@ Provide a clear, professional answer based ONLY on the raw data above."""
                 # Build export data for the Excel button
                 ad_hoc_export_data = None
                 if projects:
-                    columns = list(projects[0].keys())
-                    all_rows = [[r.get(c, "") for c in columns] for r in projects]
-                    
+                    ordered_columns = [
+                        ("Project Code", "project_code"),
+                        ("Project Name", "project_name"),
+                        ("Customer Name", "customer_name"),
+                        ("Customer Group", "customer_group"),
+                        ("Service Line", "service_line"),
+                        ("Start Date", "start_date"),
+                        ("End Date", "end_date"),
+                        ("Project In Charge", "project_in_charge"),
+                        ("Customer Relation", "customer_relation"),
+                        ("Project Partner", "project_partner"),
+                        ("Project Status", "project_status"),
+                        ("Approved Fees", "approved_fees"),
+                        ("Agreed Fees", "agreed_fees"),
+                        ("Est. Cost", "estimated_cost"),
+                        ("Est. Recoverability (%)", "estimated_recoverability"),
+                        ("Total Actual Cost", "total_actual_cost"),
+                        ("Actual Recoverability (%)", "actual_recoverability")
+                    ]
+                    headers = ["No"] + [col[0] for col in ordered_columns]
+                    all_rows = []
+                    for i, p in enumerate(projects):
+                        row = [str(i + 1)]
+                        for col_name, dict_key in ordered_columns:
+                            val = p.get(dict_key, "")
+                            if dict_key in ['approved_fees', 'agreed_fees', 'estimated_cost', 'total_actual_cost', 'estimated_recoverability', 'actual_recoverability']:
+                                row.append(round(float(val or 0), 3) if val else 0.0)
+                            else:
+                                row.append(val)
+                        all_rows.append(row)
+
                     try:
                         from datetime import datetime as _dt_now
                         gen_date = _dt_now.now().strftime('%d %b %Y')
@@ -1435,7 +1484,7 @@ Provide a clear, professional answer based ONLY on the raw data above."""
                         
                     ad_hoc_export_data = {
                         "filename": "Project_Recoverability_Report",
-                        "sheets": [{"name": "Data", "headers": columns, "rows": all_rows, "metadata": meta}]
+                        "sheets": [{"name": "Data", "headers": headers, "rows": all_rows, "metadata": meta}]
                     }
 
                 # Format the answer text deterministically
@@ -1448,7 +1497,7 @@ Provide a clear, professional answer based ONLY on the raw data above."""
                 if _emp and _emp.lower() != 'all':
                     answer_lines.append(f"- **In-Charge Employee:** {_emp}")
                     
-                answer_lines.append(f"- **Total Active Projects:** {total_projects}")
+                answer_lines.append(f"- **Total Projects:** {total_projects}")
 
                 est_cost = summary.get("total_estimated_cost")
                 if est_cost not in (None, "", "N/A"):
@@ -1460,13 +1509,7 @@ Provide a clear, professional answer based ONLY on the raw data above."""
 
                 act_rec = summary.get("total_actual_recoverability_percentage")
                 if act_rec not in (None, "", "N/A") and str(act_rec).strip().lower() != "nan":
-                    answer_lines.append(f"- **Actual Recoverability:** {act_rec}%")
-
-                source = summary.get("source", "")
-                if "API" in source:
-                    answer_lines.append("\n*Data sourced from CRM Recoverability Report API.*")
-                elif "SQL" in source:
-                    answer_lines.append("\n*Data sourced from CRM database (SQL fallback).*")
+                    answer_lines.append(f"- **Portfolio Recoverability Rate:** {act_rec}%")
 
                 if total_projects == 0:
                     msg = summary.get("message", "")
@@ -1693,11 +1736,18 @@ async def ask_question(history: List[Dict], user_context=None) -> Tuple[str, Opt
     if _looks_like_sql_write_attempt(latest_question):
         return "⚠️ I can only answer read-only questions about dashboard data.", None, None, None, None, False, None, None, None, False, None
 
+    # Confidential / Security / Schema Guardrail Check
+    from config.security_guard import check_security_guardrail
+    sec_block = check_security_guardrail(latest_question)
+    if sec_block:
+        return sec_block["answer"], None, None, [], None, False, sec_block["suggested_questions"], None, None, False, None
+
     try:
         # --- NEW: Semantic Cache Check ---
         import asyncio
-        
-        cached = await get_cached_answer(latest_question, scope_key)
+        from memory.memory_manager import _needs_live_data
+
+        cached = await get_cached_answer(latest_question, scope_key) if not _needs_live_data(latest_question) else None
 
         if cached:
             cached_nav = cached.get("navigate_to")
@@ -1716,12 +1766,23 @@ async def ask_question(history: List[Dict], user_context=None) -> Tuple[str, Opt
             )
         # --- End Cache Check ---
 
-        # Convert history array to LangGraph messages state
-        # NOTE: Use 'msg_role' to avoid overwriting the outer 'role' (user's actual role for cache)
+        # Convert history array to LangGraph messages state using proper Message objects
+        from langchain_core.messages import HumanMessage, AIMessage
         langchain_history = []
-        for msg in history:
-            msg_role = "user" if msg['role'] == "user" else "assistant"
-            langchain_history.append({"role": msg_role, "content": msg['content']})
+        if isinstance(history, list):
+            for msg in history:
+                if isinstance(msg, dict):
+                    role = msg.get("role", "user")
+                    content = msg.get("content", "")
+                    if role == "user":
+                        langchain_history.append(HumanMessage(content=content))
+                    else:
+                        langchain_history.append(AIMessage(content=content))
+                elif hasattr(msg, "content"):
+                    langchain_history.append(msg)
+
+        if not langchain_history or (hasattr(langchain_history[-1], "content") and langchain_history[-1].content != latest_question):
+            langchain_history.append(HumanMessage(content=latest_question))
 
         # The routed agent returns the identical state format as create_react_agent
         response = None
@@ -2158,7 +2219,7 @@ async def ask_question_streaming(history, user_context=None):
 
         from config.role_tier_config import get_tier_for_role
         user_tier = get_tier_for_role(role_name)
-        employee_id = user_ctx.get("employee_id") or user_ctx.get("user_id", 0)
+        employee_id = user_ctx.get("employee_id") or 0
         employee_id_str = str(employee_id) if employee_id else "0"
 
         from config.role_tier_config import build_rbac_prompt
@@ -2191,8 +2252,45 @@ async def ask_question_streaming(history, user_context=None):
         # ── STREAMING ROUTER: classify + pre-fetch DB data before streaming ──
         # The streaming path must mirror the non-streaming routing logic:
         # classify the question first, fetch real DB data, then stream the formatted answer.
+        # Extract user-only messages from history
+        user_history_qs = [
+            m.get("content", "").strip() if isinstance(m, dict) else getattr(m, "content", "").strip()
+            for m in (history or [])
+            if (isinstance(m, dict) and m.get("role") == "user") or (hasattr(m, "type") and getattr(m, "type") == "human")
+        ]
+
         latest_q = history[-1].get("content", "") if history else ""
+        
+        # Follow-up query resolution (Anaphora resolution)
+        if len(user_history_qs) >= 2:
+            prev_user_q = user_history_qs[-2]
+            curr_user_q = user_history_qs[-1]
+            curr_words = curr_user_q.lower().strip().split()
+            is_short_followup = len(curr_words) <= 7
+            starts_with_followup = any(curr_user_q.lower().strip().startswith(prefix) for prefix in [
+                "for ", "in ", "what about", "how about", "and ", "with ", "during ", "show for", "show me for"
+            ])
+            if is_short_followup or starts_with_followup:
+                latest_q = f"{prev_user_q} {curr_user_q}"
+
         q_lower = latest_q.lower().strip()
+
+        # Confidential / Security / Schema Guardrail Check
+        from config.security_guard import check_security_guardrail
+        sec_block = check_security_guardrail(latest_q)
+        if sec_block:
+            yield {"type": "token", "content": sec_block["content"]}
+            yield {
+                "type": "done",
+                "content": sec_block["content"],
+                "navigate_to": None,
+                "chart_data": None,
+                "navigation_links": [],
+                "suggested_questions": sec_block["suggested_questions"],
+                "export_data": None,
+                "auto_expand": False
+            }
+            return
 
         # Set RBAC context on semantic_layer so tools respect user scope
         from semantic import semantic_layer as _sl
@@ -2300,6 +2398,7 @@ async def ask_question_streaming(history, user_context=None):
             "compare", "specific", "a proposal", "an invoice", "the project", "detail",
             "last", "first", "which", "who made", "when was", "when did", "single",
             "most recent", "what was the last", "which was the last",
+            "rejected", "accepted", "stalled", "draft", "lost", "won",
         ]
         is_analytical = any(marker in q_lower for marker in _ANALYTICAL_MARKERS_STRONG)
 
@@ -2321,7 +2420,7 @@ async def ask_question_streaming(history, user_context=None):
                 extracted_sl = _sl_direct_match.group(1).strip()
             else:
                 # Fallback: use LLM to extract from conversation context
-                full_context = "\n".join([m.get('content', '') for m in history[-3:]])
+                full_context = "\n".join(user_history_qs[-3:]) if user_history_qs else ""
                 check_sl_prompt = (
                     f"Extract the service line from this conversation if present "
                     f"(e.g. Audit, Tax, Advisory, BPO). If no service line is mentioned, "
@@ -2504,11 +2603,33 @@ async def ask_question_streaming(history, user_context=None):
             "INTENT: If the user asks for a 'receivable report' or 'ageing summary' without filters, SET `report_intent: 'receivable'` and ask which scope they want: overall, group, pipeline, or customized."
         )
 
-        # Convert history to OpenAI message format
-        messages = [{"role": "system", "content": system_content}]
+        # Privacy Guard: Mask all prompts & history using LocalPseudonymizer prior to calling Groq/LLM
+        from .pseudonymizer import prepare_for_external_llm, unmask_data
+
+        token_map = {}
+        try:
+            privacy_res = prepare_for_external_llm(system_content)
+            masked_system_content = privacy_res.masked_text if privacy_res.safe else system_content
+            if privacy_res.safe and privacy_res.token_mapping:
+                token_map.update(privacy_res.token_mapping)
+        except Exception as pe:
+            logger.warning(f"[Pseudonymizer] Failed to mask system prompt: {pe}")
+            masked_system_content = system_content
+
+        # Convert history to OpenAI message format using masked text
+        messages = [{"role": "system", "content": masked_system_content}]
         for msg in history:
             msg_role = "user" if msg.get("role") == "user" else "assistant"
-            messages.append({"role": msg_role, "content": msg.get("content", "")})
+            msg_text = msg.get("content", "")
+            try:
+                p_msg = prepare_for_external_llm(msg_text)
+                if p_msg.safe:
+                    msg_text = p_msg.masked_text
+                    if p_msg.token_mapping:
+                        token_map.update(p_msg.token_mapping)
+            except Exception:
+                pass
+            messages.append({"role": msg_role, "content": msg_text})
 
         full_answer = ""
         streamed_ok = False
@@ -2519,6 +2640,8 @@ async def ask_question_streaming(history, user_context=None):
         for model_name in _groq_model_candidates():
             for attempt in range(GROQ_RETRY_ATTEMPTS):
                 answer_parts = []
+                stream_buf = ""
+                in_token_tag = False
                 try:
                     llm = _build_llm(model_name=model_name, temperature=0.1, max_tokens=2000)
                     async for chunk in llm.astream(messages):
@@ -2535,7 +2658,29 @@ async def ask_question_streaming(history, user_context=None):
 
                         if chunk.content:
                             answer_parts.append(chunk.content)
-                            yield {"type": "token", "content": chunk.content}
+                            if not token_map:
+                                yield {"type": "token", "content": chunk.content}
+                            else:
+                                for char in chunk.content:
+                                    stream_buf += char
+                                    if char == '<':
+                                        in_token_tag = True
+                                    elif char == '>' and in_token_tag:
+                                        in_token_tag = False
+                                        unmasked = unmask_data(stream_buf, token_map)
+                                        yield {"type": "token", "content": unmasked}
+                                        stream_buf = ""
+                                    elif in_token_tag and len(stream_buf) > 80:
+                                        in_token_tag = False
+                                        yield {"type": "token", "content": unmask_data(stream_buf, token_map)}
+                                        stream_buf = ""
+                                    elif not in_token_tag and len(stream_buf) > 0:
+                                        yield {"type": "token", "content": stream_buf}
+                                        stream_buf = ""
+
+                    if stream_buf:
+                        yield {"type": "token", "content": unmask_data(stream_buf, token_map) if token_map else stream_buf}
+                        stream_buf = ""
 
                     full_answer = "".join(answer_parts)
                     streamed_ok = True
@@ -2561,6 +2706,10 @@ async def ask_question_streaming(history, user_context=None):
 
         if not streamed_ok and last_rate_error is not None:
             raise last_rate_error
+
+        # Unmask full answer back to original real values before parsing JSON metadata
+        if token_map:
+            full_answer = unmask_data(full_answer, token_map)
 
         # Parse metadata JSON blocks from the full streamed answer
         parsed = _parse_llm_json_blocks(full_answer)
@@ -2656,4 +2805,10 @@ async def ask_question_streaming(history, user_context=None):
         }
 
     except Exception as e:
-        yield {"type": "error", "content": f"Streaming error: {str(e)}"}
+        print(f"[AskQuestionStreaming] Error: {e}")
+        yield {
+            "type": "done",
+            "content": f"⚠️ I encountered an error streaming your response: {str(e)}",
+            "error_code": "streaming_error",
+        }
+        yield {"type": "done", "content": "[DONE]\n\n"}

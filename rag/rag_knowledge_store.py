@@ -27,7 +27,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-_CHROMA_DIR = str(Path(__file__).parent / "chroma_db")
+_RAG_DIR = Path(__file__).resolve().parent
+_CHROMA_DIR = os.getenv("CHROMA_DB_DIR", str(_RAG_DIR / "chroma_db"))
 _COLLECTION_NAME = "crm_knowledge_base"
 _EMBED_MODEL = "all-MiniLM-L6-v2"
 _TOP_K = int(os.getenv("RAG_TOP_K", "5"))
