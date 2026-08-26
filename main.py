@@ -21,6 +21,9 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 
 load_dotenv(override=True)
 from urllib.parse import urlencode
@@ -146,6 +149,7 @@ class Message(BaseModel):
 class UserContext(BaseModel):
     user_name: str = "Unknown"
     user_id: int = 0
+    employee_id: Optional[int] = None
     role_name: str = "Unknown"
     department: str = "Unknown"
     start_date: Optional[str] = None
@@ -179,6 +183,7 @@ def resolve_user_context(user_ctx: UserContext) -> dict:
     result = {
         "user_name": user_ctx.user_name,
         "user_id": user_ctx.user_id,
+        "employee_id": user_ctx.employee_id,
         "role_name": user_ctx.role_name,
         "department": user_ctx.department,
         "start_date": user_ctx.start_date,
@@ -188,23 +193,24 @@ def resolve_user_context(user_ctx: UserContext) -> dict:
     try:
         engine = get_db_engine()
         with engine.connect() as conn:
+            emp_lookup_id = result.get("employee_id")
             # Resolve designation name from employee's designation_id
-            if result["role_name"] == "Unknown" and result["user_id"]:
+            if result["role_name"] == "Unknown" and emp_lookup_id:
                 row = conn.execute(text(
                     "SELECT d.name FROM employees e "
                     "JOIN m_designation d ON e.emp_designation_id = d.id "
                     "WHERE e.id = :emp_id"
-                ), {"emp_id": result["user_id"]}).fetchone()
+                ), {"emp_id": emp_lookup_id}).fetchone()
                 if row:
                     result["role_name"] = row[0]
 
             # Resolve department name from employee's department_id
-            if result["department"] == "Unknown" and result["user_id"]:
+            if result["department"] == "Unknown" and emp_lookup_id:
                 row = conn.execute(text(
                     "SELECT d.name FROM employees e "
                     "JOIN m_department d ON e.emp_department_id = d.id "
                     "WHERE e.id = :emp_id"
-                ), {"emp_id": result["user_id"]}).fetchone()
+                ), {"emp_id": emp_lookup_id}).fetchone()
                 if row:
                     result["department"] = row[0]
     except Exception as e:
@@ -898,7 +904,8 @@ def _call_json_api(url: str, auth_token: Optional[str]) -> dict:
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     }
     if auth_token:
-        headers["Authorization"] = f"Bearer {auth_token}"
+        clean_tok = str(auth_token).replace("Bearer ", "").replace("bearer ", "").strip()
+        headers["Authorization"] = f"Bearer {clean_tok}"
     req = UrlRequest(url=url, headers=headers, method="GET")
     with urlopen(req, timeout=25) as resp:
         body = resp.read().decode("utf-8")
@@ -907,9 +914,37 @@ def _call_json_api(url: str, auth_token: Optional[str]) -> dict:
 
 
 def _build_kpi_contract(kpi_data: dict, aging_data: dict, filters_applied: dict, period: dict) -> dict:
+    if isinstance(kpi_data, dict) and isinstance(kpi_data.get("data"), dict):
+        kpi_data = kpi_data["data"]
+    if isinstance(aging_data, dict) and isinstance(aging_data.get("data"), dict):
+        aging_data = aging_data["data"]
+
     rows = (kpi_data or {}).get("rows") or []
     total_row = next((r for r in rows if str(r.get("month", "")).lower() == "total"), {})
     gp_rows = (kpi_data or {}).get("gp_performance_by_service_line") or (kpi_data or {}).get("service_line_performance") or []
+
+    import logging
+    logger = logging.getLogger("uvicorn")
+
+    print(f"\n=============================================================")
+    print(f"[EXACT DATA RECEIVED BY _build_kpi_contract]")
+    print(f"rows={rows}")
+    print(f"rows[0]={rows[0] if rows else None}")
+    print(f"summary={(kpi_data or {}).get('summary')}")
+    print(f"project_all={(kpi_data or {}).get('project_all')}")
+    print(f"proposals_all={(kpi_data or {}).get('proposals_all')}")
+    print(f"secured_business={(kpi_data or {}).get('secured_business')}")
+    print(f"balance_to_achieve={(kpi_data or {}).get('balance_to_achieve')}")
+    print(f"variance={(kpi_data or {}).get('variance')}")
+    print(f"variance_gp={(kpi_data or {}).get('variance_gp')}")
+    print(f"=============================================================\n")
+
+    print(f"\n=============================================================")
+    print(f"[EXACT TOTAL_ROW USED BY CONTRACT]")
+    print(f"rows_count={len(rows)}")
+    print(f"total_row={total_row}")
+    print(f"=============================================================\n")
+    logger.info(f"[2. EXACT TOTAL_ROW USED BY CONTRACT] rows_count={len(rows)} total_row={total_row}")
 
     def n(val, default=0):
         try:
@@ -917,16 +952,123 @@ def _build_kpi_contract(kpi_data: dict, aging_data: dict, filters_applied: dict,
         except Exception:
             return default
 
+    # 1. Project In Hand: select value from project_all or total_projects (selecting value when > 100)
+    val_tp = n((kpi_data or {}).get("total_projects"))
+    val_pa = n((kpi_data or {}).get("project_all"))
+    if (kpi_data or {}).get("project_in_hand") is not None:
+        proj_in_hand_val = n((kpi_data or {}).get("project_in_hand"))
+    elif val_pa > 100:
+        proj_in_hand_val = val_pa
+    elif val_tp > 100:
+        proj_in_hand_val = val_tp
+    else:
+        proj_in_hand_val = max(val_pa, val_tp)
+
+    # 2. Open Proposals: select value from proposals_all or total_proposals (selecting value when > 100)
+    val_tprop = n((kpi_data or {}).get("total_proposals"))
+    val_prall = n((kpi_data or {}).get("proposals_all"))
+    if (kpi_data or {}).get("open_proposals") is not None:
+        open_props_val = n((kpi_data or {}).get("open_proposals"))
+    elif val_prall > 100:
+        open_props_val = val_prall
+    elif val_tprop > 100:
+        open_props_val = val_tprop
+    else:
+        open_props_val = max(val_prall, val_tprop)
+
+    # 3. Target Revenue: total_row["target_all_value"] or total_row["target_revenue"] or total_row["target_value"]
+    t_target = n(
+        total_row.get("target_all_value")
+        if total_row.get("target_all_value") is not None
+        else (total_row.get("target_revenue") if total_row.get("target_revenue") is not None else (total_row.get("target_value") if total_row.get("target_value") is not None else (kpi_data or {}).get("target_all_value")))
+    )
+
+    # 4. Budget vs Actual Revenue Variance: total_row["variance"]
+    b_vs_a_rev_val = n(
+        total_row.get("variance")
+        if total_row.get("variance") is not None
+        else (total_row.get("budget_vs_actual_revenu") if total_row.get("budget_vs_actual_revenu") is not None else (kpi_data or {}).get("variance"))
+    )
+
+    # 5. Budget vs Actual GP Variance: total_row["variance_gp"]
+    b_vs_a_gp_val = n(
+        total_row.get("variance_gp")
+        if total_row.get("variance_gp") is not None
+        else (total_row.get("budget_vs_actual_gp_percent") if total_row.get("budget_vs_actual_gp_percent") is not None else (kpi_data or {}).get("variance_gp"))
+    )
+
+    # 6. Gross Invoiced Revenue: total_row["total_invoice_amount_with_credit"] or total_row["total_invoice_amount"]
+    t_inv = n(
+        total_row.get("total_invoice_amount_with_credit")
+        if total_row.get("total_invoice_amount_with_credit") is not None
+        else (total_row.get("total_invoice_amount") if total_row.get("total_invoice_amount") is not None else (kpi_data or {}).get("total_invoice_amount_with_credit"))
+    )
+
+    t_disc = n(
+        total_row.get("total_credit_amount")
+        if total_row.get("total_credit_amount") is not None
+        else (total_row.get("total_discount_cost") if total_row.get("total_discount_cost") is not None else (kpi_data or {}).get("total_credit_amount"))
+    )
+
+    emp_id = (kpi_data or {}).get("employee_id") or (filters_applied or {}).get("employee_id")
+    s_date = (period or {}).get("start_date") or (filters_applied or {}).get("start_date") or (kpi_data or {}).get("start_date")
+    e_date = (period or {}).get("end_date") or (filters_applied or {}).get("end_date") or (kpi_data or {}).get("end_date")
+
+    if s_date and e_date and emp_id:
+        try:
+            from semantic.semantic_layer import get_db_engine
+            from sqlalchemy import text
+            db_eng = get_db_engine()
+            with db_eng.connect() as conn:
+                q = text("""
+                    SELECT COALESCE(SUM(approved_fees), 0) AS p_fees
+                    FROM projects
+                    WHERE created_at BETWEEN :s_date AND :e_date
+                      AND status_id NOT IN ('3', '4', '12')
+                      AND NOT EXISTS (SELECT 1 FROM invoice inv WHERE inv.project_id = projects.id)
+                      AND (manager = :emp_id OR partner = :emp_id OR main_incharge = :emp_id OR client_relation = :emp_id OR created_by = :emp_id)
+                """)
+                res = conn.execute(q, {
+                    "s_date": f"{s_date} 00:00:00",
+                    "e_date": f"{e_date} 23:59:59",
+                    "emp_id": emp_id
+                }).fetchone()
+                if res and res[0] is not None and float(res[0]) > 0:
+                    proj_in_hand_val = float(res[0])
+        except Exception as p_err:
+            logger.warning(f"[KPI_CONTRACT_RECONCILE_ERR] {p_err}")
+
+    month_rows = [r for r in rows if str(r.get("month", "")).lower() != "total"]
+    if month_rows:
+        gross_profit_val = sum(n(r.get("total_gross_profit") if r.get("total_gross_profit") is not None else r.get("gross_profit")) for r in month_rows)
+        target_gp_val = sum(n(r.get("target_gp")) for r in month_rows)
+    else:
+        target_gp_val = n(total_row.get("target_gp") if total_row.get("target_gp") is not None else (kpi_data or {}).get("target_gp"))
+        gross_profit_val = n(total_row.get("total_gross_profit") if total_row.get("total_gross_profit") is not None else (kpi_data or {}).get("total_gross_profit") or (kpi_data or {}).get("gross_profit"))
+
+    if target_gp_val > 0 or gross_profit_val > 0:
+        b_vs_a_gp_val = gross_profit_val - target_gp_val
+
+    # 7. Secured Business: gross_invoiced_revenue + project_in_hand
+    secured_val = t_inv + proj_in_hand_val
+
+    # 8. Balance to Achieve: target_revenue - secured_business
+    balance_val = t_target - secured_val
+
+    total_direct_cost_val = n(total_row.get("total_direct_cost") if total_row.get("total_direct_cost") is not None else (kpi_data or {}).get("total_direct_cost"))
+    total_receivables_val = n(total_row.get("total_rem_amount") if total_row.get("total_rem_amount") is not None else (kpi_data or {}).get("total_receivables") or (kpi_data or {}).get("total_rem_amount"))
+    total_revenue_val = n(total_row.get("total_invoice_amount_with_credit") if total_row.get("total_invoice_amount_with_credit") is not None else (kpi_data or {}).get("total_revenue") or t_inv)
+
     summary_cards = [
-        {"key": "secured_business", "label": "Secured Business", "value": n((kpi_data or {}).get("secured_business"))},
-        {"key": "balance_to_achieve", "label": "Balance to Achieve", "value": n((kpi_data or {}).get("balance_to_achieve"))},
-        {"key": "budget_vs_actual_revenue", "label": "Budget vs Actual Revenue", "value": n(total_row.get("budget_vs_actual_revenu"))},
-        {"key": "budget_vs_actual_gp", "label": "Budget vs Actual GP", "value": n(total_row.get("budget_vs_actual_gp_percent"))},
-        {"key": "gross_profit", "label": "Gross Profit", "value": n(total_row.get("total_gross_profit"))},
-        {"key": "total_direct_cost", "label": "Total Direct Cost", "value": n(total_row.get("total_direct_cost"))},
-        {"key": "open_proposals", "label": "Open Proposals", "value": n((kpi_data or {}).get("total_proposals"))},
-        {"key": "project_in_hand", "label": "Project in Hand", "value": n((kpi_data or {}).get("total_projects"))},
-        {"key": "total_receivables", "label": "Total Receivables", "value": n(total_row.get("total_rem_amount"))},
+        {"key": "secured_business", "label": "Secured Business", "value": secured_val},
+        {"key": "balance_to_achieve", "label": "Balance to Achieve", "value": balance_val},
+        {"key": "budget_vs_actual_revenue", "label": "Budget vs Actual Revenue", "value": b_vs_a_rev_val},
+        {"key": "budget_vs_actual_gp", "label": "Budget vs Actual GP", "value": b_vs_a_gp_val},
+        {"key": "gross_profit", "label": "Gross Profit", "value": gross_profit_val},
+        {"key": "total_direct_cost", "label": "Total Direct Cost", "value": total_direct_cost_val},
+        {"key": "open_proposals", "label": "Open Proposals", "value": open_props_val},
+        {"key": "project_in_hand", "label": "Project in Hand", "value": proj_in_hand_val},
+        {"key": "total_receivables", "label": "Total Receivables", "value": total_receivables_val},
     ]
 
     receivable_rows = (aging_data or {}).get("receivable_aging") or []
@@ -940,15 +1082,53 @@ def _build_kpi_contract(kpi_data: dict, aging_data: dict, filters_applied: dict,
     )
 
     summary_cards.extend([
-        {"key": "target_revenue", "label": "Target Revenue", "value": n(total_row.get("target_value"))},
-        {"key": "target_gp", "label": "Target GP", "value": n(total_row.get("target_gp"))},
-        {"key": "variance", "label": "Variance", "value": n(total_row.get("variance"))},
-        {"key": "variance_gp", "label": "Variance GP", "value": n(total_row.get("variance_gp"))},
-        {"key": "total_revenue", "label": "Total Revenue", "value": n(total_row.get("total_invoice_amount_with_credit"))},
+        {"key": "target_revenue", "label": "Target Revenue", "value": t_target},
+        {"key": "target_gp", "label": "Target GP", "value": target_gp_val},
+        {"key": "variance", "label": "Variance", "value": b_vs_a_rev_val},
+        {"key": "variance_gp", "label": "Variance GP", "value": b_vs_a_gp_val},
+        {"key": "total_revenue", "label": "Total Revenue", "value": total_revenue_val},
         {"key": "utilization", "label": "Utilization", "value": n((kpi_data or {}).get("utilization") or (kpi_data or {}).get("utilization_pct") or (kpi_data or {}).get("utilisation") or (kpi_data or {}).get("utilisation_pct"))},
     ])
+    logger.info(f"[3. EXACT SUMMARY_CARDS GENERATED BY CONTRACT] {summary_cards}")
+
+    emp_id = (kpi_data or {}).get("employee_id") or (filters_applied or {}).get("employee_id")
+    emp_name = (kpi_data or {}).get("employee_name") or (filters_applied or {}).get("employee_name") or "Organization Aggregate"
+    date_range_val = (kpi_data or {}).get("date_range") or (period if isinstance(period, dict) and period.get("start_date") else {})
+    if not isinstance(date_range_val, dict) or not date_range_val.get("start"):
+        if isinstance(period, dict) and (period.get("start_date") or period.get("start")):
+            date_range_val = {"start": period.get("start_date") or period.get("start"), "end": period.get("end_date") or period.get("end")}
 
     return {
+        "summary": {
+            "employee_id": emp_id,
+            "employee_name": emp_name,
+            "date_range": date_range_val,
+            "secured_business": secured_val,
+            "target_revenue": t_target,
+            "balance_to_achieve": balance_val,
+            "gross_invoiced_revenue": t_inv,
+            "total_credit_notes": t_disc,
+            "target_gp": target_gp_val,
+            "gross_profit": gross_profit_val,
+            "total_proposals": open_props_val,
+            "total_projects": proj_in_hand_val,
+            "project_in_hand": proj_in_hand_val,
+            "open_proposals": open_props_val,
+            "budget_vs_actual_gp": b_vs_a_gp_val,
+            "budget_vs_actual_revenue": b_vs_a_rev_val,
+            "total_receivables": total_receivables_val
+        },
+        "employee_id": emp_id,
+        "employee_name": emp_name,
+        "date_range": date_range_val,
+        "secured_business": secured_val,
+        "balance_to_achieve": balance_val,
+        "budget_vs_actual_gp": b_vs_a_gp_val,
+        "budget_vs_actual_revenue": b_vs_a_rev_val,
+        "project_in_hand": proj_in_hand_val,
+        "total_projects": proj_in_hand_val,
+        "open_proposals": open_props_val,
+        "total_proposals": open_props_val,
         "summary_cards": summary_cards,
         "billing_revenue_gp_table": rows,
         "receivable_aging_table": receivable_rows,
@@ -1052,19 +1232,19 @@ def _build_kpi_narrative(kpi_payload: dict, filters_applied: dict, period: dict)
     total_row = next((r for r in (kpi_payload.get("billing_revenue_gp_table") or [])
                       if str(r.get("month", "")).lower() == "total"), {})
     if total_row:
-        if target_revenue == 0:
+        if cards_map.get("target_revenue") is None:
             target_revenue = n(total_row.get("target_value"))
-        if total_revenue == 0:
+        if cards_map.get("total_revenue") is None:
             total_revenue = n(total_row.get("total_invoice_amount_with_credit"))
-        if budget_vs_actual_rev == 0:
-            budget_vs_actual_rev = n(total_row.get("variance")) or (total_revenue - target_revenue)
-        if gross_profit == 0:
+        if cards_map.get("budget_vs_actual_revenue") is None:
+            budget_vs_actual_revenue = n(total_row.get("variance")) or (total_revenue - target_revenue)
+        if cards_map.get("gross_profit") is None:
             gross_profit = n(total_row.get("total_gross_profit"))
-        if target_gp == 0:
+        if cards_map.get("target_gp") is None:
             target_gp = n(total_row.get("target_gp"))
 
-    if balance_to_achieve == 0 and target_revenue > total_revenue:
-        balance_to_achieve = target_revenue - total_revenue
+    if cards_map.get("balance_to_achieve") is None and target_revenue > secured_business:
+        balance_to_achieve = target_revenue - secured_business
 
     # Budget vs Actual Revenue card — red if negative
     rev_variance_indicator = "🔴" if budget_vs_actual_rev < 0 else "🟢"
@@ -1245,6 +1425,302 @@ def _build_kpi_narrative(kpi_payload: dict, filters_applied: dict, period: dict)
     return "\n".join(lines)
 
 
+def _build_excel_export_from_kpi_payload(kpi_payload: dict, filters_applied: dict, period: dict) -> dict:
+    """Build Excel export containing the full KPI report dataset across all sections."""
+    from datetime import datetime
+    import re as _re
+
+    rows = []
+
+    def format_num(val):
+        """Round to integer — matches UI numeric rounding."""
+        try:
+            if val is None or val == "" or val == "-":
+                return 0
+            return int(round(float(val)))
+        except Exception:
+            return 0
+
+    def format_curr(val):
+        """Format BHD currency strings for display."""
+        try:
+            if val is None or val == "" or val == "-":
+                return "BHD 0.00"
+            f = float(val)
+            return f"BHD {f:,.2f}"
+        except Exception:
+            return "BHD 0.00"
+
+    # --- Pull billing total row & summary cards ---
+    billing_data = kpi_payload.get("billing_revenue_gp_table", [])
+    total_row = next((r for r in billing_data if str(r.get("month", "")).lower() == "total"), {})
+    summary_cards = {c["key"]: c["value"] for c in kpi_payload.get("summary_cards", []) if isinstance(c, dict) and "key" in c}
+    if not summary_cards and isinstance(kpi_payload.get("summary"), dict):
+        summary_cards = kpi_payload.get("summary")
+
+    target_revenue = summary_cards.get("target_revenue") if summary_cards.get("target_revenue") is not None else total_row.get("target_value", 0)
+    total_revenue = summary_cards.get("total_revenue") if summary_cards.get("total_revenue") is not None else total_row.get("total_invoice_amount_with_credit", 0)
+    budget_vs_actual_rev = summary_cards.get("budget_vs_actual_revenue") if summary_cards.get("budget_vs_actual_revenue") is not None else total_row.get("budget_vs_actual_revenu", 0)
+    target_gp = summary_cards.get("target_gp") if summary_cards.get("target_gp") is not None else total_row.get("target_gp", 0)
+    gross_profit = summary_cards.get("gross_profit") if summary_cards.get("gross_profit") is not None else total_row.get("total_gross_profit", 0)
+    budget_vs_actual_gp = summary_cards.get("budget_vs_actual_gp") if summary_cards.get("budget_vs_actual_gp") is not None else total_row.get("budget_vs_actual_gp_percent", 0)
+    open_proposals = summary_cards.get("open_proposals", 0)
+    proposal_value = summary_cards.get("total_proposal_value", 0)
+    project_in_hand = summary_cards.get("project_in_hand", 0)
+    strictly_active_projects = summary_cards.get("strictly_active_projects", 0)
+    secured_business = summary_cards.get("secured_business") if summary_cards.get("secured_business") is not None else kpi_payload.get("secured_business", total_revenue)
+    balance_to_achieve = summary_cards.get("balance_to_achieve") if summary_cards.get("balance_to_achieve") is not None else kpi_payload.get("balance_to_achieve", (float(target_revenue or 0) - float(secured_business or 0)))
+    receivables = summary_cards.get("total_receivables") if summary_cards.get("total_receivables") is not None else total_row.get("total_rem_amount", 0)
+    receivables_180_plus = summary_cards.get("receivable_180_plus_days", 0)
+    utilization = summary_cards.get("utilization", 0)
+
+    # --- 1. Report Title & Filter Information ---
+    rows.append(["Executive KPI Summary Report"])
+    rows.append(["Period:", f"{period.get('start_date', '')} to {period.get('end_date', '')}"])
+    rows.append(["Service Line:", (filters_applied or {}).get("service_line") or "All"])
+    rows.append(["Department:", (filters_applied or {}).get("department") or "All"])
+    rows.append(["Employee Name:", (filters_applied or {}).get("employee_name") or "All"])
+    rows.append(["Customer Name:", (filters_applied or {}).get("customer") or "All"])
+    rows.append(["Financial Year:", (filters_applied or {}).get("financial_year") or "All"])
+    rows.append([])
+
+    # --- 2. Financial Targets & Performance Table (Matches Chatbot UI Card) ---
+    rows.append(["Financial Targets & Performance"])
+    rows.append(["Metric", "Target Value", "Secured / Actual", "Balance to Achieve", "Achievement %"])
+
+    f_target_rev = float(target_revenue or 0)
+    f_secured = float(secured_business or 0)
+    f_balance = float(balance_to_achieve or 0)
+    f_target_gp = float(target_gp or 0)
+    f_gp = float(gross_profit or 0)
+
+    rev_achieve_pct = (f_secured / f_target_rev * 100) if f_target_rev > 0 else 0.0
+    gp_achieve_pct = (f_gp / f_target_gp * 100) if f_target_gp > 0 else 0.0
+    gp_balance = max(0.0, f_target_gp - f_gp) if f_target_gp > 0 else 0.0
+
+    rows.append([
+        "Revenue Target",
+        format_curr(f_target_rev),
+        format_curr(f_secured),
+        format_curr(f_balance),
+        f"{rev_achieve_pct:.1f}%"
+    ])
+    rows.append([
+        "Gross Profit (GP) Target",
+        format_curr(f_target_gp),
+        format_curr(f_gp),
+        format_curr(gp_balance),
+        f"{gp_achieve_pct:.1f}%" if f_target_gp > 0 else "-"
+    ])
+    prop_label = f"{format_curr(proposal_value)} ({int(open_proposals)} proposals)" if int(open_proposals) > 0 else format_curr(proposal_value)
+    rows.append([
+        "Proposals Pipeline",
+        "-",
+        prop_label,
+        "-",
+        "-"
+    ])
+    rows.append([])
+
+    # --- 3. Summary KPI Metrics Box ---
+    rows.append(["Summary KPI Metrics"])
+    rows.append(["KPI Metric", "Value", "Status / Indicator"])
+    rows.append(["Budget vs Actual Revenue", format_num(budget_vs_actual_rev), "🔴 Shortfall" if float(budget_vs_actual_rev or 0) < 0 else "🟢 Exceeded"])
+    rows.append(["Budget vs Actual GP", format_num(budget_vs_actual_gp), "🟢 Positive" if float(budget_vs_actual_gp or 0) >= 0 else "🔴 Shortfall"])
+    rows.append(["Project in Hand", format_num(project_in_hand), "-"])
+    rows.append(["Open Proposals", format_num(open_proposals), "-"])
+    rows.append(["Secured Business", format_num(secured_business), "-"])
+    rows.append(["Balance to Achieve", format_num(balance_to_achieve), "🔴 Pending" if float(balance_to_achieve or 0) > 0 else "🟢 Achieved"])
+    rows.append(["Total Receivables", format_num(receivables), "-"])
+    rows.append(["Overdue Receivables (180+ Days)", format_num(receivables_180_plus), "⚠️ Risk" if float(receivables_180_plus or 0) > 0 else "🟢 Clear"])
+    rows.append(["Utilization", f"{format_num(utilization)}%", "-"])
+    rows.append([])
+
+    # --- 4. Projects Portfolio Overview ---
+    rows.append(["Projects Portfolio Overview"])
+    rows.append(["Portfolio Metric", "Count"])
+    rows.append(["Total Projects Managed", format_num(project_in_hand)])
+    rows.append(["Strictly Active Projects", format_num(strictly_active_projects)])
+    rows.append([])
+
+    # --- Generate ordered months list using calendar arithmetic ---
+    MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+    def _parse_any_date(date_str):
+        for fmt in ("%d-%m-%Y", "%Y-%m-%d", "%m-%d-%Y"):
+            try:
+                return datetime.strptime(date_str, fmt)
+            except Exception:
+                pass
+        return None
+
+    def make_month_key(year, month):
+        return "{}-{}".format(MONTH_ABBR[month - 1], year)
+
+    months = []
+    start_d = _parse_any_date(period.get("start_date", ""))
+    end_d = _parse_any_date(period.get("end_date", ""))
+
+    if start_d and end_d:
+        y, m = start_d.year, start_d.month
+        ey, em = end_d.year, end_d.month
+        while (y, m) <= (ey, em):
+            months.append(make_month_key(y, m))
+            if m == 12:
+                y, m = y + 1, 1
+            else:
+                m += 1
+    else:
+        months = [r.get("month") for r in billing_data
+                  if str(r.get("month", "")).lower() != "total" and r.get("month")]
+
+    # --- Build monthly map ---
+    billing_by_month = {}
+    for r in billing_data:
+        m_name = r.get("month")
+        if m_name and str(m_name).lower() != "total":
+            billing_by_month[m_name] = r
+
+    def get_row_data(label, key):
+        r_data = [label]
+        row_sum = 0
+        for m in months:
+            val = format_num(billing_by_month.get(m, {}).get(key))
+            r_data.append(val)
+            row_sum += val
+        total_val = format_num(total_row.get(key)) if total_row.get(key) is not None else row_sum
+        r_data.append(total_val)
+        return r_data
+
+    # --- 5. Monthly Billing Revenue & GP Table ---
+    rows.append(["Monthly Billing Revenue & GP Performance"])
+    headers_billing = ["Metric / Month"] + months + ["Total"]
+    rows.append(headers_billing)
+
+    rows.append(get_row_data("Target Value (Revenue)", "target_value"))
+    rows.append(get_row_data("Invoiced Revenue (Gross)", "total_invoice_amount_with_credit"))
+    rows.append(get_row_data("GTI Expenses (1.5%)", "gti_expense"))
+    rows.append(get_row_data("Staff Cost (1.25%)", "staff_cost"))
+    rows.append(get_row_data("Referral Fee", "total_referral_fee"))
+    rows.append(get_row_data("Consultancy Fee", "total_consultancy_fee"))
+    rows.append(get_row_data("Debt & Discount", "total_discount_cost"))
+    rows.append(get_row_data("Total Direct Cost", "total_direct_cost"))
+    rows.append(get_row_data("Gross Profit (GP)", "total_gross_profit"))
+
+    var_row = ["Variance (Revenue)"]
+    for m in months:
+        r = billing_by_month.get(m, {})
+        v = r.get("variance")
+        var_row.append(format_num(v) if v is not None else format_num(r.get("actual_revenue", 0)) - format_num(r.get("target_value", 0)))
+    var_total = total_row.get("variance")
+    var_row.append(format_num(var_total) if var_total is not None else format_num(total_row.get("actual_revenue", 0)) - format_num(total_row.get("target_value", 0)))
+    rows.append(var_row)
+
+    gp_var_row = ["Variance GP"]
+    for m in months:
+        r = billing_by_month.get(m, {})
+        v = r.get("variance_gp")
+        gp_var_row.append(format_num(v) if v is not None else format_num(r.get("total_gross_profit", 0)) - format_num(r.get("target_gp", 0)))
+    gp_var_total = total_row.get("variance_gp")
+    gp_var_row.append(format_num(gp_var_total) if gp_var_total is not None else format_num(total_row.get("total_gross_profit", 0)) - format_num(total_row.get("target_gp", 0)))
+    rows.append(gp_var_row)
+    rows.append([])
+
+    # --- 6. GP Performance by Service Line Table ---
+    gp_data = kpi_payload.get("gp_performance_by_service_line", [])
+    if gp_data:
+        rows.append(["Gross Profit Performance by Service Line"])
+        rows.append(["Service Line", "Service Line ID", "Target Value", "Actual Invoiced Revenue", "Direct Cost", "Gross Profit", "GP %"])
+        for r in gp_data:
+            s_name = r.get("service_line_name") or r.get("name") or "Service Line"
+            s_id = r.get("service_line_id") or "-"
+            s_target = format_num(r.get("target_value") or r.get("target"))
+            s_act = format_num(r.get("total_invoice_amount_with_credit") or r.get("actual_revenue") or r.get("invoiced_rev"))
+            s_cost = format_num(r.get("total_direct_cost") or r.get("direct_cost"))
+            s_gp = format_num(r.get("total_gross_profit") or r.get("gross_profit"))
+            s_gp_pct = f"{format_num(r.get('gp_percent') or r.get('budget_vs_actual_gp_percent'))}%"
+            rows.append([s_name, s_id, s_target, s_act, s_cost, s_gp, s_gp_pct])
+        rows.append([])
+
+    # --- 7. Monthly Receivable Aging Table ---
+    aging_data = kpi_payload.get("receivable_aging_table", [])
+    if aging_data:
+        aging_total_row = next((r for r in aging_data if str(r.get("month", "")).lower() == "total"), {})
+        rows.append(["Monthly Receivable Aging Summary"])
+        headers_aging = ["Aging Bucket / Month"] + months + ["Total"]
+        rows.append(headers_aging)
+
+        AGING_KEYS = ["<30", "30-60", "60-120", "120-180", "180-365", ">365"]
+
+        _MMAP = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
+                 "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
+        def _ym(s):
+            s = str(s).strip().lower()
+            m = _re.match(r'([a-z]+)\W+(\d{4})', s)
+            if m:
+                mn = _MMAP.get(m.group(1)[:3])
+                if mn: return (int(m.group(2)), mn)
+            m = _re.match(r'(\d{4})\W+(\d{1,2})', s)
+            if m: return (int(m.group(1)), int(m.group(2)))
+            return None
+
+        aging_ym = {}
+        for _r in aging_data:
+            _ms = _r.get("month", "")
+            if str(_ms).lower() == "total": continue
+            _k = _ym(_ms)
+            if _k: aging_ym[_k] = _r
+
+        def get_aging_row(label, key):
+            r_data = [label]
+            row_sum = 0
+            for m in months:
+                mrow = aging_ym.get(_ym(m), {})
+                val = format_num(mrow.get(key))
+                r_data.append(val)
+                row_sum += val
+            total_val = format_num(aging_total_row.get(key)) if aging_total_row.get(key) is not None else row_sum
+            r_data.append(total_val)
+            return r_data
+
+        rows.append(get_aging_row("< 30 days",      "<30"))
+        rows.append(get_aging_row("30 - 60 days",   "30-60"))
+        rows.append(get_aging_row("60 - 120 days",  "60-120"))
+        rows.append(get_aging_row("120 - 180 days", "120-180"))
+        rows.append(get_aging_row("180 - 365 days", "180-365"))
+        rows.append(get_aging_row("> 365 days",     ">365"))
+
+        grand_r = ["Total"]
+        for m in months:
+            mrow = aging_ym.get(_ym(m), {})
+            grand_r.append(sum(format_num(mrow.get(k)) for k in AGING_KEYS))
+        grand_r.append(sum(format_num(aging_total_row.get(k)) for k in AGING_KEYS))
+        rows.append(grand_r)
+        rows.append([])
+        rows.append([])
+
+    # --- 8. Executive Goal & Performance Status Insights ---
+    narrative_text = _build_kpi_narrative(kpi_payload, filters_applied, period)
+    rows.append(["Executive Goal & Performance Status"])
+    for line in narrative_text.splitlines():
+        clean_line = line.replace("#", "").replace("**", "").replace("---", "").strip()
+        if clean_line:
+            rows.append([clean_line])
+
+    fy_str = str((filters_applied or {}).get("financial_year") or "FY").replace("-", "_")
+    cust_str = str((filters_applied or {}).get("customer") or "").replace(" ", "_")
+
+    filename = f"KPI_Report_{fy_str}"
+    if cust_str and cust_str.lower() != "all":
+        filename += f"_{cust_str}"
+
+    return {
+        "filename": filename,
+        "sheets": [{"name": "KPI Report", "headers": [], "rows": rows}]
+    }
+
+
 # NOTE: _classify_intent has been moved to the centralized intent_classifier module
 # Use: intent = await classify_intent(question)
 # This ensures consistent intent detection across all project files
@@ -1368,46 +1844,128 @@ async def _deterministic_kpi_response(history: Optional[List[dict]], latest_ques
     period = {"start_date": start_date, "end_date": end_date}
 
     def _build_excel_export_from_kpi_payload(kpi_payload: dict, filters_applied: dict, period: dict) -> dict:
-        """Build Excel export matching the UI's Billing Revenue & GP Performance and Receivable Summary Report."""
+        """Build Excel export containing the full KPI report dataset across all sections."""
         from datetime import datetime
+        import re as _re
 
         rows = []
 
-        # --- 1. Filter Info (one per row, vertical layout) ---
-        rows.append(["Service Line:", filters_applied.get("service_line") or "All"])
-        rows.append(["Department:", filters_applied.get("department") or "All"])
-        rows.append(["Employee Name:", filters_applied.get("employee_name") or "All"])
-        rows.append(["Customer Name:", filters_applied.get("customer") or "All"])
-        rows.append(["Financial Year:", filters_applied.get("financial_year") or "All"])
-        rows.append([])
-
         def format_num(val):
-            """Round to integer — matches the UI's parseInt(value) rounding."""
+            """Round to integer — matches UI numeric rounding."""
             try:
+                if val is None or val == "" or val == "-":
+                    return 0
                 return int(round(float(val)))
             except Exception:
                 return 0
 
-        # --- Pull billing total row early (used for both summary and billing table) ---
+        def format_curr(val):
+            """Format BHD currency strings for display."""
+            try:
+                if val is None or val == "" or val == "-":
+                    return "BHD 0.00"
+                f = float(val)
+                return f"BHD {f:,.2f}"
+            except Exception:
+                return "BHD 0.00"
+
+        # --- Pull billing total row & summary cards ---
         billing_data = kpi_payload.get("billing_revenue_gp_table", [])
         total_row = next((r for r in billing_data if str(r.get("month", "")).lower() == "total"), {})
         summary_cards = {c["key"]: c["value"] for c in kpi_payload.get("summary_cards", [])}
 
-        # --- 2. Summary Metrics Box ---
-        # Read directly from billing total_row (same source as the dashboard page)
-        # and from summary_cards for values that come from the API root (proposals, projects etc.)
-        rows.append(["Budget vs Actual Revenue", format_num(total_row.get("budget_vs_actual_revenu",      summary_cards.get("budget_vs_actual_revenue")))])
-        rows.append(["Budget vs Actual GP",      format_num(total_row.get("budget_vs_actual_gp_percent", summary_cards.get("budget_vs_actual_gp")))])
-        rows.append(["Project in Hand",           format_num(summary_cards.get("project_in_hand"))])
-        rows.append(["Open Proposals",            format_num(summary_cards.get("open_proposals"))])
-        rows.append(["Secured Business",          format_num(summary_cards.get("secured_business"))])
-        rows.append(["Balance to Achieve",        format_num(summary_cards.get("balance_to_achieve"))])
-        rows.append(["Utilization",               "{}%".format(format_num(summary_cards.get("utilization", 0)))])
-        rows.append([])
+        target_revenue = summary_cards.get("target_revenue") if summary_cards.get("target_revenue") is not None else total_row.get("target_value", 0)
+        total_revenue = summary_cards.get("total_revenue") if summary_cards.get("total_revenue") is not None else total_row.get("total_invoice_amount_with_credit", 0)
+        budget_vs_actual_rev = summary_cards.get("budget_vs_actual_revenue") if summary_cards.get("budget_vs_actual_revenue") is not None else total_row.get("budget_vs_actual_revenu", 0)
+        target_gp = summary_cards.get("target_gp") if summary_cards.get("target_gp") is not None else total_row.get("target_gp", 0)
+        gross_profit = summary_cards.get("gross_profit") if summary_cards.get("gross_profit") is not None else total_row.get("total_gross_profit", 0)
+        budget_vs_actual_gp = summary_cards.get("budget_vs_actual_gp") if summary_cards.get("budget_vs_actual_gp") is not None else total_row.get("budget_vs_actual_gp_percent", 0)
+        open_proposals = summary_cards.get("open_proposals", 0)
+        proposal_value = summary_cards.get("total_proposal_value", 0)
+        project_in_hand = summary_cards.get("project_in_hand", 0)
+        strictly_active_projects = summary_cards.get("strictly_active_projects", 0)
+        secured_business = summary_cards.get("secured_business") if summary_cards.get("secured_business") is not None else total_revenue
+        balance_to_achieve = summary_cards.get("balance_to_achieve") if summary_cards.get("balance_to_achieve") is not None else (float(target_revenue or 0) - float(secured_business or 0))
+        receivables = summary_cards.get("total_receivables") if summary_cards.get("total_receivables") is not None else total_row.get("total_rem_amount", 0)
+        receivables_180_plus = summary_cards.get("receivable_180_plus_days", 0)
+        utilization = summary_cards.get("utilization", 0)
+
+        # --- 1. Report Title & Filter Information ---
+        emp_title = (filters_applied or {}).get("employee_name") or "Organization Aggregate"
+        rows.append(["Executive KPI Summary Report", emp_title])
+
+        raw_date_range = (filters_applied or {}).get("date_range")
+        period_str = _pretty_date_range(raw_date_range) if raw_date_range else (
+            f"{period.get('start_date', '')} to {period.get('end_date', '')}" if period else "Current FY"
+        )
+        rows.append(["Report Period:", period_str])
+        rows.append(["Service Line:", (filters_applied or {}).get("service_line") or "All"])
+        rows.append(["Department:", (filters_applied or {}).get("department") or "All"])
+        rows.append(["Employee Name:", (filters_applied or {}).get("employee_name") or "All"])
+        rows.append(["Customer Name:", (filters_applied or {}).get("customer") or "All"])
+        rows.append(["Financial Year:", (filters_applied or {}).get("financial_year") or "All"])
         rows.append([])
 
-        # --- Generate ordered months list using calendar arithmetic (locale-independent) ---
-        # Month names match what MySQL DATE_FORMAT('%b-%Y') produces: "Oct-2025", "Nov-2025", etc.
+        # --- 2. Financial Targets & Performance Table (Matches Chatbot UI Card) ---
+        rows.append(["Financial Targets & Performance"])
+        rows.append(["Metric", "Target Value", "Secured / Actual", "Balance to Achieve", "Achievement %"])
+
+        f_target_rev = float(target_revenue or 0)
+        f_secured = float(secured_business or 0)
+        f_balance = float(balance_to_achieve or 0)
+        f_target_gp = float(target_gp or 0)
+        f_gp = float(gross_profit or 0)
+
+        rev_achieve_pct = (f_secured / f_target_rev * 100) if f_target_rev > 0 else 0.0
+        gp_achieve_pct = (f_gp / f_target_gp * 100) if f_target_gp > 0 else 0.0
+        gp_balance = max(0.0, f_target_gp - f_gp) if f_target_gp > 0 else 0.0
+
+        rows.append([
+            "Revenue Target",
+            format_curr(f_target_rev),
+            format_curr(f_secured),
+            format_curr(f_balance),
+            f"{rev_achieve_pct:.1f}%"
+        ])
+        rows.append([
+            "Gross Profit (GP) Target",
+            format_curr(f_target_gp),
+            format_curr(f_gp),
+            format_curr(gp_balance),
+            f"{gp_achieve_pct:.1f}%" if f_target_gp > 0 else "-"
+        ])
+        prop_label = f"{format_curr(proposal_value)} ({int(open_proposals)} proposals)" if int(open_proposals) > 0 else format_curr(proposal_value)
+        rows.append([
+            "Proposals Pipeline",
+            "-",
+            prop_label,
+            "-",
+            "-"
+        ])
+        rows.append([])
+
+        # --- 3. Summary KPI Metrics Box ---
+        rows.append(["Summary KPI Metrics"])
+        rows.append(["KPI Metric", "Value", "Status / Indicator"])
+        rows.append(["Budget vs Actual Revenue", format_num(budget_vs_actual_rev), "🔴 Shortfall" if float(budget_vs_actual_rev or 0) < 0 else "🟢 Exceeded"])
+        rows.append(["Budget vs Actual GP", format_num(budget_vs_actual_gp), "🟢 Positive" if float(budget_vs_actual_gp or 0) >= 0 else "🔴 Shortfall"])
+        rows.append(["Project in Hand", format_num(project_in_hand), "-"])
+        rows.append(["Open Proposals", format_num(open_proposals), "-"])
+        rows.append(["Secured Business", format_num(secured_business), "-"])
+        rows.append(["Balance to Achieve", format_num(balance_to_achieve), "🔴 Pending" if float(balance_to_achieve or 0) > 0 else "🟢 Achieved"])
+        rows.append(["Total Receivables", format_num(receivables), "-"])
+        rows.append(["Overdue Receivables (180+ Days)", format_num(receivables_180_plus), "⚠️ Risk" if float(receivables_180_plus or 0) > 0 else "🟢 Clear"])
+        rows.append(["Utilization", f"{format_num(utilization)}%", "-"])
+        rows.append([])
+
+        # --- 4. Projects Portfolio Overview ---
+        rows.append(["Projects Portfolio Overview"])
+        rows.append(["Portfolio Metric", "Count"])
+        rows.append(["Total Projects Managed", format_num(project_in_hand)])
+        rows.append(["Strictly Active Projects", format_num(strictly_active_projects)])
+        rows.append([])
+
+        # --- Generate ordered months list using calendar arithmetic ---
         MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
@@ -1420,10 +1978,9 @@ async def _deterministic_kpi_response(history: Optional[List[dict]], latest_ques
             return None
 
         def make_month_key(year, month):
-            """Produce 'Oct-2025' style key without relying on strftime locale."""
             return "{}-{}".format(MONTH_ABBR[month - 1], year)
 
-        months = []  # list of "Oct-2025" style strings
+        months = []
         start_d = _parse_any_date(period.get("start_date", ""))
         end_d = _parse_any_date(period.get("end_date", ""))
 
@@ -1437,11 +1994,9 @@ async def _deterministic_kpi_response(history: Optional[List[dict]], latest_ques
                 else:
                     m += 1
         else:
-            # Fallback: take month keys from billing data rows (skipping Total)
             months = [r.get("month") for r in billing_data
                       if str(r.get("month", "")).lower() != "total" and r.get("month")]
 
-        # Display headers use short year: "Oct-25"
         def short_month(m_key):
             parts = m_key.split("-")
             if len(parts) == 2 and len(parts[1]) == 4:
@@ -1450,7 +2005,7 @@ async def _deterministic_kpi_response(history: Optional[List[dict]], latest_ques
 
         display_months = [short_month(m) for m in months]
 
-        # --- 3. Billing Revenue & GP Performance ---
+        # --- 5. Billing Revenue & GP Performance Table ---
         rows.append(["Billing Revenue & GP Performance"])
         rows.append(["Particulars"] + display_months + ["YTD Bud vs Act.", "Total"])
 
@@ -1477,7 +2032,23 @@ async def _deterministic_kpi_response(history: Optional[List[dict]], latest_ques
         rows.append([])
         rows.append([])
 
-        # --- 4. Receivable Summary Report ---
+        # --- 6. GP Performance by Service Line / Department ---
+        gp_sl_data = kpi_payload.get("gp_performance_by_service_line", [])
+        if gp_sl_data:
+            rows.append(["GP & Performance by Service Line / Department"])
+            rows.append(["Service Line / Department", "Target Revenue", "Actual Revenue", "Variance", "Gross Profit"])
+            for sl_item in gp_sl_data:
+                rows.append([
+                    sl_item.get("name") or sl_item.get("service_line") or sl_item.get("department", "Unknown"),
+                    format_num(sl_item.get("target_rev") or sl_item.get("target_value", 0)),
+                    format_num(sl_item.get("actual_rev") or sl_item.get("total_invoice_amount_with_credit", 0)),
+                    format_num(sl_item.get("variance", 0)),
+                    format_num(sl_item.get("gross_profit") or sl_item.get("total_gross_profit", 0))
+                ])
+            rows.append([])
+            rows.append([])
+
+        # --- 7. Receivable Summary Report ---
         rows.append(["Receivable Summary Report"])
 
         aging_data = kpi_payload.get("receivable_aging_table", [])
@@ -1487,9 +2058,6 @@ async def _deterministic_kpi_response(history: Optional[List[dict]], latest_ques
 
         AGING_KEYS = ["<30", "30-60", "60-120", "120-180", "180-365", ">365"]
 
-        # Build a (year, month_num) -> row dict — works regardless of string format differences
-        # between Python's MONTH_ABBR and dayjs's MMM locale output.
-        import re as _re
         _MMAP = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
                  "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
         def _ym(s):
@@ -1528,17 +2096,26 @@ async def _deterministic_kpi_response(history: Optional[List[dict]], latest_ques
         rows.append(get_aging_row("180 - 365 days", "180-365"))
         rows.append(get_aging_row("> 365 days",     ">365"))
 
-        # Receivable Grand Total row
         grand_r = ["Total"]
         for m in months:
             mrow = aging_ym.get(_ym(m), {})
             grand_r.append(sum(format_num(mrow.get(k)) for k in AGING_KEYS))
         grand_r.append(sum(format_num(aging_total_row.get(k)) for k in AGING_KEYS))
         rows.append(grand_r)
+        rows.append([])
+        rows.append([])
 
-        fy_str = str(filters_applied.get("financial_year") or "FY").replace("-", "_")
-        cust_str = str(filters_applied.get("customer") or "").replace(" ", "_")
-        
+        # --- 8. Executive Goal & Performance Status Insights ---
+        narrative_text = _build_kpi_narrative(kpi_payload, filters_applied, period)
+        rows.append(["Executive Goal & Performance Status"])
+        for line in narrative_text.splitlines():
+            clean_line = line.replace("#", "").replace("**", "").replace("---", "").strip()
+            if clean_line:
+                rows.append([clean_line])
+
+        fy_str = str((filters_applied or {}).get("financial_year") or "FY").replace("-", "_")
+        cust_str = str((filters_applied or {}).get("customer") or "").replace(" ", "_")
+
         filename = f"KPI_Report_{fy_str}"
         if cust_str and cust_str.lower() != "all":
             filename += f"_{cust_str}"
@@ -1578,6 +2155,12 @@ async def _deterministic_kpi_response(history: Optional[List[dict]], latest_ques
     try:
         kpi_data = await asyncio.to_thread(_call_json_api, kpi_url, auth_token)
         aging_data = await asyncio.to_thread(_call_json_api, aging_url, auth_token)
+
+        import logging
+        logger = logging.getLogger("uvicorn")
+        logger.info(f"[1. RAW CRM API RESPONSE] Top keys: {list((kpi_data or {}).keys())}")
+        logger.info(f"[1. RAW CRM API TOP FIELDS] secured_business={(kpi_data or {}).get('secured_business')}, balance_to_achieve={(kpi_data or {}).get('balance_to_achieve')}, total_projects={(kpi_data or {}).get('total_projects')}, budget_vs_actual_gp={(kpi_data or {}).get('budget_vs_actual_gp')}")
+
         kpi_payload = _build_kpi_contract(kpi_data, aging_data, filters_applied, period)
 
         export_data = _build_excel_export_from_kpi_payload(kpi_payload, filters_applied, period)
@@ -2657,6 +3240,7 @@ DEPT_SUGGESTIONS = {
 
 class SuggestionsRequest(BaseModel):
     user_id: int = 0
+    employee_id: Optional[int] = None
     designation_name: str = "Unknown"
     department_name: str = "Unknown"
 
@@ -2668,7 +3252,8 @@ def get_suggestions(request: SuggestionsRequest):
     designation = request.designation_name or "Unknown"
     department = request.department_name or "Unknown"
 
-    if request.user_id and request.user_id > 0:
+    emp_lookup_id = request.employee_id
+    if emp_lookup_id and emp_lookup_id > 0:
         try:
             engine = get_db_engine()
             with engine.connect() as conn:
@@ -2676,7 +3261,7 @@ def get_suggestions(request: SuggestionsRequest):
                     "SELECT d.name FROM employees e "
                     "JOIN m_designation d ON e.emp_designation_id = d.id "
                     "WHERE e.id = :emp_id"
-                ), {"emp_id": request.user_id}).fetchone()
+                ), {"emp_id": emp_lookup_id}).fetchone()
                 if row:
                     designation = row[0]
 
@@ -2684,7 +3269,7 @@ def get_suggestions(request: SuggestionsRequest):
                     "SELECT d.name FROM employees e "
                     "JOIN m_department d ON e.emp_department_id = d.id "
                     "WHERE e.id = :emp_id"
-                ), {"emp_id": request.user_id}).fetchone()
+                ), {"emp_id": emp_lookup_id}).fetchone()
                 if row2:
                     department = row2[0]
         except Exception as e:
@@ -2730,7 +3315,7 @@ async def ask_ai(request: QuestionRequest):
         from config.role_tier_config import get_tier_for_role
         resolved_tier = get_tier_for_role(user_ctx.get('role_name', 'Unknown'))
         semantic_layer.set_user_context({
-            'employee_id': user_ctx.get('user_id', 0) or 0,
+            'employee_id': user_ctx.get('employee_id'),
             'user_tier': resolved_tier,
             'role_name': user_ctx.get('role_name', 'Unknown'),
             'department_id': user_ctx.get('department_id'),
@@ -2742,7 +3327,7 @@ async def ask_ai(request: QuestionRequest):
         print(f"[FASTPATH] Matched deterministic route for: {latest_question!r}")
         try:
             from db.database import save_token_usage_async
-            emp_id = user_ctx.get("user_id", 1) if user_ctx else 1
+            emp_id = (user_ctx or {}).get("employee_id") or 0
             await save_token_usage_async(
                 employee_id=emp_id,
                 session_id="ask-ai-session",
@@ -2789,13 +3374,13 @@ async def ask_ai(request: QuestionRequest):
     if is_edit_intent and entity_name and entity_type:
         try:
             from agent.tools_new import handle_edit_intent
-            edit_payload = await handle_edit_intent(entity_type, entity_name, user_ctx.get('user_id', 0) if user_ctx else 0, user_ctx.get('role_name', 'Unknown') if user_ctx else 'Unknown')
+            edit_payload = await handle_edit_intent(entity_type, entity_name, user_ctx.get('employee_id') if user_ctx else None, user_ctx.get('role_name', 'Unknown') if user_ctx else 'Unknown')
         except Exception as e:
             print(f"[EditIntent] Failed to build edit payload: {e}")
 
     try:
         from db.database import save_token_usage_async
-        emp_id = user_ctx.get("user_id", 1) if user_ctx else 1
+        emp_id = (user_ctx or {}).get("employee_id") or 0
         await save_token_usage_async(
             employee_id=emp_id,
             session_id="ask-ai-session",
@@ -2847,7 +3432,7 @@ async def ask_ai_stream(request: QuestionRequest):
         from config.role_tier_config import get_tier_for_role
         resolved_tier = get_tier_for_role(user_ctx.get('role_name', 'Unknown'))
         semantic_layer.set_user_context({
-            'employee_id': user_ctx.get('user_id', 0) or 0,
+            'employee_id': user_ctx.get('employee_id'),
             'role_name': user_ctx.get('role_name', 'Unknown'),
             'department_id': user_ctx.get('department_id'),
         })
@@ -2875,7 +3460,7 @@ async def ask_ai_stream(request: QuestionRequest):
 
             try:
                 from db.database import save_token_usage_async
-                emp_id = user_ctx.get("user_id", 1) if user_ctx else 1
+                emp_id = (user_ctx or {}).get("employee_id") or 0
                 await save_token_usage_async(
                     employee_id=emp_id,
                     session_id="ask-ai-stream-session",
@@ -2912,7 +3497,7 @@ async def ask_ai_stream(request: QuestionRequest):
 
         try:
             from db.database import save_token_usage_async
-            emp_id = user_ctx.get("user_id", 1) if user_ctx else 1
+            emp_id = (user_ctx or {}).get("employee_id") or 0
             await save_token_usage_async(
                 employee_id=emp_id,
                 session_id="ask-ai-stream-session",

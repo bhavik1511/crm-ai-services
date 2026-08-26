@@ -24,6 +24,7 @@ from memory import chat_history
 from memory.serializer import build_clarification_dto, safe_json_dumps
 from db.database import get_db_engine
 from agent.planner import EnterprisePlanner, RequestContext
+from agent.secure_log_sanitizer import sanitize_for_log
 
 load_dotenv(override=True)
 
@@ -93,10 +94,6 @@ def _decode_jwt(credentials: HTTPAuthorizationCredentials) -> dict:
         or _to_int(payload.get("emp_id"))
         or _to_int(payload.get("employeeId"))
     )
-
-    # Employee-login tokens may only carry `id` for the employee row.
-    if not employee_id and payload.get("isEmployeeLogin") is True:
-        employee_id = _to_int(payload.get("id"))
 
     user_name = payload.get("name", payload.get("user_name", "Unknown"))
 
@@ -193,7 +190,7 @@ def _decode_jwt(credentials: HTTPAuthorizationCredentials) -> dict:
     
     print(f"[DEBUG JWT RESOLVED]")
     print(f"  user_id: {user_id}")
-    print(f"  employee_id: {resolved_emp_id or employee_id or user_id}")
+    print(f"  employee_id: {resolved_emp_id or employee_id}")
     print(f"  role_name: {role_name}")
     print(f"  hierarchy_level (TIER): {hierarchy_level}")
     print(f"  department: {department}")
@@ -201,7 +198,7 @@ def _decode_jwt(credentials: HTTPAuthorizationCredentials) -> dict:
 
     user_context = {
         "user_id": user_id,
-        "employee_id": resolved_emp_id or employee_id or user_id,
+        "employee_id": (resolved_emp_id or employee_id) if (resolved_emp_id or employee_id) else None,
         "role": role_name,
         "role_name": role_name,
         "hierarchy_level": hierarchy_level,
@@ -422,28 +419,16 @@ async def chat(
             logger.info(f"[ChatRoute] Matched deterministic route for: {question[:60]}...")
         else:
             if USE_ENTERPRISE_PLANNER:
-                from agent.executive_classifier import handle_executive_classification
-                _is_conv, _conv_reply = await handle_executive_classification(question, history, user_context)
-                if _is_conv and _conv_reply:
-                    logger.info(f"[ExecutiveClassifier] Handled conversational query '{question[:40]}' via short-circuit (0 Planner/DB cost)")
-                    return {
-                        "type": "done",
-                        "answer": _conv_reply,
-                        "content": _conv_reply,
-                        "was_cached": False,
-                        "cache_tier": "conversational_short_circuit"
-                    }
-
                 # ── Clarification State Injection (zero LLM cost) ──────────────────
                 # Load any pending clarification from the session store and inject it
-                # into user_context so the Planner can resume without re-planning.
+                # into user_context so the Planner/Engine can resume without re-planning.
                 from memory.session_manager import (
                     get_clarification_state, save_clarification_state, clear_clarification_state
                 )
                 # [DIAG-1] session_id + conversation metadata
                 logger.info(f"[DIAG-1] /chat/query | session_id={session_id} | user_id={user_id} | question='{question[:60]}'")
 
-                # [DIAG-3] Load clarification state
+                # [DIAG-3] Load clarification state BEFORE running conversational short-circuit
                 _clar_state = await get_clarification_state(session_id)
 
                 # [DIAG-4] Log loaded state
@@ -455,10 +440,32 @@ async def chat(
 
                 clar_history = history
                 if _clar_state:
-                    user_context["previous_execution_plan"] = _clar_state.get("execution_plan")
-                    logger.info(f"[ChatRoute] Injected clarification state for session={session_id}, missing={_clar_state.get('missing_fields')}")
+                    _plan = _clar_state.get("execution_plan") or {}
+                    if isinstance(_plan, dict) and _clar_state.get("original_question"):
+                        _plan["original_question"] = _clar_state.get("original_question")
+                    user_context["previous_execution_plan"] = _plan
+                    _restored_cap = None
+                    if isinstance(_plan, dict) and _plan.get("business_capabilities"):
+                        caps = _plan.get("business_capabilities")
+                        if caps and isinstance(caps, list) and len(caps) > 0:
+                            _restored_cap = caps[0].get("id")
+                    logger.info(f"[CLARIFICATION] pending=true | missing_fields={_clar_state.get('missing_fields')}")
+                    logger.info(f"[CLARIFICATION_RESOLUTION] input='{question[:60]}'")
+                    logger.info(f"[PLAN_RESTORED] capability='{_restored_cap}'")
                     # Clarification Fast-Path: Omit full history to eliminate token overhead on clarification follow-ups
                     clar_history = []
+                else:
+                    from agent.executive_classifier import handle_executive_classification
+                    _is_conv, _conv_reply = await handle_executive_classification(question, history, user_context)
+                    if _is_conv and _conv_reply:
+                        logger.info(f"[ExecutiveClassifier] Handled conversational query '{question[:40]}' via short-circuit (0 Planner/DB cost)")
+                        return {
+                            "type": "done",
+                            "answer": _conv_reply,
+                            "content": _conv_reply,
+                            "was_cached": False,
+                            "cache_tier": "conversational_short_circuit"
+                        }
 
                 # [DIAG-5/6] Log user_context before RequestContext creation
                 logger.info(
@@ -534,12 +541,14 @@ async def chat(
         # ── Telemetry Logging to MySQL Database (ai_chatbot_usage) ─────────
         try:
             from db.database import save_token_usage_async
-            _emp_id = (user_context or {}).get("employee_id") or user_id or 0
-            _telem = result.get("telemetry", {})
-            _model = _telem.get("model") or ("fast-path-deterministic" if _telem.get("fast_path") else (os.getenv("PRIMARY_MODEL") or os.getenv("LLM_MODEL") or "qwen/qwen3.6-27b"))
-            _in_tok = _telem.get("input_tokens") if _telem.get("input_tokens") is not None else _telem.get("planner_tokens", 0)
-            _out_tok = _telem.get("output_tokens") if _telem.get("output_tokens") is not None else _telem.get("synthesizer_tokens", 0)
-            _tot_tok = _telem.get("total_tokens", _in_tok + _out_tok)
+            from config.llm_factory import extract_token_usage
+            _emp_id = (user_context or {}).get("employee_id") or 0
+            _tu = extract_token_usage(result)
+            _telem = result.get("telemetry") if isinstance(result.get("telemetry"), dict) else {}
+            _model = _tu.get("model_name") or _telem.get("model") or ("fast-path-deterministic" if _telem.get("fast_path") else (os.getenv("PRIMARY_MODEL") or os.getenv("LLM_MODEL") or "openai/gpt-oss-20b"))
+            _in_tok = _tu.get("input_tokens") or _telem.get("input_tokens") or _telem.get("planner_tokens", 0)
+            _out_tok = _tu.get("output_tokens") or _telem.get("output_tokens") or _telem.get("synthesizer_tokens", 0)
+            _tot_tok = _tu.get("total_tokens") or (_in_tok + _out_tok)
             _exec_path = _telem.get("execution_path") or ("FAST_PATH" if _telem.get("fast_path") else "PLANNER_LLM")
             await save_token_usage_async(
                 employee_id=_emp_id,
@@ -551,8 +560,8 @@ async def chat(
                 total_cost_usd=0.0,
                 status="success",
                 trace_id=_telem.get("trace_id") or f"trc_{(session_id or 'sess')[:8]}_{int(time.time()*1000)}",
-                capability_id=_telem.get("capability_id"),
-                operation=_telem.get("operation"),
+                capability_id=_telem.get("capability_id") or result.get("report_intent"),
+                operation=_telem.get("operation") or "chat_response",
                 execution_path=_exec_path,
                 planner_tokens=_telem.get("planner_tokens", 0),
                 synthesizer_tokens=_telem.get("synthesizer_tokens", 0),
@@ -563,11 +572,12 @@ async def chat(
             )
         except Exception as _tb_err:
             logger.error(f"[ChatRoute] Failed to save success token usage: {_tb_err}")
+
     except Exception as e:
         logger.error(f"[ChatRoute] resolve_answer failed: {e}")
         try:
             from db.database import save_token_usage_async
-            _emp_id = (user_context or {}).get("employee_id") or user_id or 0
+            _emp_id = (user_context or {}).get("employee_id") or 0
             _model = os.getenv("LLM_MODEL") or os.getenv("PRIMARY_MODEL") or "unknown"
             await save_token_usage_async(
                 employee_id=_emp_id,
@@ -615,7 +625,7 @@ async def chat(
             await chat_history.save_chat_entry({
                 "session_id": session_id,
                 "user_id": user_id,
-                "employee_id": user_context.get("employee_id", user_id),
+                "employee_id": user_context.get("employee_id"),
                 "role": user_context.get("role", "Staff"),
                 "hierarchy_level": user_context.get("hierarchy_level", 4),
                 "department_id": user_context.get("department_id"),
@@ -878,7 +888,7 @@ async def chat_stream(
 
             if _run_hybrid:
                 import hashlib
-                from db.database_redis import get_redis
+                from cache import get_secure_cache_manager, generate_secure_cache_key
                 from rag import vector_store_v2 as vector_store
                 from agent.agent import ask_question_streaming
                 from memory.memory_manager import _needs_live_data
@@ -891,28 +901,26 @@ async def chat_stream(
                 else:
                     scope_key = role
                     
-                q_hash = hashlib.sha256(question.strip().lower().encode()).hexdigest()
-                redis_key = f"qa:{q_hash}:{hashlib.sha256(scope_key.encode()).hexdigest()[:12]}"
+                redis_key = generate_secure_cache_key("qa", user_context, question)
                 
                 cached_result = None
                 
                 # Live data queries bypass cache to avoid stale financial/HR data
                 # The Enterprise Planner also bypasses legacy caching to allow dynamic slot filling
                 if not _needs_live_data(question) and not USE_ENTERPRISE_PLANNER:
-                    # 1. Tier 1: Redis cache
+                    # 1. Tier 1: Encrypted Redis cache
                     try:
-                        redis = get_redis()
-                        cached = await redis.get(redis_key)
-                        if cached:
-                            data = json.loads(cached)
+                        scm = get_secure_cache_manager()
+                        data = await scm.get_secure(redis_key)
+                        if data and isinstance(data, dict):
                             if data.get("role_scope") == scope_key:
                                 data["hit_count"] = data.get("hit_count", 0) + 1
-                                await redis.setex(redis_key, 3600, json.dumps(data))
+                                await scm.set_secure(redis_key, data, 3600)
                                 cached_result = data
                                 cached_result["cache_tier"] = "redis"
                                 cached_result["was_cached"] = True
                     except Exception as e:
-                        logger.warning(f"Redis cache check failed: {e}")
+                        logger.warning(f"Secure Redis cache check failed: {e}")
                         
                     # 2. Tier 2: Vector cache
                     if not cached_result:
@@ -933,15 +941,6 @@ async def chat_stream(
                     await asyncio.sleep(0)
                     
                     if USE_ENTERPRISE_PLANNER:
-                        from agent.executive_classifier import handle_executive_classification
-                        _is_conv, _conv_reply = await handle_executive_classification(question, history, user_context)
-                        if _is_conv and _conv_reply:
-                            logger.info(f"[ExecutiveClassifier Stream] Handled conversational query '{question[:40]}' via short-circuit (0 Planner/DB cost)")
-                            yield f"data: {json.dumps({'type': 'token', 'content': _conv_reply})}\n\n"
-                            yield f"data: {safe_json_dumps({'type': 'done', 'answer': _conv_reply})}\n\n"
-                            yield "data: [DONE]\n\n"
-                            return
-
                         _already_streamed = False
                         # ── Clarification State Injection (zero LLM cost) ──────────────────
                         from memory.session_manager import (
@@ -950,19 +949,46 @@ async def chat_stream(
                         # [DIAG-1]
                         logger.info(f"[DIAG-1] /chat/stream | session_id={session_id} | user_id={user_id} | question='{question[:60]}'")
 
-                        # [DIAG-3]
+                        # [DIAG-3] Load clarification state BEFORE running conversational short-circuit
                         _clar_state = await get_clarification_state(session_id)
+                        from memory.session_manager import get_session_memory
+                        _sess_mem = await get_session_memory(session_id) or {}
+                        _has_active_followups = bool(_sess_mem.get("active_followup_options"))
 
                         # [DIAG-4]
                         logger.info(
                             f"[DIAG-4] /chat/stream | clarification_state loaded | "
                             f"has_state={bool(_clar_state)} | "
+                            f"has_followups={_has_active_followups} | "
                             f"missing_fields={_clar_state.get('missing_fields') if _clar_state else None}"
                         )
 
-                        if _clar_state:
-                            user_context["previous_execution_plan"] = _clar_state.get("execution_plan")
-                            logger.info(f"[StreamRoute] Injected clarification state for session={session_id}, missing={_clar_state.get('missing_fields')}")
+                        if _clar_state or _has_active_followups:
+                            if _clar_state:
+                                _plan = _clar_state.get("execution_plan") or {}
+                                if isinstance(_plan, dict) and _clar_state.get("original_question"):
+                                    _plan["original_question"] = _clar_state.get("original_question")
+                                user_context["previous_execution_plan"] = _plan
+                                _restored_cap = None
+                                if isinstance(_plan, dict) and _plan.get("business_capabilities"):
+                                    caps = _plan.get("business_capabilities")
+                                    if caps and isinstance(caps, list) and len(caps) > 0:
+                                        _restored_cap = caps[0].get("id")
+                                logger.info(f"[CLARIFICATION] pending=true | missing_fields={_clar_state.get('missing_fields')}")
+                                logger.info(f"[CLARIFICATION_RESOLUTION] input='{question[:60]}'")
+                                logger.info(f"[PLAN_RESTORED] capability='{_restored_cap}'")
+                        else:
+                            from agent.executive_classifier import handle_executive_classification
+                            from config.llm_factory import clean_think_tags
+                            _is_conv, _conv_reply = await handle_executive_classification(question, history, user_context)
+                            if _is_conv and _conv_reply:
+                                _conv_reply = clean_think_tags(_conv_reply)
+                                if _conv_reply and "thinking process" not in _conv_reply.lower() and "<think>" not in _conv_reply.lower():
+                                    logger.info(f"[ExecutiveClassifier Stream] Handled conversational query '{question[:40]}' via short-circuit (0 Planner/DB cost)")
+                                    yield f"data: {json.dumps({'type': 'token', 'content': _conv_reply})}\n\n"
+                                    yield f"data: {safe_json_dumps({'type': 'done', 'answer': _conv_reply})}\n\n"
+                                    yield "data: [DONE]\n\n"
+                                    return
 
                         # [DIAG-5/6]
                         logger.info(
@@ -998,9 +1024,26 @@ async def chat_stream(
                         yield f"data: {json.dumps({'type': 'thinking', 'content': 'Analyzing query intent & business context...'})}\n\n"
                         await asyncio.sleep(0)
 
-                        planner = EnterprisePlanner()
-                        plan_result = await planner.execute_turn(req_ctx)
-                        logger.info(f"[RUNTIME INSTRUMENTATION] [ChatRoute PLANNER TURN RETURNED]:\n{json.dumps(plan_result, default=str)[:1000]}")
+                        hybrid_result = None
+                        try:
+                            from engine.hybrid_engine import get_hybrid_engine
+                            hybrid_engine = get_hybrid_engine()
+                            hybrid_result = await hybrid_engine.process_turn(
+                                question=question,
+                                jwt_token=credentials.credentials,
+                                session_id=session_id,
+                                user_context=user_context
+                            )
+                        except Exception as h_err:
+                            logger.warning(f"[StreamRoute] HybridEngine check failed (non-fatal, falling back to Planner): {h_err}")
+
+                        if hybrid_result:
+                            plan_result = hybrid_result
+                        else:
+                            planner = EnterprisePlanner()
+                            plan_result = await planner.execute_turn(req_ctx)
+
+                        logger.info(f"[RUNTIME INSTRUMENTATION] [ChatRoute TURN RETURNED]:\n{json.dumps(sanitize_for_log(plan_result), default=str)[:1000]}")
                         result = plan_result
                         result["answer"] = plan_result.get("content", "Sorry, I could not process that.")
                         result["cache_tier"] = "planner"
@@ -1080,7 +1123,7 @@ async def chat_stream(
             logger.error(f"[StreamEndpoint] Error: {e}\n{traceback.format_exc()}")
             try:
                 from db.database import save_token_usage_async
-                _emp_id = (user_context or {}).get("employee_id") or user_id or 0
+                _emp_id = (user_context or {}).get("employee_id") or 0
                 _model = os.getenv("LLM_MODEL") or os.getenv("PRIMARY_MODEL") or "unknown"
                 await save_token_usage_async(
                     employee_id=_emp_id,
@@ -1150,20 +1193,23 @@ async def chat_stream(
         yield "data: [DONE]\n\n"
 
         # Calculate and track token cost
-        token_usage = result.get("token_usage") or {}
-        model = token_usage.get("model_name") if token_usage else None
-        model = model or os.getenv("LLM_MODEL") or os.getenv("PRIMARY_MODEL") or "qwen/qwen3.6-27b"
-        in_tok = token_usage.get("input_tokens", 0) if token_usage else 0
-        out_tok = token_usage.get("output_tokens", 0) if token_usage else 0
-        tot_tok = token_usage.get("total_tokens", 0) if token_usage else 0
+        from config.llm_factory import extract_token_usage
+        _tu = extract_token_usage(result)
+        _telem = result.get("telemetry") if isinstance(result.get("telemetry"), dict) else {}
+        model = _tu.get("model_name") or _telem.get("model") or os.getenv("LLM_MODEL") or os.getenv("PRIMARY_MODEL") or "openai/gpt-oss-20b"
+        in_tok = _tu.get("input_tokens") or _telem.get("input_tokens") or 0
+        out_tok = _tu.get("output_tokens") or _telem.get("output_tokens") or 0
+        tot_tok = _tu.get("total_tokens") or (in_tok + out_tok)
+        planner_tok = _telem.get("planner_tokens", 0)
+        synth_tok = _telem.get("synthesizer_tokens", 0)
         from db.database import calculate_llm_cost
         cost = calculate_llm_cost(model, in_tok, out_tok) if tot_tok > 0 else 0.0
-        exec_path = result.get("cache_tier") or ("fast_path" if result.get("latency_ms") == 0 else "llm_stream")
-        cap_id = result.get("report_intent") or "general_query"
+        exec_path = _telem.get("execution_path") or result.get("cache_tier") or ("fast_path" if result.get("latency_ms") == 0 else "llm_stream")
+        cap_id = _telem.get("capability_id") or result.get("report_intent") or "general_query"
         try:
             from db.database import save_token_usage_async
             await save_token_usage_async(
-                employee_id=user_context.get("employee_id", user_id) or user_id or 1,
+                employee_id=user_context.get("employee_id") or 0,
                 session_id=session_id,
                 model_name=model or "unknown",
                 input_tokens=in_tok,
@@ -1173,10 +1219,13 @@ async def chat_stream(
                 execution_path=exec_path,
                 capability_id=cap_id,
                 operation="report_generation" if result.get("report_intent") else "chat_response",
+                planner_tokens=planner_tok,
+                synthesizer_tokens=synth_tok,
                 status="success"
             )
         except Exception as e:
             logger.error(f"[StreamEndpoint] Failed to save chatbot token usage: {e}")
+
 
         try:
             is_form = False
@@ -1201,7 +1250,7 @@ async def chat_stream(
                 await chat_history.save_chat_entry({
                     "session_id": session_id,
                     "user_id": user_id,
-                    "employee_id": user_context.get("employee_id", user_id),
+                    "employee_id": user_context.get("employee_id"),
                     "role": user_context.get("role", "Staff"),
                     "hierarchy_level": user_context.get("hierarchy_level", 4),
                     "department_id": user_context.get("department_id"),
@@ -1827,4 +1876,5 @@ async def get_ai_usage_logs(
             }
     except Exception as e:
         logger.error(f"[UsageLogs] Failed to fetch usage logs: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch usage logs: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch usage logs: {str(e)}")

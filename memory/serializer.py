@@ -23,9 +23,38 @@ def _json_default(obj: Any) -> Any:
 
 
 def safe_json_dumps(obj: Any) -> str:
-    """Convert any object to a JSON string without raising serialization errors."""
+    """Convert any object to a JSON string without raising serialization errors or circular reference exceptions."""
+    seen = set()
+
+    def _sanitize(val: Any) -> Any:
+        if isinstance(val, (str, int, float, bool, type(None))):
+            return val
+        if isinstance(val, (datetime, date)):
+            return val.isoformat()
+        
+        val_id = id(val)
+        if val_id in seen:
+            return "[Circular]"
+        seen.add(val_id)
+
+        try:
+            if isinstance(val, dict):
+                return {str(k): _sanitize(v) for k, v in val.items() if not str(k).startswith("_")}
+            if isinstance(val, (list, tuple, set)):
+                return [_sanitize(x) for x in val]
+            if hasattr(val, "dict") and callable(val.dict):
+                return _sanitize(val.dict())
+            if hasattr(val, "to_dict") and callable(val.to_dict):
+                return _sanitize(val.to_dict())
+            if hasattr(val, "__dict__"):
+                return _sanitize({k: v for k, v in val.__dict__.items() if not str(k).startswith("_")})
+            return str(val)
+        finally:
+            seen.remove(val_id)
+
     try:
-        return json.dumps(obj, default=_json_default)
+        sanitized = _sanitize(obj)
+        return json.dumps(sanitized)
     except Exception as e:
         logger.error(f"[Serializer] safe_json_dumps fallback failed: {e}")
         return json.dumps({"error": "Serialization failure", "details": str(e)})

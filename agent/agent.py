@@ -752,8 +752,8 @@ NAVIGATION ROUTES — use these EXACT paths in navigate_to JSON field:
 NEVER navigate to a page that is NOT explicitly listed above. If the user asks for a report or page that does not exist in this list (for example, "Total Estimation Report"), you MUST set `navigate_to` to the closest parent category (like "/projects/reports") or "/". NEVER invent, guess, or hallucinate URLs. If you output a URL that is not on this list, the application will crash.
 """
 
-    # Use true employee_id from context, fallback to user_id (if 0 or missing, it's 0)
-    employee_id = (user_context or {}).get("employee_id") or (user_context or {}).get("user_id", 0)
+    # Use true employee_id from context (if None/0, keep 0 for unassigned)
+    employee_id = (user_context or {}).get("employee_id") or 0
     employee_id_str = str(employee_id) if employee_id else "0"
 
     from config.role_tier_config import get_tier_for_role
@@ -2219,7 +2219,7 @@ async def ask_question_streaming(history, user_context=None):
 
         from config.role_tier_config import get_tier_for_role
         user_tier = get_tier_for_role(role_name)
-        employee_id = user_ctx.get("employee_id") or user_ctx.get("user_id", 0)
+        employee_id = user_ctx.get("employee_id") or 0
         employee_id_str = str(employee_id) if employee_id else "0"
 
         from config.role_tier_config import build_rbac_prompt

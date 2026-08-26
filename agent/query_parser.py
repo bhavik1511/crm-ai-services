@@ -66,7 +66,8 @@ _MONTH_NAMES_DICT = {'jan':1,'feb':2,'mar':3,'apr':4,'may':5,'jun':6, 'jul':7,'a
 KNOWN_SERVICE_LINES = {
     "audit", "tax", "advisory", "consulting", "deals", "strategy", 
     "risk advisory", "financial advisory", "accounting", "legal", 
-    "technology", "assurance", "corporate finance"
+    "technology", "assurance", "corporate finance",
+    "tech", "brs", "bps", "a&a", "growth", "growth advisory"
 }
 
 def _extract_service_line_name(question: str) -> str:
@@ -80,8 +81,44 @@ def _extract_service_line_name(question: str) -> str:
             return sl.title()
     return ""
 
+_TEMPORAL_NOISE_REGEX = re.compile(
+    r'\b('
+    r'report|summary|kpi|data|details?|active|projects?|invoices?|proposals?|'
+    r'for|in|on|during|since|from|to|until|last|next|this|current|year|month|quarter|'
+    r'fy|financial|fiscal|20\d\d|q[1-4]|ytd|year\s*to\s*date|'
+    r'january|february|march|april|may|june|july|august|september|october|november|december|'
+    r'jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec|'
+    r'please|download|show|give|button|thanks|ok|okay|tell|can\s+you'
+    r')\b.*$',
+    re.IGNORECASE
+)
+
+def _clean_entity_candidate(candidate: str) -> str:
+    """Strips articles, leading/trailing punctuation, and trailing temporal noise/prepositions from candidate entity names."""
+    if not candidate:
+        return ""
+    cleaned = re.sub(r'^(the|a|an)\s+', '', candidate, flags=re.IGNORECASE).strip()
+    cleaned = _TEMPORAL_NOISE_REGEX.sub('', cleaned).strip()
+    cleaned = re.sub(r'[^a-zA-Z0-9\s]', '', cleaned).strip()
+    return cleaned
+
 def _extract_person_name(question: str) -> str:
-    """Extracts person name ONLY when explicit employee trigger words are present."""
+    """Extracts person name (from possessives, 'for X', 'of X', 'KPI for X', etc.)."""
+    if not question:
+        return ""
+
+    q_lower = question.lower()
+    if "gp" in q_lower or "gross profit" in q_lower or "gp_performance" in q_lower:
+        if not any(kw in q_lower for kw in ["employee", "staff", "consultant", "resource", "developer", "manager", "partner"]):
+            return ""
+
+    # 0. Possessive pattern (e.g., "Shashank's active projects", "Shashank Arya's KPI")
+    poss_m = re.search(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\'s\b', question)
+    if poss_m:
+        candidate = _clean_entity_candidate(poss_m.group(1))
+        if len(candidate) > 2 and candidate.lower() not in _MONTH_NAMES_SET and candidate.lower() not in KNOWN_SERVICE_LINES:
+            return candidate
+
     from agent.entity_resolver import has_employee_trigger
     if not has_employee_trigger(question):
         return ""
@@ -91,19 +128,13 @@ def _extract_person_name(question: str) -> str:
 
     m = _FOR_PATTERN.search(question)
     if m:
-        candidate = m.group(1).strip()
-        candidate = re.sub(r'^(the|a|an)\s+', '', candidate, flags=re.IGNORECASE).strip()
-        candidate = re.sub(r'\b(report|summary|data|details?|for|in|on|last|next|this|year|month|quarter|fy|20\d\d|got\s+it|please|download|show|give|button|thanks|ok|okay|tell|can\s+you)\b.*$', '', candidate, flags=re.IGNORECASE).strip()
-        candidate = re.sub(r'[^a-zA-Z0-9\s]', '', candidate).strip()
+        candidate = _clean_entity_candidate(m.group(1))
         if len(candidate) > 2 and not _is_company_name(candidate) and candidate.lower() not in _MONTH_NAMES_SET and candidate.lower() not in KNOWN_SERVICE_LINES:
             return candidate
 
     m = _OF_PATTERN.search(question)
     if m:
-        candidate = m.group(1).strip()
-        candidate = re.sub(r'^(the|a|an)\s+', '', candidate, flags=re.IGNORECASE).strip()
-        candidate = re.sub(r'\b(report|summary|data|details?|for|in|on|last|next|this|year|month|quarter|fy|20\d\d|got\s+it|please|download|show|give|button|thanks|ok|okay|tell|can\s+you)\b.*$', '', candidate, flags=re.IGNORECASE).strip()
-        candidate = re.sub(r'[^a-zA-Z0-9\s]', '', candidate).strip()
+        candidate = _clean_entity_candidate(m.group(1))
         if len(candidate) > 2 and not _is_company_name(candidate) and candidate.lower() not in _MONTH_NAMES_SET and candidate.lower() not in KNOWN_SERVICE_LINES:
             return candidate
     return ""
@@ -112,24 +143,56 @@ def _extract_company_name(question: str) -> str:
     """Extracts customer / company name from question text."""
     if not question:
         return ""
+
+    q_lower = question.lower()
+    if "gp" in q_lower or "gross profit" in q_lower or "gp_performance" in q_lower:
+        if not any(kw in q_lower for kw in ["customer", "client", "company", "account"]):
+            return ""
+
     q = question.strip()
-    
-    # 1. Pattern: 'customer/client <Name>' or 'customer/client is <Name>'
-    m_cust = re.search(r'\b(?:customer|client)\s+(?:name\s+)?(?:is\s+)?([A-Za-z0-9\.\,\'\&\-\s]{3,40})', q, re.IGNORECASE)
-    if m_cust:
-        candidate = m_cust.group(1).strip()
-        candidate = re.sub(r'\b(report|summary|data|details?|active|projects?|invoices?|for|in|on|last|next|this|year|month|fy|20\d\d)\b.*$', '', candidate, flags=re.IGNORECASE).strip()
-        if len(candidate) >= 3 and candidate.lower() not in _MONTH_NAMES_SET and candidate.lower() not in KNOWN_SERVICE_LINES:
+
+    _STOP_WORDS = {'all', 'service line', 'department', 'last month', 'this month', 'last year', 'this year', 'active projects', 'projects', 'revenue', 'receivables'}
+
+    def _is_valid_customer_candidate(candidate: str) -> bool:
+        if not candidate or len(candidate) < 3:
+            return False
+        cand_lower = candidate.lower()
+        if cand_lower in _STOP_WORDS or cand_lower in _MONTH_NAMES_SET or cand_lower in KNOWN_SERVICE_LINES:
+            return False
+        from agent.entity_resolver import is_aggregate_value, is_reserved_business_term
+        if is_aggregate_value(candidate) or is_reserved_business_term(candidate):
+            return False
+        # If candidate matches an active employee in CRM database, it's an employee, NOT a customer
+        if _lookup_employee_by_name(candidate):
+            return False
+        return True
+
+    # 1. Pattern: 'does <Name> have/has' (e.g. 'how many active projects does Dr. Hasan Ali Radhi has')
+    m_does = re.search(r'\bdoes\s+([A-Za-z0-9\.\,\'\&\-\s]{3,40}?)\s+(?:have|has)\b', q, re.IGNORECASE)
+    if m_does:
+        candidate = _clean_entity_candidate(m_does.group(1))
+        if _is_valid_customer_candidate(candidate):
             return candidate
 
-    # 2. Pattern: 'of <Name>' or 'for <Name>' (e.g., 'projects of Dr. Hasan Ali Radhi', 'active of Dr. Hasan Ali Radhi')
+    # 2. Pattern: '<Name>\'s active projects/proposals/invoices/revenue'
+    m_poss = re.search(r'\b([A-Za-z0-9\.\,\&\-\s]{3,40})\'s\s+(?:active\s+)?(?:projects|proposals|invoices|revenue|receivables|details|summary|report)\b', q, re.IGNORECASE)
+    if m_poss:
+        candidate = _clean_entity_candidate(m_poss.group(1))
+        if _is_valid_customer_candidate(candidate):
+            return candidate
+    
+    # 3. Pattern: 'customer/client <Name>' or 'customer/client is <Name>'
+    m_cust = re.search(r'\b(?:customer|client)\s+(?:name\s+)?(?:is\s+)?([A-Za-z0-9\.\,\'\&\-\s]{3,40})', q, re.IGNORECASE)
+    if m_cust:
+        candidate = _clean_entity_candidate(m_cust.group(1))
+        if _is_valid_customer_candidate(candidate):
+            return candidate
+
+    # 4. Pattern: 'of <Name>' or 'for <Name>' (e.g., 'projects of Dr. Hasan Ali Radhi', 'active of Dr. Hasan Ali Radhi')
     m_of = re.search(r'\b(?:of|for)\s+([A-Za-z0-9\.\,\'\&\-\s]{3,40})', q, re.IGNORECASE)
     if m_of:
-        candidate = m_of.group(1).strip()
-        candidate = re.sub(r'\b(report|summary|data|details?|last|next|this|year|month|quarter|fy|20\d\d|please|download|show|give)\b.*$', '', candidate, flags=re.IGNORECASE).strip()
-        candidate = candidate.strip(" .,").strip()
-        _STOP_WORDS = {'all', 'service line', 'department', 'last month', 'this month', 'last year', 'this year', 'active projects', 'projects', 'revenue', 'receivables'}
-        if len(candidate) >= 3 and candidate.lower() not in _STOP_WORDS and candidate.lower() not in _MONTH_NAMES_SET and candidate.lower() not in KNOWN_SERVICE_LINES:
+        candidate = _clean_entity_candidate(m_of.group(1))
+        if _is_valid_customer_candidate(candidate):
             return candidate
 
     return ""
@@ -297,6 +360,57 @@ def _lookup_employee_by_name(name: str) -> Optional[tuple[int, str]]:
     except Exception as e:
         logger.warning(f"[QueryParser] Employee lookup failed: {e}")
     return None
+
+
+def _lookup_customer_by_name(name: str) -> Optional[tuple[int, str]]:
+    """Lookup customer by name or code in CRM database."""
+    if not name or len(name) < 2:
+        return None
+    try:
+        from db.database import get_db_engine
+        from sqlalchemy import text
+        import difflib
+        
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(text("SELECT id, customer_name, cust_code FROM customers WHERE is_active = 1")).fetchall()
+            
+        if not rows:
+            return None
+            
+        cleaned_target = re.sub(r'\b(got\s+it|please|download|show|give|button|thanks|ok|okay|report|summary|the|a|an)\b.*$', '', name, flags=re.IGNORECASE).strip()
+        cleaned_target = re.sub(r'[^a-zA-Z0-9\s]', '', cleaned_target).strip()
+        if not cleaned_target:
+            cleaned_target = name.strip()
+
+        target_name = cleaned_target.lower()
+        target_no_spaces = target_name.replace(' ', '')
+        
+        name_map = {}
+        for r in rows:
+            c_id = int(r[0])
+            c_name = str(r[1]).strip() if r[1] else ""
+            c_code = str(r[2]).strip() if r[2] else ""
+            if c_name:
+                name_map[c_name.lower()] = (c_id, c_name)
+            if c_code:
+                name_map[c_code.lower()] = (c_id, c_name)
+
+        # 1. Substring / exact match
+        for cust_key, cust_data in name_map.items():
+            key_no_spaces = cust_key.replace(' ', '')
+            if target_no_spaces == key_no_spaces or target_no_spaces in key_no_spaces or key_no_spaces in target_no_spaces:
+                return cust_data
+
+        # 2. Fuzzy match
+        matches = difflib.get_close_matches(target_name, name_map.keys(), n=1, cutoff=0.7)
+        if matches:
+            return name_map[matches[0]]
+
+        return None
+    except Exception as e:
+        logger.warning(f"[QueryParser] Customer lookup failed: {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------

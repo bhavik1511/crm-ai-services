@@ -19,10 +19,13 @@ Supported temporal concepts:
   • explicit date range (e.g., "2026-01-01 to 2026-01-31", "2026-01-01 - 2026-01-31")
 """
 
+import logging
 import calendar
 import re
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 _MONTH_NAMES_MAP = {
     'jan': 1, 'january': 1,
@@ -68,45 +71,73 @@ def resolve_temporal_scope(query: str, now: Optional[datetime] = None) -> Dict[s
     current_fy_start_date = f"{current_fy_start_year}-10-01"
     current_fy_end_date = f"{current_fy_end_year}-09-30"
 
-    # 1. Explicit ISO / standard date range (YYYY-MM-DD to YYYY-MM-DD)
-    range_m = re.search(r'(\d{4}[-/]\d{2}[-/]\d{2})\s+(?:to|until|-)\s+(\d{4}[-/]\d{2}[-/]\d{2})', q)
+    # Helper to calculate FY string for a given year and month
+    def _calc_fy_for_date(y: int, m: int) -> str:
+        if m >= 10:
+            return f"{y}-{y + 1}"
+        else:
+            return f"{y - 1}-{y}"
+
+    # 1. Explicit ISO / standard date range (YYYY-MM-DD to/and/until/- YYYY-MM-DD)
+    range_m = re.search(r'(\d{4}[-/]\d{2}[-/]\d{2})\s+(?:to|until|and|-)\s+(\d{4}[-/]\d{2}[-/]\d{2})', q)
     if range_m:
         s_date = range_m.group(1).replace('/', '-')
         e_date = range_m.group(2).replace('/', '-')
+        try:
+            s_dt = datetime.strptime(s_date, "%Y-%m-%d")
+            fy_str = _calc_fy_for_date(s_dt.year, s_dt.month)
+        except Exception:
+            fy_str = current_fy_str
         return {
             "temporal_scope": "explicit_range",
             "start_date": s_date,
             "end_date": e_date,
-            "financial_year": current_fy_str,
-            "is_explicit": True
-        }
-
-    # 2. Explicit FY pattern (e.g. FY25, FY 2025-2026, FY2025, 2024-2025)
-    fy_match = re.search(r'\bfy\s*(\d{2,4})(?:\s*[-/]\s*(\d{2,4}))?\b', q)
-    if fy_match:
-        y1 = int(fy_match.group(1))
-        if y1 < 100:
-            y1 += 2000
-        if fy_match.group(2):
-            y2 = int(fy_match.group(2))
-            if y2 < 100:
-                y2 += 2000
-        else:
-            y2 = y1 + 1
-        fy_str = f"{y1}-{y2}"
-        return {
-            "temporal_scope": "explicit_fy",
-            "start_date": f"{y1}-10-01",
-            "end_date": f"{y2}-09-30",
             "financial_year": fy_str,
             "is_explicit": True
         }
 
-    # 3. Explicit Month + Year (e.g., "January 2026", "Jan 2026")
+    # 2. Explicit FY pattern (e.g. FY25, FY 2025-2026, FY2025, 2024-2025, FY 2025-26)
+    fy_match = re.search(r'\b(?:fy|financial\s*year|fiscal\s*year)\s*(\d{2,4})(?:\s*[-/]\s*(\d{2,4}))?\b', q)
+    if not fy_match:
+        fy_match = re.search(r'\b(\d{4})\s*[-/]\s*(\d{2,4})\b', q)
+
+    if fy_match:
+        v1 = int(fy_match.group(1))
+        if v1 < 100:
+            v1 += 2000
+            start_y, end_y = (v1, v1 + 1) if not fy_match.group(2) else (v1, int(fy_match.group(2)) + (2000 if int(fy_match.group(2)) < 100 else 0))
+        elif 2000 <= v1 <= 2999 and not fy_match.group(2):
+            v1_str = str(v1)
+            y1 = int(v1_str[:2])
+            y2 = int(v1_str[2:])
+            if 20 <= y1 <= 50 and y2 == y1 + 1:
+                start_y, end_y = 2000 + y1, 2000 + y2
+            else:
+                start_y, end_y = v1 - 1, v1
+        elif fy_match.group(2):
+            v2 = int(fy_match.group(2))
+            if v2 < 100:
+                v2 += 2000
+            start_y, end_y = v1, v2
+        else:
+            start_y, end_y = v1 - 1, v1
+
+        fy_str = f"{start_y}-{end_y}"
+        res = {
+            "temporal_scope": "explicit_fy",
+            "start_date": f"{start_y}-10-01",
+            "end_date": f"{end_y}-09-30",
+            "financial_year": fy_str,
+            "is_explicit": True
+        }
+        logger.info(f"[TEMPORAL_RESOLVED] query='{query[:40]}' | scope=explicit_fy | range={start_y}-10-01 to {end_y}-09-30")
+        return res
+
+    # 3. Explicit Month + Year (e.g., "January 2026", "Jan 2026", "Jan-2025", "January 25")
     month_year_m = re.search(
         r'\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|'
         r'jul(?:y)?|aug(?:ust)?|sep(?:tember|t)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)'
-        r'\s+(\d{2,4})\b', q)
+        r'[,/\s-]+(\d{2,4})\b', q)
     if month_year_m:
         m_str = month_year_m.group(1)[:3]
         y_val = int(month_year_m.group(2))
@@ -114,11 +145,12 @@ def resolve_temporal_scope(query: str, now: Optional[datetime] = None) -> Dict[s
             y_val += 2000
         m_val = _MONTH_NAMES_MAP[m_str]
         last_day = calendar.monthrange(y_val, m_val)[1]
+        fy_str = _calc_fy_for_date(y_val, m_val)
         return {
             "temporal_scope": "explicit_month",
             "start_date": f"{y_val}-{m_val:02d}-01",
             "end_date": f"{y_val}-{m_val:02d}-{last_day:02d}",
-            "financial_year": current_fy_str,
+            "financial_year": fy_str,
             "is_explicit": True
         }
 
@@ -134,11 +166,12 @@ def resolve_temporal_scope(query: str, now: Optional[datetime] = None) -> Dict[s
         if m_val > now.month:
             y_val = now.year - 1
         last_day = calendar.monthrange(y_val, m_val)[1]
+        fy_str = _calc_fy_for_date(y_val, m_val)
         return {
             "temporal_scope": "explicit_month",
             "start_date": f"{y_val}-{m_val:02d}-01",
             "end_date": f"{y_val}-{m_val:02d}-{last_day:02d}",
-            "financial_year": current_fy_str,
+            "financial_year": fy_str,
             "is_explicit": True
         }
 
@@ -205,8 +238,8 @@ def resolve_temporal_scope(query: str, now: Optional[datetime] = None) -> Dict[s
             "is_explicit": True
         }
 
-    # 10. "last fy" / "previous fy" / "previous financial year"
-    if any(x in q for x in ['last fy', 'previous fy', 'previous financial year', 'last financial year']):
+    # 10. "last fy" / "previous fy" / "previous financial year" / "last year"
+    if any(x in q for x in ['last fy', 'previous fy', 'previous financial year', 'last financial year', 'last year', 'prior year']):
         prev_fy_start_year = current_fy_start_year - 1
         prev_fy_end_year = current_fy_start_year
         prev_fy_str = f"{prev_fy_start_year}-{prev_fy_end_year}"
@@ -218,8 +251,8 @@ def resolve_temporal_scope(query: str, now: Optional[datetime] = None) -> Dict[s
             "is_explicit": True
         }
 
-    # 11. "this year" / "current year" / "current fy" / "this fy"
-    if any(x in q for x in ['this year', 'current year', 'current fy', 'this fy', 'financial year', 'fiscal year']):
+    # 11. "this year" / "current year" / "current fy" / "this fy" / "ytd" / "current revenue"
+    if any(x in q for x in ['this year', 'current year', 'current fy', 'this fy', 'financial year', 'fiscal year', 'ytd', 'year to date', 'current revenue', 'current']):
         return {
             "temporal_scope": "current_fy",
             "start_date": current_fy_start_date,

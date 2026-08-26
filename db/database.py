@@ -111,6 +111,7 @@ def get_db_engine() -> Engine:
         ("clarification_reason",   "ALTER TABLE ai_chatbot_usage ADD COLUMN clarification_reason VARCHAR(255) NULL"),
         ("backend_execution_ms",   "ALTER TABLE ai_chatbot_usage ADD COLUMN backend_execution_ms INT DEFAULT 0"),
         ("total_execution_ms",     "ALTER TABLE ai_chatbot_usage ADD COLUMN total_execution_ms INT DEFAULT 0"),
+        ("user_query",             "ALTER TABLE ai_chatbot_usage ADD COLUMN user_query TEXT NULL"),
     ]
     for col_name, col_sql in _col_migrations:
         with _engine.begin() as _conn:
@@ -225,7 +226,8 @@ async def save_token_usage_async(
     clarification_required: bool = False,
     clarification_reason: str = None,
     backend_execution_ms: int = 0,
-    total_execution_ms: int = 0
+    total_execution_ms: int = 0,
+    user_query: str = None
 ):
     """
     Asynchronously saves the authoritative token usage & telemetry record for chatbot to MySQL (ai_chatbot_usage).
@@ -233,7 +235,7 @@ async def save_token_usage_async(
     def _insert_sync():
         try:
             engine = get_db_engine()
-            safe_emp_id = 1
+            safe_emp_id = 0
             if employee_id is not None:
                 try:
                     s_emp = str(employee_id).strip()
@@ -241,14 +243,14 @@ async def save_token_usage_async(
                         s_emp = s_emp.split(":")[-1]
                     safe_emp_id = int(s_emp)
                 except Exception:
-                    safe_emp_id = 1
+                    safe_emp_id = 0
 
             with engine.begin() as conn:
                 conn.execute(
                     text("""
                         INSERT INTO ai_chatbot_usage 
-                        (employee_id, session_id, model_name, input_tokens, output_tokens, total_tokens, total_cost_usd, status, error_type, error_message, trace_id, capability_id, operation, execution_path, planner_tokens, synthesizer_tokens, clarification_required, clarification_reason, backend_execution_ms, total_execution_ms)
-                        VALUES (:emp_id, :sess_id, :model, :in_tok, :out_tok, :tot_tok, :cost, :status, :error_type, :error_message, :trace_id, :cap_id, :op, :exec_path, :p_tok, :s_tok, :clar_req, :clar_reason, :b_ms, :t_ms)
+                        (employee_id, session_id, model_name, input_tokens, output_tokens, total_tokens, total_cost_usd, status, error_type, error_message, trace_id, capability_id, operation, execution_path, planner_tokens, synthesizer_tokens, clarification_required, clarification_reason, backend_execution_ms, total_execution_ms, user_query)
+                        VALUES (:emp_id, :sess_id, :model, :in_tok, :out_tok, :tot_tok, :cost, :status, :error_type, :error_message, :trace_id, :cap_id, :op, :exec_path, :p_tok, :s_tok, :clar_req, :clar_reason, :b_ms, :t_ms, :u_query)
                     """),
                     {
                         "emp_id": safe_emp_id,
@@ -270,7 +272,8 @@ async def save_token_usage_async(
                         "clar_req": bool(clarification_required),
                         "clar_reason": clarification_reason,
                         "b_ms": int(backend_execution_ms or 0),
-                        "t_ms": int(total_execution_ms or 0)
+                        "t_ms": int(total_execution_ms or 0),
+                        "u_query": None
                     }
                 )
             logger.info(f"[TokenTracker] Successfully saved usage record to ai_chatbot_usage table: emp_id={safe_emp_id}, session={session_id}, path={execution_path}")
@@ -536,13 +539,13 @@ async def save_ai_email_parsing_async(
     await asyncio.to_thread(_insert_sync)
 
 
-def calculate_llm_cost(model_name: str, input_tokens: int, output_tokens: int) -> float:
+def calculate_llm_cost(model_name: str = None, input_tokens: int = 0, output_tokens: int = 0) -> float:
     """
     Calculates the USD cost of an LLM call based on model pricing per 1M tokens.
     Guarantees non-zero estimation for active models.
     """
     if not model_name:
-        model_name = "qwen/qwen3.6-27b"
+        model_name = os.getenv("LLM_MODEL") or os.getenv("PRIMARY_MODEL") or "openai/gpt-oss-20b"
     
     model_key = str(model_name).lower().strip()
     
@@ -550,6 +553,9 @@ def calculate_llm_cost(model_name: str, input_tokens: int, output_tokens: int) -
         # Groq & OpenRouter Models
         "qwen/qwen3.6-27b": {"in": 0.27, "out": 0.40},
         "openai/gpt-oss-20b": {"in": 0.10, "out": 0.15},
+        "openai/gpt-oss-120b": {"in": 0.50, "out": 0.75},
+        "groq/compound": {"in": 0.25, "out": 0.40},
+        "groq/compound-mini": {"in": 0.10, "out": 0.15},
         "llama-3.3-70b-versatile": {"in": 0.59, "out": 0.79},
         "llama-3.3-70b": {"in": 0.59, "out": 0.79},
         "llama-3.1-8b-instant": {"in": 0.05, "out": 0.08},

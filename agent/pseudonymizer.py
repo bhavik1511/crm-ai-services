@@ -151,6 +151,10 @@ class PostMaskingValidator:
 # Global Presidio Analyzer instance (loaded once per process)
 _global_presidio_analyzer = None
 
+# Global DB Masters Cache (300 seconds TTL)
+_db_masters_cache = None
+_db_masters_cache_time = 0.0
+
 class PresidioEngine:
     """
     Microsoft Presidio Analyzer Engine wrapper using process-level singleton.
@@ -162,6 +166,7 @@ class PresidioEngine:
             try:
                 import os
                 os.environ["TLDEXTRACT_FALLBACK_TO_SNAPSHOT"] = "1"
+                logging.getLogger("presidio-analyzer").setLevel(logging.WARNING)
                 from presidio_analyzer import AnalyzerEngine
                 _global_presidio_analyzer = AnalyzerEngine()
             except Exception as e:
@@ -191,8 +196,14 @@ class LocalPseudonymizer:
     def get_db_master_entities(self) -> Tuple[List[str], List[str], List[str]]:
         """
         Fetches known customer names, project names, employee names, and client contact names
-        from local MySQL database.
+        from local MySQL database. Uses process-level TTL cache (300 seconds).
         """
+        global _db_masters_cache, _db_masters_cache_time
+        import time
+        now = time.time()
+        if _db_masters_cache is not None and (now - _db_masters_cache_time) < 300:
+            return _db_masters_cache
+
         customers = []
         projects = []
         employees = []
@@ -259,7 +270,11 @@ class LocalPseudonymizer:
                         pass
         except Exception as e:
             logger.debug(f"[Pseudonymizer] DB master lookup notice: {e}")
-        return list(set(customers)), list(set(projects)), list(set(employees))
+
+        res = (list(set(customers)), list(set(projects)), list(set(employees)))
+        _db_masters_cache = res
+        _db_masters_cache_time = now
+        return res
 
     def prepare_for_external_llm(
         self,
@@ -586,3 +601,36 @@ def mask_email_text(
 def unmask_data(data: Any, mapping: Dict[str, str]) -> Any:
     """Backward-compatible unmasking wrapper."""
     return _pseudonymizer_instance.unmask_data(data, mapping)
+
+def validate_and_unmask_response(raw_response: Any, privacy_res: PrivacyResult) -> Any:
+    """
+    Post-response leak validation & in-memory local unmasking.
+    1. Validates that raw_response does NOT contain any raw confidential values from privacy_res.token_mapping.
+    2. If validation fails, raises PrivacySecurityError (FAIL CLOSED) and clears mapping.
+    3. Unmasks tokens in response locally.
+    4. Clears mapping via privacy_res.clear_mapping() in a try...finally block.
+    """
+    if not privacy_res:
+        return raw_response
+
+    try:
+        token_mapping = privacy_res.token_mapping or {}
+        if not privacy_res.safe:
+            raise PrivacySecurityError(f"Fail-closed: Request was blocked by privacy validator: {privacy_res.blocked_reason}")
+
+        # Check raw response for leaks
+        if token_mapping:
+            raw_str = str(raw_response)
+            for token, real_val in token_mapping.items():
+                if real_val and isinstance(real_val, str) and len(real_val.strip()) >= 3:
+                    clean_real = real_val.strip()
+                    pattern = r'\b' + re.escape(clean_real) + r'\b' if clean_real.replace(" ", "").isalnum() else re.escape(clean_real)
+                    if re.search(pattern, raw_str, re.IGNORECASE):
+                        logger.error(f"[Pseudonymizer] Post-response leak validation failed! Confidential value '{clean_real[:3]}***' detected in raw response.")
+                        raise PrivacySecurityError("Post-response leak validation failed: Raw confidential value detected in outbound LLM response.")
+
+        unmasked = _pseudonymizer_instance.unmask_data(raw_response, token_mapping)
+        return unmasked
+    finally:
+        privacy_res.clear_mapping()
+

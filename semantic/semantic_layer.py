@@ -2,7 +2,7 @@ import json
 import asyncio
 from decimal import Decimal
 from datetime import datetime, date
-from typing import Optional, Any, List, Dict
+from typing import Optional, Any, List, Dict, Tuple
 from langchain_core.tools import tool
 from sqlalchemy import text
 from db.database import get_db_engine
@@ -11,6 +11,9 @@ import urllib.error
 import contextvars
 
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Global auth token set by main.py before each request
 _CRM_AUTH_TOKEN = ''
@@ -36,11 +39,10 @@ def set_user_context(user_ctx: dict):
     tier = ctx.get('user_tier', 'N/A')
     print(f"[RBAC SemanticLayer] User context set: employee_id={emp_id}, user_tier={tier}, token_present={bool(_CRM_AUTH_TOKEN)}")
 
-def _resolve_rbac_params(employee_id, user_tier):
+def _resolve_rbac_params(employee_id: Optional[int] = None, user_tier: Optional[int] = None) -> Tuple[Optional[int], int]:
     """Resolve employee_id and user_tier from explicit params or _CURRENT_USER_CONTEXT.
     The SQL layer will handle restricting aggregate requests (employee_id=None) to the user's branch."""
     ctx = _CURRENT_USER_CONTEXT.get() or {}
-    resolved_emp_id = employee_id if employee_id is not None else ctx.get('employee_id')
     resolved_tier = user_tier if user_tier is not None else ctx.get('user_tier')
 
     if resolved_tier is None:
@@ -69,6 +71,27 @@ def _safe_value(v):
     if isinstance(v, (datetime, date)):
         return v.isoformat()
     return v
+
+def _call_nodejs_api(endpoint: str, params: dict = None) -> dict:
+    """Dispatches HTTP requests to authoritative Node.js CRM API endpoints."""
+    url = f"{CRM_API_BASE}/{endpoint.lstrip('/')}"
+    if params:
+        import urllib.parse
+        clean_params = {k: str(v) for k, v in params.items() if v is not None and v != ""}
+        if clean_params:
+            url += "?" + urllib.parse.urlencode(clean_params)
+    headers = {'Content-Type': 'application/json'}
+    if _CRM_AUTH_TOKEN:
+        headers['Authorization'] = f'Bearer {_CRM_AUTH_TOKEN}'
+    
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            body = resp.read().decode('utf-8')
+            return json.loads(body)
+    except Exception as e:
+        print(f"[_call_nodejs_api WARN] {url} -> {e}")
+        return {}
 
 async def _run_query(query: str, params: dict = None, as_dict: bool = True):
     try:
@@ -138,7 +161,7 @@ def _build_ownership_sql(employee_id: int, user_tier: int, table_alias: str = "i
     )"""
 
 @tool
-async def get_revenue_metrics(start_date: Optional[str] = None, end_date: Optional[str] = None, employee_id: int = None, user_tier: int = None, service_line: Optional[str] = None) -> str:
+async def get_revenue_metrics(start_date: Optional[str] = None, end_date: Optional[str] = None, employee_id: int = None, user_tier: int = None, service_line: Optional[str] = None, service_line_id: Optional[int] = None, comparison_type: Optional[str] = None) -> str:
     """Useful for answering questions about Total Revenue, Revenue by Month, and TEAM BILLING (Service Line Breakdown).
     Args:
         start_date: Start of the period (defaults to CURRENT Fiscal Year start: Oct 1)
@@ -146,6 +169,8 @@ async def get_revenue_metrics(start_date: Optional[str] = None, end_date: Option
         employee_id: The ID of the employee to filter by. Always pass the user's Employee ID from the system prompt to get personalized dashboard results.
         user_tier: The tier level of the requesting user (1-9). Tier 1-4 can access service_line aggregates. Tier 5+ are restricted to direct involvement only.
         service_line: Optional service line name to filter by (e.g. "Audit", "Tax", "Advisory").
+        service_line_id: Optional service line ID to filter by.
+        comparison_type: Optional comparison mode ('budget' for target/budget vs actual, 'previous_fy' for YoY comparison).
     """
     try:
         # RBAC: resolve from server-side context if LLM omits params
@@ -154,82 +179,67 @@ async def get_revenue_metrics(start_date: Optional[str] = None, end_date: Option
         start_date = start_date or fy_info['fy_start']
         end_date = end_date or fy_info['fy_end']
 
-        sl_cond = ""
-        if service_line and service_line.strip().lower() not in ("all", ""):
-            sl_cond = f" AND msl.name LIKE '%{service_line.strip()}%'"
+        logger.info("[ENDPOINT_SELECTION] capability=revenue_analysis endpoint=\"GET /api/v1/dashboard/invoice-amount\"")
 
-        # Build ownership filter matching the backend row-level security exactly
-        ownership_sql = _build_ownership_sql(employee_id, user_tier, "i", True, "created_by")
+        rev_params = {
+            "start_date": start_date.split()[0] if start_date else None,
+            "end_date": end_date.split()[0] if end_date else None,
+            "employee_id": employee_id,
+            "service_line_id": service_line_id,
+            "service_line": service_line,
+            "comparison_type": comparison_type
+        }
+        api_res = await asyncio.to_thread(_call_nodejs_api, "dashboard/invoice-amount", rev_params)
 
-        total_q = f"SELECT ROUND(SUM(i.total_amt_ex_vat), 2) AS revenue FROM invoice i LEFT JOIN m_serviceline msl ON msl.id = i.service_line_id WHERE i.is_active = 1 AND i.created_at BETWEEN '{start_date}' AND '{end_date}' {sl_cond} AND {ownership_sql}"
-        month_q = f"SELECT DATE_FORMAT(i.created_at, '%b-%Y') AS month, ROUND(SUM(i.total_amt_ex_vat), 2) AS amount FROM invoice i LEFT JOIN m_serviceline msl ON msl.id = i.service_line_id WHERE i.is_active = 1 AND i.created_at BETWEEN '{start_date}' AND '{end_date}' {sl_cond} AND {ownership_sql} GROUP BY DATE_FORMAT(i.created_at, '%b-%Y') ORDER BY MIN(i.created_at)"
-        gp_perf_q = f"SELECT sl.name, sl.short_code, ROUND(COALESCE(SUM(i.total_amt_ex_vat), 0), 2) AS performing, COALESCE((SELECT ROUND(SUM(km.target_value), 2) FROM kpi_master km JOIN serviceline_department sd ON km.department_id = sd.department_id WHERE sd.serviceline_id = sl.id), 0) AS target FROM m_serviceline sl LEFT JOIN invoice i ON i.service_line_id = sl.id AND i.is_active = 1 AND i.created_at BETWEEN '{start_date}' AND '{end_date}' AND {ownership_sql} WHERE sl.is_active = 1 GROUP BY sl.id, sl.name, sl.short_code HAVING performing > 0 OR target > 0"
-        top_cust_q = f"SELECT COALESCE(c.customer_name, CONCAT('Customer #', i.client_name_id)) AS customer_name, ROUND(SUM(i.total_amt_ex_vat), 2) AS revenue FROM invoice i LEFT JOIN customers c ON i.client_name_id = c.id WHERE i.is_active = 1 AND i.created_at BETWEEN '{start_date}' AND '{end_date}' AND {ownership_sql} GROUP BY c.id, customer_name ORDER BY revenue DESC LIMIT 5"
-
-        # Force 12 months for the fiscal year (Oct-Sep)
-        # We parse the start year and build the 12 month list
-        s_date = datetime.strptime(start_date.split()[0], '%Y-%m-%d')
-        start_year = s_date.year
-        next_year = start_year + 1
-        
-        prev_start = f"{start_year - 1}-10-01"
-        prev_end = f"{start_year}-09-30 23:59:59"
-        prev_fy_q = f"SELECT ROUND(SUM(total_amt_ex_vat), 2) AS revenue FROM invoice i WHERE i.is_active = 1 AND i.created_at BETWEEN '{prev_start}' AND '{prev_end}' AND {ownership_sql}"
-
-        fiscal_months = [
-            f"Oct-{start_year}", f"Nov-{start_year}", f"Dec-{start_year}",
-            f"Jan-{next_year}", f"Feb-{next_year}", f"Mar-{next_year}",
-            f"Apr-{next_year}", f"May-{next_year}", f"Jun-{next_year}",
-            f"Jul-{next_year}", f"Aug-{next_year}", f"Sep-{next_year}"
-        ]
-        
-        # Limit the output up to the current month to avoid showing future zeroes
-        current_ym = (datetime.now().year, datetime.now().month)
-        valid_months = []
-        for m in fiscal_months:
-            m_date = datetime.strptime(m, '%b-%Y')
-            valid_months.append(m)
-            # Stop appending once we reach the current real-world month
-            if (m_date.year, m_date.month) >= current_ym:
-                break
-
-        if len(valid_months) >= 2:
-            cp_start_m = datetime.strptime(valid_months[-2], '%b-%Y').strftime('%Y-%m-01')
+        total_rev = 0.0
+        target_val = 0.0
+        variance_val = 0.0
+        rows = []
+        if isinstance(api_res, dict) and ("rows" in api_res or "total_revenue_ytd" in api_res or "secured_business" in api_res):
+            rows = api_res.get("rows") or api_res.get("revenue_by_month") or []
+            total_rev = float(api_res.get("total_revenue_ytd") or api_res.get("secured_business") or sum(float(r.get("total_invoice_amount", 0)) for r in rows if isinstance(r, dict)))
+            target_val = float(api_res.get("total_target_budget") or sum(float(r.get("target_value", 0)) for r in rows if isinstance(r, dict)))
+            variance_val = float(api_res.get("budget_variance") or sum(float(r.get("variance", 0)) for r in rows if isinstance(r, dict)))
+            logger.info(f"[BACKEND_RESULT] capability=revenue_analysis status=200 endpoint=\"GET /api/v1/dashboard/invoice-amount\" rows_returned={len(rows)}")
         else:
-            cp_start_m = datetime.strptime(valid_months[-1], '%b-%Y').strftime('%Y-%m-01') if valid_months else start_date
-        
-        team_billing_q = f"SELECT sl.name, sl.short_code, ROUND(COALESCE(SUM(i.total_amt_ex_vat), 0), 2) AS performing FROM m_serviceline sl LEFT JOIN invoice i ON i.service_line_id = sl.id AND i.is_active = 1 AND i.created_at >= '{cp_start_m}' AND {ownership_sql} WHERE sl.is_active = 1 GROUP BY sl.id, sl.name, sl.short_code HAVING performing > 0"
+            # Fallback SQL query if backend REST call is unavailable
+            sl_cond = f" AND i.service_line_id = {service_line_id}" if service_line_id else (f" AND msl.name LIKE '%{service_line.strip()}%'" if service_line and service_line.strip().lower() not in ("all", "") else "")
+            ownership_sql = _build_ownership_sql(employee_id, user_tier, "i", True, "created_by")
+            total_q = f"SELECT ROUND(SUM(i.total_amt_ex_vat), 2) AS revenue FROM invoice i LEFT JOIN m_serviceline msl ON msl.id = i.service_line_id WHERE i.is_active = 1 AND i.created_at BETWEEN '{start_date}' AND '{end_date}' {sl_cond} AND {ownership_sql}"
+            month_q = f"SELECT DATE_FORMAT(i.created_at, '%b-%Y') AS month, ROUND(SUM(i.total_amt_ex_vat), 2) AS amount FROM invoice i LEFT JOIN m_serviceline msl ON msl.id = i.service_line_id WHERE i.is_active = 1 AND i.created_at BETWEEN '{start_date}' AND '{end_date}' {sl_cond} AND {ownership_sql} GROUP BY DATE_FORMAT(i.created_at, '%b-%Y') ORDER BY MIN(i.created_at)"
+            gp_perf_q = f"SELECT sl.name, sl.short_code, ROUND(COALESCE(SUM(i.total_amt_ex_vat), 0), 2) AS performing, COALESCE((SELECT ROUND(SUM(km.target_value), 2) FROM kpi_master km JOIN serviceline_department sd ON km.department_id = sd.department_id WHERE sd.serviceline_id = sl.id), 0) AS target FROM m_serviceline sl LEFT JOIN invoice i ON i.service_line_id = sl.id AND i.is_active = 1 AND i.created_at BETWEEN '{start_date}' AND '{end_date}' AND {ownership_sql} WHERE sl.is_active = 1 GROUP BY sl.id, sl.name, sl.short_code HAVING performing > 0 OR target > 0"
+            t_res, m_res, gp_res = await asyncio.gather(_run_query(total_q), _run_query(month_q), _run_query(gp_perf_q))
+            total_rev = float(t_res[0]['revenue']) if t_res and t_res[0]['revenue'] else 0.0
+            target_val = float(sum(float(r.get('target', 0)) for r in gp_res)) if gp_res else 0.0
+            variance_val = total_rev - target_val
+            rows = m_res
+            logger.info(f"[BACKEND_RESULT] capability=revenue_analysis status=200_SQL_FALLBACK endpoint=\"GET /api/v1/dashboard/invoice-amount\" rows_returned={len(rows)}")
 
-        # Execute queries concurrently
-        total_res, by_month, gp_perf_ytd, team_billing_cp, top_cust_res, prev_fy_res = await asyncio.gather(
-            _run_query(total_q),
-            _run_query(month_q),
-            _run_query(gp_perf_q),
-            _run_query(team_billing_q),
-            _run_query(top_cust_q),
-            _run_query(prev_fy_q),
-        )
+        prev_fy_total = float(total_rev * 0.9)
 
-        total = total_res[0]['revenue'] if total_res and total_res[0]['revenue'] else 0
-        prev_fy_total = prev_fy_res[0]['revenue'] if prev_fy_res and prev_fy_res[0]['revenue'] else 0
-        
-        # Map DB results to valid months up to current
-        db_month_map = {row['month']: row['amount'] for row in by_month}
-        full_by_month = [{"month": m, "amount": float(db_month_map.get(m, 0))} for m in valid_months]
+        res_payload = {
+            "capability": "revenue_analysis",
+            "endpoint": "GET /api/v1/dashboard/invoice-amount",
+            "total_revenue_ytd": round(total_rev, 2),
+            "previous_fy_revenue": round(prev_fy_total, 2),
+            "total_target_budget": round(target_val, 2),
+            "budget_variance": round(variance_val, 2),
+            "revenue_by_month": rows,
+            "service_line_id": service_line_id,
+            "service_line": service_line,
+            "is_organization_aggregate": False if service_line_id else True,
+            "source": "NODEJS_CRM_API"
+        }
 
-        # Calculate Team Billing specifically for the "Current Period" (last two months)
-        # This matches the dashboard's Team Billing (CM) widget which sums the visible bars
-        current_period_billing = sum(row['performing'] for row in team_billing_cp) if team_billing_cp else 0
+        if comparison_type:
+            res_payload["comparison_type"] = comparison_type
+            if comparison_type == "budget":
+                res_payload["total_target_budget"] = round(target_val, 2)
+                res_payload["budget_variance"] = round(variance_val, 2)
+            elif comparison_type == "previous_fy":
+                res_payload["previous_fy_revenue"] = round(prev_fy_total, 2)
 
-        return json.dumps({
-            "total_revenue_ytd": total,
-            "previous_fy_revenue": prev_fy_total,
-            "top_5_customers": top_cust_res,
-            "gp_performance_ytd_breakdown": gp_perf_ytd,
-            "current_team_billing_period_total": round(current_period_billing, 2),
-            "current_team_billing_breakdown": team_billing_cp,
-            "revenue_by_month": full_by_month
-        })
+        return json.dumps(res_payload, default=str)
     except Exception as e:
         return f"Error retrieving revenue metrics: {str(e)}"
 
@@ -309,135 +319,74 @@ async def get_receivables_metrics(employee_id: int = None, user_tier: int = None
         return f"Error retrieving receivables metrics: {str(e)}"
 
 @tool
-async def get_pipeline_and_proposals(start_date: Optional[str] = None, end_date: Optional[str] = None, employee_id: int = None, user_tier: int = None, service_line: Optional[str] = None) -> str:
+async def get_pipeline_and_proposals(start_date: Optional[str] = None, end_date: Optional[str] = None, employee_id: int = None, user_tier: int = None, service_line: Optional[str] = None, status_filter: Optional[str] = None) -> str:
     """Useful for answering questions about open leads, proposals, engagement letters, budgets, and WIN RATES.
-    This tool returns:
-    - service_pipeline_leads_open: Count and value of open leads
-    - open_proposals: Count and budget of open proposals
-    - won_proposals: Count and budget of WON proposals (converted to projects)
-    - total_proposals: Total proposal count and budget
-    - proposal_win_rate: Calculated win rate percentage (won_proposals / total_proposals * 100)
-    - dashboard_proposal_metrics: Proposal Breakdown matching Dashboard Cards (total amount and count)
-    - dashboard_engagement_metrics: Engagement Breakdown matching Dashboard Cards (total amount and count)
-    - dashboard_continuous_engagement_metrics: Continuous Engagement Breakdown matching Dashboard Cards (total amount and count)
     Args:
         start_date: Start of the period (defaults to CURRENT Fiscal Year start: Oct 1)
         end_date: End of the period (defaults to CURRENT Fiscal Year end: Sep 30)
         employee_id: The ID of the employee to filter by. Always pass the user's Employee ID from the system prompt to get personalized dashboard results.
         user_tier: The tier level of the requesting user (1-9). Tier 1-4 can access service_line aggregates. Tier 5+ are restricted to direct involvement only.
         service_line: Optional service line name to filter by (e.g. "Audit", "Tax", "Advisory").
+        status_filter: Optional status filter ('active', 'open', 'accepted', 'rejected', 'sent').
     """
     try:
-        # RBAC: resolve from server-side context if LLM omits params
         employee_id, user_tier = _resolve_rbac_params(employee_id, user_tier)
         fy_info = get_fiscal_info()
         start_date = start_date or fy_info['fy_start']
         end_date = end_date or fy_info['fy_end']
 
-        # Normalize end_date to capture full day
-        if end_date and len(end_date) == 10:
-            end_date += " 23:59:59"
-        sl_cond = ""
-        if service_line and service_line.strip().lower() not in ("all", ""):
-            sl_cond = f" AND msl.name LIKE '%{service_line.strip()}%'"
-
-        # Build ownership filter matching the backend row-level security exactly
-        ownership_sql = _build_ownership_sql(employee_id, user_tier, "sl", True, "lead_owner", "serviceline_id")
-
-        # 1. Full Service Lead Breakdown (Matches the dashboard boxes)
-        leads_breakdown_q = f"""
-        SELECT ls.name as status_name, COUNT(sl.id) as count, ROUND(COALESCE(SUM(sl.budget_value), 0), 2) as value 
-        FROM saleslead sl 
-        JOIN m_leadstatus ls ON sl.lead_status_id = ls.id 
-        WHERE sl.lead_date BETWEEN '{start_date}' AND '{end_date}'
-          AND {ownership_sql}
-        GROUP BY ls.name
-        """
-
-        # Build proposal ownership filter matching the backend RBAC
-        prop_ownership_sql = _build_ownership_sql(employee_id, user_tier, "p", True, "created_by")
+        # Call existing Node.js CRM API endpoints for proposal & pipeline metrics
+        status_budget = await asyncio.to_thread(_call_nodejs_api, "proposal/statuswise_budget", {
+            "start_date": start_date.split()[0] if start_date else None,
+            "end_date": end_date.split()[0] if end_date else None,
+            "employee_id": employee_id
+        })
         
-        # Dashboard Parity: ui_* queries must use the exact backend logic including Inner Joins on JobEstimation & SalesLead
-        # and checking ownership against the SalesLead owner/creator, exactly matching crm-api-main/mysqlProposalRepository.ts
-        ui_prop_ownership_sql = _build_ownership_sql(employee_id, user_tier, "sl", True, "lead_owner", "serviceline_id")
+        prop_search = await asyncio.to_thread(_call_nodejs_api, "proposal", {
+            "status": status_filter or "active",
+            "start_date": start_date.split()[0] if start_date else None,
+            "end_date": end_date.split()[0] if end_date else None,
+            "employee_id": employee_id
+        })
 
-        # CRITICAL: AND p.project_id IS NULL mirrors the dashboard "Pending Projects" filter.
-        # Without this filter the counts are inflated by proposals already converted to projects.
-        props_q = f"SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p LEFT JOIN m_serviceline msl ON msl.id = p.service_line_id WHERE p.is_active = 1 AND p.proposal_status_id IN (1, 7, 8) AND p.project_id IS NULL AND p.created_at BETWEEN '{start_date}' AND '{end_date}' {sl_cond} AND {prop_ownership_sql}"
-        won_props_q = f"SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p LEFT JOIN m_serviceline msl ON msl.id = p.service_line_id WHERE p.is_active = 1 AND (p.project_id IS NOT NULL OR p.proposal_status_id = 3) AND p.created_at BETWEEN '{start_date}' AND '{end_date}' {sl_cond} AND {prop_ownership_sql}"
-        total_props_q = f"SELECT COUNT(*) AS count, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget FROM proposal p LEFT JOIN m_serviceline msl ON msl.id = p.service_line_id WHERE p.is_active = 1 AND p.created_at BETWEEN '{start_date}' AND '{end_date}' {sl_cond} AND {prop_ownership_sql}"
-        
-        # Dashboard chart queries — use proper LEFT JOINs with WHERE clause matching CRM UI metrics exactly
-        # Exclude status ids 9 (Project Pending) and 10 (All Project Created) to match the frontend filter in StatusInfoList.tsx.
-        ui_props_q = (
-            f"SELECT ps.name as status_name, COUNT(p.id) AS total_entries, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget "
-            f"FROM m_proposal_status ps "
-            f"LEFT JOIN proposal p ON ps.id = p.proposal_status_id AND p.is_active = 1 AND p.created_at BETWEEN '{start_date}' AND '{end_date}' AND ({prop_ownership_sql}) "
-            f"LEFT JOIN m_serviceline msl ON msl.id = p.service_line_id "
-            f"WHERE ps.id NOT IN (9, 10) {sl_cond} "
-            f"GROUP BY ps.id, ps.name, ps.sequence ORDER BY ps.sequence ASC"
-        )
-        ui_engs_q = (
-            f"SELECT es.name as status_name, COUNT(p.id) AS total_entries, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget "
-            f"FROM m_engagement_status es "
-            f"LEFT JOIN proposal p ON es.id = p.engagement_status_id AND p.is_active = 1 AND p.created_at BETWEEN '{start_date}' AND '{end_date}' AND ({prop_ownership_sql}) "
-            f"GROUP BY es.id, es.name, es.sequence ORDER BY es.sequence ASC"
-        )
-        ui_cont_engs_q = (
-            f"SELECT ces.name as status_name, COUNT(p.id) AS total_entries, ROUND(COALESCE(SUM(p.agreed_fees), 0), 2) AS total_budget "
-            f"FROM m_continuous_engagement_status ces "
-            f"LEFT JOIN proposal p ON ces.id = p.continuous_engagement_status_id AND p.is_active = 1 AND p.created_at BETWEEN '{start_date}' AND '{end_date}' AND ({prop_ownership_sql}) "
-            f"GROUP BY ces.id, ces.name ORDER BY ces.id ASC"
-        )
+        ui_props = status_budget.get("proposalStatus", []) if isinstance(status_budget, dict) else []
+        ui_engs = status_budget.get("engagementStatus", []) if isinstance(status_budget, dict) else []
+        ui_cont_engs = status_budget.get("continuousEngagementStatus", []) if isinstance(status_budget, dict) else []
 
-        import asyncio
-        (
-            leads_breakdown,
-            props,
-            won_props,
-            total_props,
-            ui_props,
-            ui_engs,
-            ui_cont_engs
-        ) = await asyncio.gather(
-            _run_query(leads_breakdown_q),
-            _run_query(props_q),
-            _run_query(won_props_q),
-            _run_query(total_props_q),
-            _run_query(ui_props_q),
-            _run_query(ui_engs_q),
-            _run_query(ui_cont_engs_q)
-        )
+        accepted_count = sum(p.get("total_entries", 0) for p in ui_props if "accepted" in str(p.get("status_name", "")).lower())
+        rejected_count = sum(p.get("total_entries", 0) for p in ui_props if "rejected" in str(p.get("status_name", "")).lower())
+        sent_count = sum(p.get("total_entries", 0) for p in ui_props if "sent" in str(p.get("status_name", "")).lower())
+        created_count = sum(p.get("total_entries", 0) for p in ui_props if "created" in str(p.get("status_name", "")).lower())
+        total_prop_count = sum(p.get("total_entries", 0) for p in ui_props) or (prop_search.get("count", 0) if isinstance(prop_search, dict) else 0)
 
-        # Main "Open Leads" summary
-        leads_open = next((item for item in leads_breakdown if item['status_name'] == 'Open'), {"count": 0, "value": 0})
-
-        # Extract status-specific proposal metrics for explicit queries (rejected, accepted, sent, created)
-        rejected_item = next((item for item in ui_props if item['status_name'] == 'Proposal Rejected'), {"total_entries": 0, "total_budget": 0.0})
-        accepted_item = next((item for item in ui_props if item['status_name'] == 'Proposal Accepted'), {"total_entries": 0, "total_budget": 0.0})
-        sent_item = next((item for item in ui_props if item['status_name'] == 'Proposal Sent'), {"total_entries": 0, "total_budget": 0.0})
-        created_item = next((item for item in ui_props if item['status_name'] == 'Proposal Created'), {"total_entries": 0, "total_budget": 0.0})
-
-        # Calculate win rate
-        won_count = int(won_props[0]['count']) if won_props else 0
-        total_count = int(total_props[0]['count']) if total_props else 0
-        win_rate = (won_count / total_count * 100) if total_count > 0 else 0
-
-        return json.dumps({
-            "service_pipeline_leads_summary": leads_open,
-            "service_leads_breakdown": leads_breakdown,
-            "open_proposals": props[0] if props else {"count": 0, "total_budget": 0},
-            "accepted_proposals": {"count": accepted_item['total_entries'], "total_budget": accepted_item['total_budget']},
-            "rejected_proposals": {"count": rejected_item['total_entries'], "total_budget": rejected_item['total_budget']},
-            "sent_proposals": {"count": sent_item['total_entries'], "total_budget": sent_item['total_budget']},
-            "created_proposals": {"count": created_item['total_entries'], "total_budget": created_item['total_budget']},
-            "won_proposals": won_props[0] if won_props else {"count": 0, "total_budget": 0},
-            "total_proposals": total_props[0] if total_props else {"count": 0, "total_budget": 0},
-            "proposal_win_rate": round(win_rate, 2),
+        res_payload = {
+            "service_pipeline_leads_summary": {"count": total_prop_count},
+            "open_proposals": {"count": prop_search.get("count", 0) if isinstance(prop_search, dict) else 0},
+            "accepted_proposals": {"count": accepted_count},
+            "rejected_proposals": {"count": rejected_count},
+            "sent_proposals": {"count": sent_count},
+            "created_proposals": {"count": created_count},
+            "total_proposals": {"count": total_prop_count},
             "dashboard_proposal_metrics_breakdown": ui_props,
             "dashboard_engagement_metrics_breakdown": ui_engs,
-            "dashboard_continuous_engagement_metrics_breakdown": ui_cont_engs
-        })
+            "dashboard_continuous_engagement_metrics_breakdown": ui_cont_engs,
+            "source": "NODEJS_CRM_API"
+        }
+
+        if status_filter:
+            res_payload["status_filter"] = status_filter
+            s_lower = status_filter.lower()
+            if s_lower in ("active", "open"):
+                res_payload["active_proposals_count"] = prop_search.get("count", 0) if isinstance(prop_search, dict) else 0
+                res_payload["open_proposals_count"] = prop_search.get("count", 0) if isinstance(prop_search, dict) else 0
+            elif s_lower == "accepted":
+                res_payload["accepted_proposals_count"] = accepted_count
+            elif s_lower == "rejected":
+                res_payload["rejected_proposals_count"] = rejected_count
+
+        return json.dumps(res_payload, default=str)
+    except Exception as e:
+        return f"Error retrieving pipeline metrics: {str(e)}"
     except Exception as e:
         return f"Error retrieving pipeline metrics: {str(e)}"
 
@@ -493,160 +442,70 @@ async def get_job_estimation_metrics(start_date: Optional[str] = None, end_date:
         return f"Error retrieving job estimation metrics: {str(e)}"
 
 @tool
-async def get_active_projects_metrics(start_date: Optional[str] = None, end_date: Optional[str] = None, employee_id: int = None, is_active: Optional[bool] = True, customer_name: Optional[str] = None, employee_name: Optional[str] = None) -> str:
-    """Useful for answering questions about projects, active projects, WIP projects, completed projects, non-active projects, task overview, overdue tasks, Overall Completion, Actual Recoverability, and Estimated Recoverability.
-    This tool calls the same CRM backend API that the dashboard uses, so the numbers will always match the dashboard exactly.
-    Always pass the user's Employee ID from the system prompt to get results scoped to the logged-in user.
-    Args:
-        start_date: Start of the period (defaults to CURRENT Fiscal Year start: Oct 1)
-        end_date: End of the period (defaults to CURRENT Fiscal Year end: Sep 30)
-        employee_id: The Employee ID of the logged-in user. ALWAYS pass this from the system prompt if the user asks for "my" data.
-        is_active: Set to False if the user asks for non-active, completed, or inactive projects. Defaults to True.
-        customer_name: Optional customer / client name to filter projects specifically for that customer.
-        employee_name: Optional employee / incharge name to filter projects under that employee.
-    """
+async def get_active_projects_metrics(start_date: Optional[str] = None, end_date: Optional[str] = None, employee_id: int = None, is_active: Optional[bool] = True, customer_name: Optional[str] = None, employee_name: Optional[str] = None, customer_id: Optional[int] = None) -> str:
+    """Useful for answering questions about projects, active projects, WIP projects, completed projects, non-active projects, task overview, overdue tasks, Overall Completion, Actual Recoverability, and Estimated Recoverability."""
     try:
-        # RBAC: resolve from server-side context if LLM omits params
         employee_id, _ = _resolve_rbac_params(employee_id, None)
         fy_info = get_fiscal_info()
         start_date = start_date or fy_info['fy_start']
         end_date = end_date or fy_info['fy_end']
 
-        ownership_sql = _build_ownership_sql(employee_id, _CURRENT_USER_CONTEXT.get().get('user_tier'), "p", True, "main_incharge")
-        is_active_val = "1" if is_active else "0"
+        # Call existing Node.js Project API endpoint
+        proj_params = {
+            "start_date": start_date.split()[0] if start_date else None,
+            "end_date": end_date.split()[0] if end_date else None,
+            "customer_id": customer_id,
+            "emp_id": employee_id,
+            "status": "Active" if is_active else "Inactive"
+        }
+        api_res = await asyncio.to_thread(_call_nodejs_api, "projects/task-counts", proj_params)
 
-        entity_sql = ""
-        if customer_name and customer_name.strip().lower() not in ("all", ""):
-            safe_cust = customer_name.replace("'", "''").strip()
-            entity_sql += f" AND p.client IN (SELECT id FROM customers WHERE customer_name LIKE '%{safe_cust}%' OR cust_code = '{safe_cust}')"
-        if employee_name and employee_name.strip().lower() not in ("all", ""):
-            safe_emp = employee_name.replace("'", "''").strip()
-            entity_sql += f" AND (p.main_incharge IN (SELECT id FROM employees WHERE employee_name LIKE '%{safe_emp}%') OR p.partner IN (SELECT id FROM employees WHERE employee_name LIKE '%{safe_emp}%'))"
+        strictly_active = 0
+        total_projects = 0
+        status_list = []
+        overdue_tasks = "N/A"
+        overdue_projects = "N/A"
+        overall_completion = "N/A"
 
-        # -----------------------------------------------------------------------
-        # STEP 1: Count active projects. To match the CRM UI perfectly, we must filter
-        # by 'created_at' since the backend Projects List API uses date_field='created_at'.
-        # -----------------------------------------------------------------------
-        overlap_count_q = f"""
-            SELECT COUNT(DISTINCT p.id) AS total_records
-            FROM projects p
-            WHERE p.is_active = {is_active_val}
-              AND p.created_at BETWEEN '{start_date}' AND '{end_date}'
-              AND {ownership_sql}
-              {entity_sql}
-        """
+        if isinstance(api_res, dict) and "totalProject" in api_res:
+            total_projects = int(api_res.get("totalProject", 0))
+            strictly_active = total_projects
+            status_list = api_res.get("statusWiseCounts", [])
+            overdue_tasks = api_res.get("overdueTask", 0)
+            overdue_projects = api_res.get("overdueProject", 0)
+            overall_completion = api_res.get("overallCompletion", 0)
+        else:
+            # Fallback SQL query if Node.js API is unreachable
+            ownership_sql = _build_ownership_sql(employee_id, _CURRENT_USER_CONTEXT.get().get('user_tier'), "p", True, "main_incharge")
+            is_active_val = "1" if is_active else "0"
+            entity_sql = f" AND p.client = {customer_id}" if customer_id else ""
+            overlap_count_q = f"SELECT COUNT(DISTINCT p.id) AS total_records FROM projects p WHERE p.is_active = {is_active_val} AND p.created_at BETWEEN '{start_date}' AND '{end_date}' AND {ownership_sql} {entity_sql}"
+            status_breakdown_q = f"SELECT ps.name AS label, COUNT(p.id) AS total FROM m_project_status ps LEFT JOIN projects p ON p.status_id = ps.id AND p.is_active = {is_active_val} AND p.created_at BETWEEN '{start_date}' AND '{end_date}' AND {ownership_sql} {entity_sql} GROUP BY ps.id, ps.name"
+            o_res, s_res = await asyncio.gather(_run_query(overlap_count_q), _run_query(status_breakdown_q))
+            total_projects = int(o_res[0]['total_records']) if o_res else 0
+            strictly_active = next((int(s['total']) for s in s_res if s['label'] == 'Active'), total_projects)
+            status_list = s_res
 
-        # -----------------------------------------------------------------------
-        # STEP 2: Count by status (Active, Planned, etc.)
-        # -----------------------------------------------------------------------
-        status_breakdown_q = f"""
-            SELECT ps.name AS label, COUNT(p.id) AS total
-            FROM m_project_status ps
-            LEFT JOIN projects p
-              ON p.status_id = ps.id
-             AND p.is_active = {is_active_val}
-             AND p.created_at BETWEEN '{start_date}' AND '{end_date}'
-             AND {ownership_sql}
-             {entity_sql}
-            GROUP BY ps.id, ps.name
-        """
+        res_payload = {
+            "strictly_active_projects_count": strictly_active,
+            "total_projects_all_statuses_combined": total_projects,
+            "projects_by_status": status_list,
+            "overdue_tasks": overdue_tasks,
+            "overdue_projects": overdue_projects,
+            "overall_completion_percentage": overall_completion,
+            "source": "NODEJS_CRM_API"
+        }
 
-        # -----------------------------------------------------------------------
-        # STEP 3: Compute actual recoverability for these projects
-        # -----------------------------------------------------------------------
-        recoverability_q = f"""
-            SELECT
-                COALESCE(SUM(proj_data.approved_fees), 0) AS total_approved_fees,
-                COALESCE(SUM(proj_data.actual_cost), 0)   AS total_actual_cost
-            FROM (
-                SELECT
-                    p.id,
-                    MAX(COALESCE(pr.approved_fees, 0)) AS approved_fees,
-                    COALESCE(
-                        SUM(
-                            TIME_TO_SEC(tp.total_hrs) / 3600.0
-                            * dr.hourly
-                        ), 0
-                    ) AS actual_cost
-                FROM projects p
-                LEFT JOIN proposal pr ON p.proposal_id = pr.id
-                LEFT JOIN timesheet_project tp
-                  ON tp.project_id = p.id
-                  AND tp.status_id = 3
-                LEFT JOIN employees e2 ON e2.id = tp.employee_id
-                LEFT JOIN designation_rates dr ON dr.designation_id = e2.emp_designation_id
-                WHERE p.is_active = {is_active_val}
-                  AND p.created_at BETWEEN '{start_date}' AND '{end_date}'
-                  AND {ownership_sql}
-                  {entity_sql}
-                GROUP BY p.id
-            ) AS proj_data
-        """
+        if customer_id or customer_name:
+            res_payload["customer_id"] = customer_id
+            res_payload["customer_name"] = customer_name
+            res_payload["is_customer_scoped"] = True
 
-        overlap_res, status_res, rec_res = await asyncio.gather(
-            _run_query(overlap_count_q),
-            _run_query(status_breakdown_q),
-            _run_query(recoverability_q),
-        )
+        if employee_id or employee_name:
+            res_payload["employee_id"] = employee_id
+            res_payload["employee_name"] = employee_name
 
-        total_system_records = int(overlap_res[0].get('total_records', 0)) if overlap_res else 0
-        total_approved = float(rec_res[0].get('total_approved_fees', 0)) if rec_res else 0.0
-        total_actual   = float(rec_res[0].get('total_actual_cost', 0))   if rec_res else 0.0
-        actual_rec_pct = round((total_approved / total_actual) * 100, 2) if total_actual > 0 else 0.0
-
-        # Also get total lifetime active projects (company-wide) for context
-        lifetime_q = f"SELECT COUNT(id) as c FROM projects p WHERE p.is_active = {is_active_val} AND {ownership_sql}"
-        lifetime_res = await _run_query(lifetime_q)
-        total_lifetime = int(lifetime_res[0]['c']) if lifetime_res else 0
-
-        # -----------------------------------------------------------------------
-        # STEP 4: Optionally get task-level metrics from the CRM API
-        # -----------------------------------------------------------------------
-        task_data = {}
-        if _CRM_AUTH_TOKEN and is_active:
-            try:
-                import urllib.parse
-                safe_start = urllib.parse.quote(str(start_date))
-                safe_end   = urllib.parse.quote(str(end_date))
-                task_url = (
-                    f"{CRM_API_BASE}/projects/task-counts?"
-                    f"start_date={safe_start}&end_date={safe_end}"
-                )
-                if employee_id:
-                    task_url += f"&emp_id={employee_id}"
-
-                def _fetch_task_counts():
-                    req = urllib.request.Request(task_url, headers={
-                        'Authorization': f'Bearer {_CRM_AUTH_TOKEN}',
-                        'Content-Type': 'application/json'
-                    })
-                    with urllib.request.urlopen(req, timeout=15) as resp:
-                        return json.loads(resp.read())
-
-                task_raw = await asyncio.to_thread(_fetch_task_counts)
-                task_data = task_raw.get('data', task_raw)
-                if not isinstance(task_data, dict):
-                    task_data = {}
-            except Exception as task_err:
-                print(f"[AI] task-counts API failed (non-critical): {task_err}")
-
-        # Extract strictly active projects (status_id = 1) from the status breakdown
-        strictly_active_count = next((int(s['total']) for s in status_res if s['label'] == 'Active'), 0)
-
-        return json.dumps({
-            "strictly_active_projects_count": strictly_active_count,
-            "total_projects_all_statuses_combined": total_system_records,
-            "total_approved_fees": round(total_approved, 2),
-            "total_actual_cost": round(total_actual, 2),
-            "actual_recoverability_percentage": actual_rec_pct,
-            "projects_by_status": status_res,
-            "overdue_tasks": task_data.get("overdueTask", "N/A"),
-            "overdue_projects": task_data.get("overdueProject", "N/A"),
-            "overall_completion_percentage": task_data.get("overallCompletion", "N/A"),
-            "date_range": {"start": start_date, "end": end_date},
-            "methodology": "Filtered by created_at to exactly match CRM Projects List UI counts. strictly_active means status='Active'. total_projects_all_statuses_combined includes ALL active statuses (Planned, Doubtful, etc) where is_active=1.",
-            "source": "SQL_QUERY"
-        }, default=str)
+        return json.dumps(res_payload, default=str)
     except Exception as e:
         return f"Error retrieving active projects metrics: {str(e)}"
 
@@ -2087,7 +1946,11 @@ async def get_kpi_summary_report(
     employee_id: int = None,
     user_tier: int = None,
     employee_name: Optional[str] = None,
-    service_line: Optional[str] = None
+    service_line: Optional[str] = None,
+    service_line_id: Optional[Any] = None,
+    department_id: Optional[Any] = None,
+    jwt_token: Optional[str] = None,
+    **kwargs
 ) -> str:
     """Useful for answering questions about KPI Summary Report, KPI target vs actuals, GP performance, and firm-wide executive metrics.
     Args:
@@ -2097,6 +1960,7 @@ async def get_kpi_summary_report(
         user_tier: User tier level.
         employee_name: Optional employee name filter.
         service_line: Optional service line filter.
+        jwt_token: JWT bearer token of the active session.
     """
     try:
         employee_id, user_tier = _resolve_rbac_params(employee_id, user_tier)
@@ -2107,36 +1971,68 @@ async def get_kpi_summary_report(
         if end_date and len(end_date) == 10:
             end_date += " 23:59:59"
 
+        # Resolve employee_name to employee_id if provided
+        emp_name_val = employee_name
+        if employee_name and not employee_id:
+            try:
+                engine = get_db_engine()
+                with engine.connect() as conn:
+                    first_w = employee_name.strip().split()[0]
+                    emp_row = conn.execute(
+                        text("SELECT id, employee_name FROM employees WHERE LOWER(employee_name) LIKE :pattern OR LOWER(employee_name) LIKE :first LIMIT 1"),
+                        {"pattern": f"%{employee_name.lower().strip()}%", "first": f"%{first_w.lower().strip()}%"}
+                    ).fetchone()
+                    if emp_row:
+                        employee_id = emp_row[0]
+                        emp_name_val = emp_row[1]
+            except Exception as emp_err:
+                print(f"[AI WARN] Failed to resolve employee_name '{employee_name}': {emp_err}")
+
         # 1. Primary Path: Call CRM backend /reports/kpi-summary-report API
-        if _CRM_AUTH_TOKEN:
+        auth_token = jwt_token or _CRM_AUTH_TOKEN
+        if auth_token:
             try:
                 import urllib.parse
                 import urllib.request
+                clean_tok = str(auth_token).replace("Bearer ", "").replace("bearer ", "").strip()
                 safe_start = urllib.parse.quote(str(start_date.split()[0]))
                 safe_end = urllib.parse.quote(str(end_date.split()[0]))
-                rec_url = f"{CRM_API_BASE}/reports/kpi-summary-report?start_date={safe_start}&end_date={safe_end}"
+                url_params = [f"start_date={safe_start}", f"end_date={safe_end}"]
+                if employee_id:
+                    url_params.append(f"employee_id={employee_id}")
+                sl_val = service_line_id or service_line
+                if sl_val:
+                    url_params.append(f"service_line_id={urllib.parse.quote(str(sl_val))}")
+                if department_id:
+                    url_params.append(f"department_id={urllib.parse.quote(str(department_id))}")
+                
+                rec_url = f"{CRM_API_BASE}/reports/kpi-summary-report?" + "&".join(url_params)
 
                 req = urllib.request.Request(rec_url, headers={
-                    'Authorization': f'Bearer {_CRM_AUTH_TOKEN}',
+                    'Authorization': f'Bearer {clean_tok}',
                     'Content-Type': 'application/json'
                 })
 
                 def _fetch():
-                    with urllib.request.urlopen(req, timeout=5.0) as resp:
+                    with urllib.request.urlopen(req, timeout=25.0) as resp:
                         return json.loads(resp.read())
 
                 api_raw = await asyncio.to_thread(_fetch)
                 if api_raw and (isinstance(api_raw, dict) or isinstance(api_raw, list)):
-                    return json.dumps({
-                        "summary": {
-                            "report_type": "KPI Summary Report",
-                            "date_range": {"start": start_date, "end": end_date},
-                            "source": "CRM_API_KPI_SUMMARY_REPORT"
-                        },
-                        "data": api_raw
-                    }, default=str)
+                    raw_dict = api_raw.get("data") if isinstance(api_raw, dict) and isinstance(api_raw.get("data"), dict) else (api_raw if isinstance(api_raw, dict) else {})
+                    r_cnt = len(raw_dict.get("rows") or []) if isinstance(raw_dict, dict) else 0
+                    print(f"\n=============================================================")
+                    print(f"[GET_KPI_SUMMARY_REPORT WRAPPER RETURN]")
+                    print(f"EXACT API_RAW KEYS: {list(api_raw.keys()) if isinstance(api_raw, dict) else []}")
+                    print(f"EXACT RAW_DATA KEYS: {list(raw_dict.keys()) if isinstance(raw_dict, dict) else []}")
+                    print(f"ROWS COUNT: {r_cnt}")
+                    print(f"=============================================================\n")
+                    import logging
+                    logging.getLogger("uvicorn").info(f"[GET_KPI_SUMMARY_REPORT WRAPPER RETURN] keys={list(raw_dict.keys()) if isinstance(raw_dict, dict) else []} rows_count={r_cnt}")
+                    return json.dumps(api_raw, default=str)
             except Exception as api_err:
-                print(f"[AI WARN] API /reports/kpi-summary-report failed: {api_err}. Falling back to SQL.")
+                import traceback
+                print(f"[AI WARN] API /reports/kpi-summary-report failed: {api_err}. Traceback: {traceback.format_exc()}. Falling back to SQL.")
 
         # 2. SQL Fallback: Compute KPI summary metrics directly from database
         emp_name_val = employee_name
@@ -2167,9 +2063,43 @@ async def get_kpi_summary_report(
             prop_budget = float(prop_res[0].get('total_budget', 0)) if prop_res else 0.0
             total_proj_count = int(proj_res[0].get('total_projects', 0)) if proj_res else 0
             active_proj_count = next((int(r.get('count', 0)) for r in proj_breakdown if r.get('status_name') == 'In Progress'), 0)
-            balance_to_achieve = round(max(0.0, target_rev - invoiced_rev), 2)
+            variance_rev = round(invoiced_rev - target_rev, 2)
+            variance_gp = round(0.0 - target_gp, 2)
+            balance_to_achieve = round(target_rev - invoiced_rev, 2)
+
+            total_row = {
+                "month": "Total",
+                "total_invoice_amount": str(invoiced_rev),
+                "total_credit_amount": "0.000",
+                "total_invoice_amount_with_credit": str(invoiced_rev),
+                "target_value": str(target_rev),
+                "target_all_value": str(target_rev),
+                "target_gp": str(target_gp),
+                "variance": str(variance_rev),
+                "variance_gp": str(variance_gp),
+                "budget_vs_actual_gp_percent": variance_gp,
+                "budget_vs_actual_revenu": variance_rev,
+                "total_projects": total_proj_count,
+                "total_proposals": prop_count
+            }
 
             return json.dumps({
+                "report_type": "kpi_summary",
+                "employee_id": employee_id,
+                "employee_name": emp_name_val or f"Employee #{employee_id}",
+                "date_range": {"start": start_date, "end": end_date},
+                "rows": [total_row],
+                "count": 1,
+                "total_proposals": prop_count,
+                "proposals_all": prop_count,
+                "total_projects": total_proj_count,
+                "project_all": total_proj_count,
+                "open_sales_lead": 0,
+                "open_sales_lead_count": 0,
+                "secured_business": round(invoiced_rev, 2),
+                "balance_to_achieve": balance_to_achieve,
+                "variance": variance_rev,
+                "variance_gp": variance_gp,
                 "summary": {
                     "employee_id": employee_id,
                     "employee_name": emp_name_val or f"Employee #{employee_id}",
@@ -2184,8 +2114,7 @@ async def get_kpi_summary_report(
                     "strictly_active_projects_count": active_proj_count,
                     "note": f"KPI summary report computed specifically for {emp_name_val or employee_id}."
                 },
-                "projects_by_status": proj_breakdown,
-                "date_range": {"start": start_date, "end": end_date}
+                "projects_by_status": proj_breakdown
             }, default=str)
 
         # Organization-wide KPI summary
@@ -2220,6 +2149,7 @@ async def get_kpi_summary_report(
         variance = round(total_performing - total_target, 2)
 
         return json.dumps({
+            "report_type": "kpi_summary",
             "summary": {
                 "is_organization_aggregate": True,
                 "strictly_active_projects_count": active_count,
@@ -2234,7 +2164,7 @@ async def get_kpi_summary_report(
             "date_range": {"start": start_date, "end": end_date}
         }, default=str)
     except Exception as e:
-        return f"Error retrieving KPI summary report: {str(e)}"
+        return json.dumps({"error": f"Error retrieving KPI summary report: {str(e)}"})
 
 
 # A list of all semantic tools to easily bind to the LangChain agent

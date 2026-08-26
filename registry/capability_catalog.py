@@ -19,6 +19,42 @@ PRIORITY_AD_HOC_SQL = 5
 # ---------------------------------------------------------------------------
 BUSINESS_CAPABILITIES = [
     {
+        "id": "entity_discovery",
+        "business_domain": "entity",
+        "fast_path_eligible": True,
+        "intent_keywords": ['entity lookup', 'name lookup', 'entity discovery'],
+        "description": "Performs generic CRM entity lookup by name when the user provides only an entity name or code without specifying an analytical operation.",
+        "supported_metrics": ["entity_id", "entity_name"],
+        "supported_operations": ["search", "lookup"],
+        "priority": PRIORITY_BUSINESS_API,
+        "dependencies": [],
+        "response_contract": {
+            "supports_report": False,
+            "supports_summary": True,
+            "supports_analysis": False,
+            "supports_chart": False,
+            "supports_export": False,
+            "supports_filters": False,
+            "supports_followup": True,
+            "supports_comparison": False,
+            "supports_drilldown": False,
+            "default_presentation": "SUMMARY"
+        },
+        "primary_metric": "entity_name",
+        "response_schema": {
+            "status": "string",
+            "entity_name": "string"
+        },
+        "default_error_message": "Could not find matching CRM entity.",
+        "required_context": [],
+        "clarifiable_context": [],
+        "inheritable_context": [],
+        "defaultable_context": [],
+        "required_business_context": {},
+        "parameter_metadata": {},
+        "implementations": []
+    },
+    {
         "id": "analytical_query",
         "business_domain": "analytics",
         "fast_path_eligible": False,
@@ -53,7 +89,29 @@ BUSINESS_CAPABILITIES = [
             "results": "array",
             "total_count": "number",
             "summary": "object",
-            "headers": "array"
+            "headers": "array",
+            "ranking_data": "array",
+            "comparison_periods": "array",
+            "result_type": "string",
+            "operation": "string",
+            "requested_metric": "string",
+            "returned_metric": "string",
+            "metric": "string",
+            "metric_type": "string",
+            "metric_label": "string",
+            "dimension": "string",
+            "limit": "number",
+            "sort_order": "string",
+            "variance": "number",
+            "variance_pct": "number",
+            "formatted_variance": "string",
+            "status": "string",
+            "authoritative": "boolean",
+            "source": "string",
+            "start_date": "string",
+            "end_date": "string",
+            "error_message": "string",
+            "error_code": "string"
         },
         "default_error_message": "I couldn't complete the requested analytical query at the moment. Please try again later.",
         "required_context": ["temporal_scope"],
@@ -198,10 +256,10 @@ BUSINESS_CAPABILITIES = [
         "id": "receivables_analysis",
         "business_domain": "finance",
         "fast_path_eligible": True,
-        "intent_keywords": ['receivables', 'receivable', 'overdue invoices', 'ageing report', 'ageing bucket', 'view by ageing', 'view by service line', 'receivables by service line', 'ageing summary'],
-        "description": "Full ageing breakdown of all overdue invoices. Use when asking about pending or overdue receivables.",
-        "supported_metrics": ["total_receivables", "overdue_invoices", "ageing_buckets", "total_overdue_count"],
-        "supported_operations": ["sum", "filter", "group_by", "comparison", "trend"],
+        "intent_keywords": ['receivables', 'receivable', 'overdue invoices', 'ageing report', 'ageing bucket', 'view by ageing', 'view by service line', 'receivables by service line', 'ageing summary', 'pending invoices', 'pending invoice count', 'pending receivables amount'],
+        "description": "Full ageing breakdown of all overdue invoices. Use when asking about pending or overdue receivables or pending invoice counts.",
+        "supported_metrics": ["total_receivables", "overdue_invoices", "ageing_buckets", "total_overdue_count", "pending_receivables_amount", "pending_invoice_count"],
+        "supported_operations": ["sum", "filter", "group_by", "comparison", "trend", "ranking", "count"],
         "priority": PRIORITY_EXISTING_REPORT,
         "dependencies": [],
         "response_contract": {
@@ -307,9 +365,11 @@ BUSINESS_CAPABILITIES = [
         "inheritable_context": ["temporal_scope", "start_date", "end_date", "financial_year", "customer_id", "service_line_id"],
         "defaultable_context": [],
         "required_parameters": [],
+        "authoritative_endpoint": "GET /api/v1/dashboard/invoice-amount",
         "optional_parameters": {
             "start_date": {"type": "string", "format": "date", "description": "Start date (YYYY-MM-DD), e.g. FY start"},
-            "end_date": {"type": "string", "format": "date", "description": "End date (YYYY-MM-DD), e.g. FY end"}
+            "end_date": {"type": "string", "format": "date", "description": "End date (YYYY-MM-DD), e.g. FY end"},
+            "service_line_id": {"type": "integer", "description": "Service line ID to filter revenue by"}
         },
         "clarification_order": [],
         "parameter_metadata": {
@@ -549,14 +609,83 @@ BUSINESS_CAPABILITIES = [
         ]
     },
     {
+        "id": "gp_performance",
+        "business_domain": "finance",
+        "fast_path_eligible": True,
+        "intent_keywords": ['gp performance', 'gross profit', 'gp', 'gp breakdown', 'gp performance by service line', 'gp performance by department'],
+        "description": "Retrieves Gross Profit (GP) performance breakdown by department or service line, including target GP, actual GP, GP percentage, and variance.",
+        "supported_metrics": ["gp_performance", "actual_gp", "target_gp", "gp_percent", "variance"],
+        "supported_dimensions": ["department", "service_line"],
+        "supported_operations": ["summary", "ranking", "filter", "sort_order", "limit", "aggregate", "comparison"],
+        "priority": PRIORITY_EXISTING_REPORT,
+        "authoritative_endpoint": "GET /api/v1/dashboard/gp-performance",
+        "dependencies": [],
+        "response_contract": {
+            "supports_report": True,
+            "supports_summary": True,
+            "supports_analysis": True,
+            "supports_chart": True,
+            "supports_export": True,
+            "supports_filters": True,
+            "supports_followup": True,
+            "supports_comparison": True,
+            "supports_drilldown": True,
+            "default_presentation": "REPORT"
+        },
+        "primary_metric": "actual_gp",
+        "response_schema": {
+            "department_name": "string",
+            "service_line_name": "string",
+            "target_gp": "number",
+            "actual_gp": "number",
+            "gp_percent": "number",
+            "variance": "number",
+            "rows": "array",
+            "data": "object"
+        },
+        "default_error_message": "GP performance metrics are currently unavailable. Please try again later.",
+        "required_context": ["temporal_scope"],
+        "clarifiable_context": ["temporal_scope"],
+        "inheritable_context": ["temporal_scope", "start_date", "end_date", "financial_year", "department_id", "service_line_id"],
+        "defaultable_context": [],
+        "required_parameters": [],
+        "optional_parameters": {
+            "start_date": {"type": "string", "format": "date", "description": "Start date (YYYY-MM-DD)"},
+            "end_date": {"type": "string", "format": "date", "description": "End date (YYYY-MM-DD)"},
+            "department_id": {"type": "integer", "description": "Filter by department ID"},
+            "service_line_id": {"type": "integer", "description": "Filter by service line ID"}
+        },
+        "implementations": [
+            {
+                "priority": PRIORITY_EXISTING_REPORT,
+                "type": "report",
+                "endpoint": "GET /api/v1/dashboard/gp-performance",
+                "needs_confirmation": False,
+                "required_entities": [],
+                "required_parameters": []
+            },
+            {
+                "priority": PRIORITY_SEMANTIC_WRAPPER,
+                "type": "wrapper",
+                "function_call": "call_gp_performance_metrics",
+                "needs_confirmation": False,
+                "required_entities": [],
+                "required_parameters": []
+            }
+        ]
+    },
+    {
         "id": "kpi_summary",
         "business_domain": "kpi",
         "fast_path_eligible": True,
         "intent_keywords": ['kpi summary', 'executive kpi', 'organization kpi', 'kpi report', 'generate kpi report', 'kpi dashboard', 'show kpi'],
-        "description": "Retrieves the master KPI summary report (budget vs actuals, GP performance).",
-        "supported_metrics": ["strictly_active_projects_count", "overdue_tasks", "overdue_projects", "projects_by_status"],
+        "description": "Retrieves the master KPI summary report for organization-wide or specific employee KPIs (budget vs actuals, GP performance, targets, secured business).",
+        "supported_metrics": ["strictly_active_projects_count", "overdue_tasks", "overdue_projects", "projects_by_status", "total_kpi_target", "secured_business"],
+        "supported_dimensions": ["organization", "employee"],
+        "supported_employee_identifiers": ["employee_id", "emp_id"],
         "supported_operations": ["summary", "filter", "comparison", "trend", "count", "aggregate", "generate"],
         "priority": PRIORITY_EXISTING_REPORT,
+        "authoritative_endpoint": "GET /api/v1/reports/kpi-summary-report",
         "dependencies": [],
         "response_contract": {
             "supports_report": True,
@@ -580,8 +709,12 @@ BUSINESS_CAPABILITIES = [
             "secured_business": "number",
             "balance_to_achieve": "number",
             "total_proposals": "number",
+            "proposals_all": "number",
             "total_proposal_value": "number",
             "total_projects": "number",
+            "project_all": "number",
+            "open_sales_lead": "number",
+            "open_sales_lead_count": "number",
             "strictly_active_projects_count": "number",
             "total_projects_all_statuses_combined": "number",
             "total_performing_revenue": "number",
@@ -590,6 +723,10 @@ BUSINESS_CAPABILITIES = [
             "gp_performance": "object",
             "summary": "object",
             "date_range": "object",
+            "rows": "array",
+            "data": "object",
+            "report_type": "string",
+            "count": "number",
             "overdue_tasks": "number",
             "overdue_projects": "number"
         },
@@ -601,7 +738,9 @@ BUSINESS_CAPABILITIES = [
         "required_business_context": {},
         "optional_parameters": {
             "start_date": {"type": "string", "format": "date", "description": "Start date (YYYY-MM-DD), default FY start '2025-04-01'"},
-            "end_date": {"type": "string", "format": "date", "description": "End date (YYYY-MM-DD), default FY end '2026-03-31'"}
+            "end_date": {"type": "string", "format": "date", "description": "End date (YYYY-MM-DD), default FY end '2026-03-31'"},
+            "employee_id": {"type": "integer", "description": "Filter by employee ID"},
+            "employee_name": {"type": "string", "description": "Filter by employee name"}
         },
         "parameter_metadata": {
             "financial_year": {
@@ -624,17 +763,17 @@ BUSINESS_CAPABILITIES = [
         "ui_action": "navigate",
         "implementations": [
             {
-                "priority": PRIORITY_EXISTING_REPORT,
-                "type": "report",
-                "endpoint": "GET /api/v1/reports/kpi-summary-report",
+                "priority": PRIORITY_SEMANTIC_WRAPPER,
+                "type": "wrapper",
+                "function_call": "get_kpi_summary_report",
                 "needs_confirmation": False,
                 "required_entities": [],
                 "required_parameters": []
             },
             {
-                "priority": PRIORITY_SEMANTIC_WRAPPER,
-                "type": "wrapper",
-                "function_call": "get_kpi_summary_report",
+                "priority": PRIORITY_EXISTING_REPORT,
+                "type": "report",
+                "endpoint": "GET /api/v1/reports/kpi-summary-report",
                 "needs_confirmation": False,
                 "required_entities": [],
                 "required_parameters": []
@@ -886,7 +1025,7 @@ BUSINESS_CAPABILITIES = [
         "intent_keywords": ["staff billing", "billing report", "employee billing", "team billing"],
         "description": "Gets the staff billing report showing employee time, billing amounts, and project-level cost recovery.",
         "supported_metrics": ["billing_summary", "employee_billing", "project_billing"],
-        "supported_operations": ["sum", "filter", "group_by", "comparison", "trend", "ranking"],
+        "supported_operations": ["summary", "generate", "generate_report", "report", "filter", "group_by", "comparison", "trend", "ranking", "sum", "count", "average", "analyze"],
         "priority": PRIORITY_EXISTING_REPORT,
         "dependencies": [],
         "response_contract": {
@@ -915,7 +1054,8 @@ BUSINESS_CAPABILITIES = [
         "optional_parameters": {
             "financial_year": {"type": "string", "description": "Financial year"},
             "service_line": {"type": "string", "description": "Service line filter"},
-            "employee_id": {"type": "integer", "description": "Filter by specific employee"}
+            "employee_id": {"type": "integer", "description": "Filter by specific employee"},
+            "department_id": {"type": "integer", "description": "Department filter"}
         },
         "ui_action": "navigate",
         "implementations": [
@@ -925,7 +1065,8 @@ BUSINESS_CAPABILITIES = [
                 "function_call": "get_staff_billing_report",
                 "needs_confirmation": False,
                 "required_entities": [],
-                "required_parameters": []
+                "required_parameters": [],
+                "supported_operations": ["summary", "generate", "generate_report", "report", "filter", "group_by", "comparison", "trend", "ranking", "sum", "count", "average", "analyze"]
             },
             {
                 "priority": PRIORITY_EXISTING_REPORT,
@@ -933,7 +1074,8 @@ BUSINESS_CAPABILITIES = [
                 "endpoint": "GET /api/v1/reports/revenue-billing-report",
                 "needs_confirmation": False,
                 "required_entities": [],
-                "required_parameters": ["department_id"]
+                "required_parameters": [],
+                "supported_operations": ["summary", "generate", "generate_report", "report", "filter", "group_by", "comparison", "trend", "ranking", "sum", "count", "average", "analyze"]
             }
         ]
     },
@@ -966,6 +1108,9 @@ BUSINESS_CAPABILITIES = [
 
 # Capability Alias Mapping for robust matching
 CAPABILITY_ALIASES = {
+    "gp_performance": "gp_performance",
+    "gross_profit": "gp_performance",
+    "gp": "gp_performance",
     "receivable_analysis": "receivables_analysis",
     "receivable_report": "receivables_analysis",
     "receivables": "receivables_analysis",

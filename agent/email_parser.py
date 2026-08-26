@@ -568,7 +568,7 @@ Email Text:
                 if hasattr(response, 'response_metadata') and isinstance(response.response_metadata, dict):
                     model_name_used = response.response_metadata.get("model_name") or response.response_metadata.get("model")
             if not model_name_used or model_name_used == 'unknown':
-                model_name_used = os.getenv("VISION_MODEL", "llama-3.2-90b-vision-preview") if is_vision else (os.getenv("LLM_MODEL") or os.getenv("PRIMARY_MODEL") or "qwen/qwen3.6-27b")
+                model_name_used = os.getenv("VISION_MODEL") if is_vision else (os.getenv("LLM_MODEL") or os.getenv("PRIMARY_MODEL") or "openai/gpt-oss-20b")
 
             has_att = len(attachments) > 0 if attachments else False
             ext = None
@@ -577,7 +577,7 @@ Email Text:
                 if "." in first_name:
                     ext = "." + first_name.split(".")[-1].lower()
                     
-            from db.database import calculate_llm_cost
+            from db.database import calculate_llm_cost, save_parsing_token_usage
             cost = calculate_llm_cost(model_name_used, in_tok, out_tok)
 
             meta_dict = {
@@ -594,11 +594,30 @@ Email Text:
                     "file_extension": ext
                 }
             }
+
+            try:
+                ref_id = f"email_{int(datetime.datetime.now().timestamp())}"
+                save_parsing_token_usage(
+                    employee_id=employee_id or 1,
+                    document_type="email",
+                    reference_id=ref_id,
+                    input_tokens=in_tok,
+                    output_tokens=out_tok,
+                    total_tokens=tot_tok,
+                    total_cost_usd=cost,
+                    model_name=model_name_used,
+                    has_attachment=has_att,
+                    file_extension=ext
+                )
+                print(f"[EMAIL_PARSER DB LOG] Saved email parsing usage record to DB: model={model_name_used}, total_tokens={tot_tok}, cost=${cost:.6f}")
+            except Exception as dbe:
+                print(f"[EMAIL_PARSER DB LOG WARNING] Failed to persist email token usage: {dbe}")
         except Exception as te:
             print(f"Token tracking error: {te}")
         # ----------------------
         
-        content_str = str(response.content or "").strip()
+        from config.llm_factory import clean_think_tags
+        content_str = clean_think_tags(str(response.content or "")).strip()
         parsed = clean_and_parse_json(content_str)
         
         print("[DEBUG EMAIL_PARSER] Cleaned content_str length:", len(content_str))
@@ -1239,10 +1258,10 @@ def build_general_query_mapping(parsed: dict) -> dict:
         req_type_name = "HR"
         subject_name = "HR Query"
         query = "HR Query"
-    elif "proposal" in intent or "proposal" in desc_lower or "proposal" in title_lower or "pitch" in desc_lower:
+    elif "proposal" in intent or "service lead" in intent or "lead" in intent or "service" in intent or "proposal" in desc_lower or "proposal" in title_lower or "pitch" in desc_lower or "lead" in desc_lower or "opportunity" in desc_lower:
         req_type_name = "Marketing & Business Development"
         subject_name = "Proposal Request"
-        query = "Others"
+        query = "New Proposal"
     elif "engagement letter" in intent or "engagement" in intent or "el request" in intent or "el" in desc_lower or "engagement letter" in desc_lower:
         req_type_name = "Marketing & Business Development"
         subject_name = "EL Request"
@@ -1327,14 +1346,26 @@ def build_general_query_mapping(parsed: dict) -> dict:
         "manual_review_reasons": manual_review_reasons
     }
     
+    intent_clean = intent.lower()
+    if any(k in intent_clean for k in ["service lead", "lead", "proposal", "pitch", "estimation"]):
+        target_route = "/proposal/add-proposal"
+        target_name = "New Proposal"
+    elif any(k in intent_clean for k in ["leave", "vacation", "day off"]):
+        target_route = "/self-services/leave-request/add"
+        target_name = "Leave Request"
+    else:
+        target_route = "/self-services/general-queries/add"
+        target_name = "General Query"
+
     redirection_prompt = {
-        "message": manual_review_notice if requires_manual_review else "Do you want to redirect to General Query for this task?",
+        "message": manual_review_notice if requires_manual_review else f"Do you want to redirect to {target_name} for this task?",
+        "target_name": target_name,
         "options": {
             "yes": {
                 "label": "Yes",
-                "redirect_to": "/self-services/general-queries",
+                "redirect_to": target_route,
                 "auto_fill_filters": True,
-                "description": "Redirects to General Queries page with pre-filled AI chips & project dropdown."
+                "description": f"Redirects to {target_name} page with pre-filled AI details."
             },
             "no": {
                 "label": "No",

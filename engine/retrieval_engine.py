@@ -131,7 +131,11 @@ class SemanticRetrievalEngine:
             # Boost score if query exact matches capability intent keywords or ID
             q_lower = query.lower()
             intent_kws = cap.get("intent_keywords", [])
-            if any(kw.lower() in q_lower for kw in intent_kws):
+            if cap_id == "gp_performance" and ("gp" in q_lower or "gross profit" in q_lower):
+                score = 0.99
+            elif cap_id != "gp_performance" and ("gp performance" in q_lower or "gross profit" in q_lower):
+                score = min(score, 0.50)
+            elif any(kw.lower() in q_lower for kw in intent_kws):
                 score = max(score, 0.96)
             elif cap_id.replace("_", " ") in q_lower:
                 score = max(score, 0.95)

@@ -23,6 +23,7 @@ from sqlalchemy import text
 from rag import vector_store_v2 as vector_store
 from agent.agent import ask_question
 from db.database_mongo import get_vector_cache_collection, get_chat_history_collection
+from cache import get_secure_cache_manager, generate_secure_cache_key
 
 from dotenv import load_dotenv
 
@@ -829,9 +830,9 @@ async def resolve_answer(
     # Proactive anomaly check — once per 30 minutes per session
     anomaly_note = ""
     try:
-        redis = get_redis()
-        anomaly_key = f"anomaly_checked:{session_id}"
-        already_checked = await redis.get(anomaly_key)
+        scm = get_secure_cache_manager()
+        anomaly_key = generate_secure_cache_key("anomaly", user_context, str(session_id))
+        already_checked = await scm.get_secure(anomaly_key)
         
         if not already_checked:
             from agent.tools_new import get_anomaly_alerts
@@ -850,7 +851,7 @@ async def resolve_answer(
                 anomaly_note += " — want me to pull the full details?"
             
             # Mark as checked for 30 minutes
-            await redis.setex(anomaly_key, 1800, "1")
+            await scm.set_secure(anomaly_key, {"checked": True}, 1800)
     except Exception as e:
         logger.warning(f"[Anomaly] Check failed (non-fatal): {e}")
         anomaly_note = ""
@@ -871,7 +872,7 @@ async def resolve_answer(
         cache_key_input = f"{q_norm}:{scope_key}"
         vector_scope_key = scope_key
         
-    redis_key = f"qa:{hashlib.sha256(cache_key_input.encode()).hexdigest()}"
+    redis_key = generate_secure_cache_key("qa", user_context, cache_key_input)
 
     KNOWLEDGE_KEYWORDS = ["formula", "how does", "what is the rule", 
                           "how is calculated", "what formula", "gosi rule",
@@ -928,19 +929,18 @@ async def resolve_answer(
         return _apply_kpi_overrides(result, question)
     # ── END LIVE DATA GATE ────────────────────────────────────────────────────
 
-    redis = get_redis()
+    scm = get_secure_cache_manager()
 
     # ═══════════════════════════════════════════════
-    # TIER 1 — Redis exact match
+    # TIER 1 — Encrypted Redis exact match
     # ═══════════════════════════════════════════════
     try:
-        cached = await redis.get(redis_key)
-        if cached:
-            data = json.loads(cached)
+        data = await scm.get_secure(redis_key)
+        if data and isinstance(data, dict):
             if data.get("role_scope") == vector_scope_key:
                 # Increment hit count and refresh TTL
                 data["hit_count"] = data.get("hit_count", 0) + 1
-                await redis.setex(redis_key, ttl, json.dumps(data))
+                await scm.set_secure(redis_key, data, ttl)
                 logger.info(f"[Memory] Tier 1 Redis hit for: {question[:60]}…")
                 return _apply_kpi_overrides({
                     "answer": data["answer"],
@@ -1003,7 +1003,7 @@ async def resolve_answer(
                 "timestamp": datetime.utcnow().isoformat(),
             }
             try:
-                await redis.setex(redis_key, ttl, json.dumps(payload))
+                await scm.set_secure(redis_key, payload, ttl)
             except Exception as e:
                 logger.warning(f"[Memory] Redis warm-up after vector hit failed: {e}")
 
@@ -1087,10 +1087,10 @@ async def resolve_answer(
 
     async def _store_redis():
         try:
-            # Cache full payload including navigation and suggested questions
-            await redis.setex(redis_key, ttl, json.dumps(payload))
+            scm = get_secure_cache_manager()
+            await scm.set_secure(redis_key, payload, ttl)
         except Exception as e:
-            logger.warning(f"[Memory] Redis cache store failed: {e}")
+            logger.warning(f"[Memory] Secure Redis cache store failed: {e}")
 
     async def _store_vector():
         try:

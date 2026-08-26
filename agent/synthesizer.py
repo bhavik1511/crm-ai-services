@@ -6,7 +6,7 @@ import json
 import re
 import logging
 from typing import List, Dict, Any, Optional
-
+import os
 logger = logging.getLogger(__name__)
 
 MAX_PAYLOAD_CHARS = 15000
@@ -14,45 +14,43 @@ MAX_PAYLOAD_CHARS = 15000
 # Fields that must NEVER be forwarded to the LLM or shown to the user
 _SUPPRESSED_FIELDS = frozenset({
     "raw_sql", "sql", "query", "debug", "trace", "metadata_instructions",
-    "tenant_id", "created_at", "updated_at", "internal_id", "_id", "source"
+    "tenant_id", "created_at", "updated_at", "internal_id", "_id", "source",
+    "capability", "capability_id", "intent", "confidence", "implementation_type",
+    "priority", "function_call", "execution_time_ms", "http_status", "error",
+    "endpoint", "backend_endpoint", "authoritative", "requested_metric", "returned_metric"
 })
 
-def _get_matching_breakdown_array(query: str, data: dict) -> tuple:
+def _get_matching_breakdown_array(data: dict, capability_id: str = "") -> tuple:
     """
-    Selects the matching array, title, x_field, and y_field from multi-array tool responses based on query intent.
+    Selects the matching breakdown array, title, x_field, and y_field from structured tool response payload.
+    Determined purely by validated response metadata and payload keys (Zero natural language query inspection).
     """
     if not isinstance(data, dict):
         return None, None, None, None
 
-    q_lower = query.lower()
-
     # 1. GP Performance / Service Line GP
-    if ("gp" in q_lower or "gross profit" in q_lower or "performance" in q_lower) and "gp_performance_ytd_breakdown" in data:
-        arr = data.get("gp_performance_ytd_breakdown")
-        if isinstance(arr, list) and arr:
-            return ("GP Performance by Service Line", arr, "name", "performing")
+    if "gp_performance_ytd_breakdown" in data and isinstance(data["gp_performance_ytd_breakdown"], list) and data["gp_performance_ytd_breakdown"]:
+        return ("GP Performance by Service Line", data["gp_performance_ytd_breakdown"], "name", "performing")
 
     # 2. Team Billing / Billing by Service Line
-    if ("billing" in q_lower or "staff" in q_lower or "team" in q_lower) and ("current_team_billing_breakdown" in data or "team_billing_breakdown" in data):
-        arr = data.get("current_team_billing_breakdown") or data.get("team_billing_breakdown")
-        if isinstance(arr, list) and arr:
-            return ("Team Billing Breakdown", arr, "name", "performing")
+    arr = data.get("current_team_billing_breakdown") or data.get("team_billing_breakdown")
+    if isinstance(arr, list) and arr:
+        return ("Team Billing Breakdown", arr, "name", "performing")
 
     # 3. Top Customers
-    if ("customer" in q_lower or "client" in q_lower or "top 5" in q_lower or "top customer" in q_lower) and "top_5_customers" in data:
-        arr = data.get("top_5_customers")
-        if isinstance(arr, list) and arr:
-            return ("Top 5 Customers by Revenue", arr, "customer_name", "revenue")
+    if "top_5_customers" in data and isinstance(data["top_5_customers"], list) and data["top_5_customers"]:
+        return ("Top 5 Customers by Revenue", data["top_5_customers"], "customer_name", "revenue")
 
     # 4. Monthly Revenue Breakdown
-    if ("month" in q_lower or "monthly" in q_lower or "trend" in q_lower) and "revenue_by_month" in data:
-        arr = data.get("revenue_by_month")
-        if isinstance(arr, list) and arr:
-            return ("Revenue by Month Breakdown", arr, "month", "amount")
+    if "revenue_by_month" in data and isinstance(data["revenue_by_month"], list) and data["revenue_by_month"]:
+        return ("Revenue by Month Breakdown", data["revenue_by_month"], "month", "amount")
 
-    # Default fallback if query was generic revenue or service line
-    if "gp_performance_ytd_breakdown" in data and isinstance(data["gp_performance_ytd_breakdown"], list) and ("gp" in q_lower or "service line" in q_lower or "serviceline" in q_lower):
-        return ("GP Performance by Service Line", data["gp_performance_ytd_breakdown"], "name", "performing")
+    # 5. Ranking Data
+    if "ranking_data" in data and isinstance(data["ranking_data"], list) and data["ranking_data"]:
+        dim_label = (data.get("dimension") or "Item").replace("_", " ").title()
+        metric_label = (data.get("metric_label") or data.get("metric") or "Amount").replace("_", " ").title()
+        title = f"Top {len(data['ranking_data'])} {dim_label}s by {metric_label}"
+        return (title, data["ranking_data"], "entity_name", "amount")
 
     return None, None, None, None
 
@@ -149,6 +147,10 @@ def trim_report_payload(capability: str, data: Any, max_list_items: int = 5) -> 
     # Internal fields that must never be forwarded to the LLM
     _SUPPRESSED = frozenset({"raw_sql", "sql", "query", "debug", "trace", "metadata_instructions", "created_at", "updated_at", "created_by", "updated_by"})
 
+    effective_max_items = max_list_items
+    if isinstance(data, dict) and data.get("limit") and isinstance(data.get("limit"), int):
+        effective_max_items = max(max_list_items, data["limit"])
+
     def _clean_node(val: Any) -> Any:
         """Recursively strip nulls, empty strings, dashes, zero values, and empty structures."""
         if isinstance(val, dict):
@@ -162,7 +164,7 @@ def trim_report_payload(capability: str, data: Any, max_list_items: int = 5) -> 
                 if v not in (None, "", "-", [], {})
             }
         elif isinstance(val, list):
-            sliced = val[:max_list_items]
+            sliced = val[:effective_max_items]
             cleaned_list = [_clean_node(item) for item in sliced]
             return [item for item in cleaned_list if item not in (None, "", "-", [], {})]
         else:
@@ -173,12 +175,17 @@ def trim_report_payload(capability: str, data: Any, max_list_items: int = 5) -> 
     for key, val in data.items():
         if key in _SUPPRESSED:
             continue
-        if response_schema and key not in response_schema and not key.startswith("total_") and key not in {"status", "records", "data"}:
+        if response_schema and key not in response_schema and not key.startswith("total_") and key not in {
+            "status", "records", "data", "ranking_data", "comparison_periods", "result_type", "operation",
+            "requested_metric", "returned_metric", "metric", "metric_type", "metric_label", "dimension",
+            "limit", "sort_order", "variance", "variance_pct", "formatted_variance", "authoritative",
+            "source", "start_date", "end_date"
+        }:
             continue
         cleaned_val = _clean_node(val)
         if cleaned_val not in (None, "", "-", [], {}):
             summary[key] = cleaned_val
-            if isinstance(val, list) and len(val) > max_list_items:
+            if isinstance(val, list) and len(val) > effective_max_items:
                 summary[f"{key}_total_count"] = len(val)
 
     return summary if summary else data
@@ -206,18 +213,27 @@ async def synthesize_response(original_query: str, tool_results: List[Dict[str, 
     synth_token_usage = {}
 
     # Policy Enforcement Step 1: Check Envelope Status & Errors across tool outputs
-    failed_node = next((res for res in tool_results if res.get("status") in ["error", "unavailable"] or res.get("error")), None)
-    if failed_node and not any(res.get("status") == "success" for res in tool_results):
-        err_payload = failed_node.get("result", {})
+    failed_node = next((
+        res for res in tool_results
+        if res.get("status") in ["error", "unavailable", "AUTH_ERROR", "BACKEND_ERROR", "VALIDATION_ERROR"]
+        or res.get("error")
+        or (isinstance(res.get("result"), dict) and res.get("result", {}).get("status") in ["AUTH_ERROR", "BACKEND_ERROR", "VALIDATION_ERROR", "ERROR"])
+    ), None)
+
+    if failed_node:
+        err_payload = failed_node.get("result", {}) if isinstance(failed_node.get("result"), dict) else {}
         fallback_msg = (
-            err_payload.get("error_message") if isinstance(err_payload, dict) else None
-        ) or failed_node.get("error") or "The requested metric is currently unavailable. Please try again later."
-        
+            err_payload.get("error_message")
+            or err_payload.get("error")
+            or failed_node.get("error")
+            or "Sorry, I couldn't retrieve the data for the requested comparison. The CRM service returned an error. No comparison has been calculated."
+        )
+
         logger.warning(f"[Synthesizer Envelope Short-Circuit] Output status is non-success for capability '{failed_node.get('capability')}'. Suppressing synthesis.")
         return {
             "type": "done",
             "content": fallback_msg,
-            "error_code": "capability_unavailable",
+            "error_code": err_payload.get("error_code") or "capability_unavailable",
             "chart_data": None,
             "navigate_to": None,
             "navigation_links": None,
@@ -419,7 +435,10 @@ async def synthesize_response(original_query: str, tool_results: List[Dict[str, 
             "4. If a capability failed or returned an error, explain it gracefully but still present any successful data.\n"
             "5. NEVER invent or hallucinate data. Only use the provided JSON.\n"
             "6. Do not expose internal technical terms like 'capabilities', 'JSON', or 'SQL'.\n"
-            "7. Do not explain your reasoning process."
+            "7. Do not explain your reasoning process.\n"
+            "8. CRITICAL: Do NOT output <think> tags, 'Thinking Process:', or reasoning blocks. Start IMMEDIATELY with the response text.\n"
+            "9. Clean up metric names: Convert snake_case keys (e.g. 'balance_to_achieve') into clean Title Case (e.g. 'Balance to Achieve').\n"
+            "10. Format monetary and metric numbers: Add comma separators and round floats to 2 decimal places (e.g. BHD 2,383,540.81)."
         )
         
         # Truncate overly large JSON payload to prevent exceeding LLM rate limits (e.g. 8k TPM)
@@ -442,31 +461,46 @@ async def synthesize_response(original_query: str, tool_results: List[Dict[str, 
                 final_text = "Data formatting paused due to security privacy policy enforcement."
             else:
                 try:
+                    req_id = (execution_plan or {}).get("request_id") or "unknown"
+                    logger.info(f"[LLM_CALL] stage=synthesizer request_id={req_id}")
                     response = await llm_client.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=privacy_res.masked_text)])
                 except Exception as primary_err:
                     err_str = str(primary_err)
                     if "429" in err_str or "rate_limit" in err_str.lower() or "quota" in err_str.lower():
-                        logger.warning("[Synthesizer] Primary model rate-limited (429). Retrying with llama-3.1-8b-instant fallback model...")
+                        fallback_model = os.getenv("FALLBACK_MODEL") or os.getenv("FAST_MODEL") or os.getenv("LLM_MODEL")
+                        logger.warning(f"[Synthesizer] Primary model rate-limited (429). Retrying with {fallback_model} fallback model...")
                         from config.llm_factory import get_llm
-                        fallback_llm = get_llm(model_name="llama-3.1-8b-instant")
+                        fallback_llm = get_llm(model_name=fallback_model, stage="synthesizer")
+                        logger.info(f"[LLM_CALL] stage=synthesizer_retry request_id={req_id}")
                         response = await fallback_llm.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=privacy_res.masked_text)])
                     else:
                         raise primary_err
 
-                final_text = unmask_data(response.content, privacy_res.token_mapping)
+                raw_unmasked = unmask_data(response.content, privacy_res.token_mapping)
                 privacy_res.clear_mapping()
 
-                # Post-process: convert any remaining $ currency symbols to BHD
+                from config.llm_factory import clean_think_tags
+                final_text = clean_think_tags(raw_unmasked)
+
+                # Post-process: convert any remaining $ or USD currency symbols to BHD & clean up unformatted numbers/keys
                 import re
                 final_text = re.sub(r'\$(\d)', r'BHD \1', final_text)
+                final_text = re.sub(r'\bUSD\b', r'BHD', final_text)
+                final_text = re.sub(r'\|\s*([a-z0-9_]+_[a-z0-9_]+)\s*\|', lambda m: f"| {m.group(1).replace('_', ' ').title()} |", final_text)
+                def _format_float(m):
+                    try:
+                        val = float(m.group(0))
+                        return f"{val:,.2f}"
+                    except Exception:
+                        return m.group(0)
+                final_text = re.sub(r'\b\d{4,}\.\d{3,}\b', _format_float, final_text)
 
-                if hasattr(response, "usage_metadata") and response.usage_metadata:
-                    synth_token_usage = {
-                        "input_tokens": response.usage_metadata.get("input_tokens", 0),
-                        "output_tokens": response.usage_metadata.get("output_tokens", 0),
-                        "total_tokens": response.usage_metadata.get("total_tokens", 0),
-                    }
-                    logger.info(f"[Synthesizer Tokens] In: {synth_token_usage['input_tokens']} | Out: {synth_token_usage['output_tokens']} | Total: {synth_token_usage['total_tokens']}")
+                from config.llm_factory import extract_token_usage
+                synth_token_usage = extract_token_usage(response)
+                if not synth_token_usage.get("model_name"):
+                    synth_token_usage["model_name"] = os.getenv("LLM_MODEL") or os.getenv("PRIMARY_MODEL") or "openai/gpt-oss-20b"
+                logger.info(f"[Synthesizer Tokens] Model: {synth_token_usage['model_name']} | In: {synth_token_usage['input_tokens']} | Out: {synth_token_usage['output_tokens']} | Total: {synth_token_usage['total_tokens']}")
+
         except Exception as e:
             logger.error(f"Dynamic synthesis failed ({e}). Falling back to 0-token DATA mode formatter.")
             fallback_res = format_data_response(original_query, tool_results)
@@ -511,7 +545,7 @@ async def synthesize_response(original_query: str, tool_results: List[Dict[str, 
 
         # Read chart_config from metadata for auto chart generation
         if isinstance(data, dict):
-            dyn_title, dyn_arr, dyn_x, dyn_y = _get_matching_breakdown_array(original_query, data)
+            dyn_title, dyn_arr, dyn_x, dyn_y = _get_matching_breakdown_array(data, tool_name)
             chart_cfg = cap_meta.get("chart_config") or {}
             chart_type = chart_cfg.get("type", "bar")
             
@@ -691,7 +725,7 @@ def format_data_response(user_query: str, tool_results: List[Dict[str, Any]]) ->
                 lines.append("")
 
             sub_lists = []
-            dyn_title, dyn_arr, _, _ = _get_matching_breakdown_array(user_query, data)
+            dyn_title, dyn_arr, _, _ = _get_matching_breakdown_array(data)
             if dyn_title and dyn_arr:
                 sub_lists.append((dyn_title, dyn_arr))
             elif "rows" in data and isinstance(data["rows"], list):
@@ -728,7 +762,10 @@ def format_data_response(user_query: str, tool_results: List[Dict[str, Any]]) ->
 
                     if display_headers:
                         lines.append(f"### {title}")
-                        if len(clean_records) < 3:
+                        if len(clean_records) == 1:
+                            from engine.renderer_engine import _render_single_entity_kpi
+                            lines.append(_render_single_entity_kpi(clean_records[0], title))
+                        elif len(clean_records) < 3:
                             for row in clean_records:
                                 name = row.get("name") or row.get("title") or row.get("label") or row.get("status_name")
                                 parts = []
@@ -745,7 +782,7 @@ def format_data_response(user_query: str, tool_results: List[Dict[str, Any]]) ->
                                             val_str = str(val)
                                         parts.append(f"**{h.replace('_', ' ').title()}:** {val_str}")
                                 prefix = f"- **{name}:** " if name else "- "
-                                lines.append(prefix + " | ".join(parts))
+                                lines.append(prefix + " • ".join(parts))
                             lines.append("")
                         else:
                             header_str = "| " + " | ".join([h.replace("_", " ").title() for h in display_headers]) + " |"
@@ -770,32 +807,17 @@ def format_data_response(user_query: str, tool_results: List[Dict[str, Any]]) ->
                             lines.append("")
 
         elif isinstance(data, list) and data and isinstance(data[0], dict):
-            keys = list(data[0].keys())
-            display_headers = [
-                k for k in keys 
-                if k.lower() not in _SUPPRESSED_FIELDS 
-                and k.lower() not in {"id", "status_id", "raw_record"}
-            ][:6]
-            if display_headers:
-                if len(data) < 3:
-                    for row in data:
-                        name = row.get("name") or row.get("title") or row.get("label") or row.get("status_name")
-                        parts = []
-                        for h in display_headers:
-                            if h.lower() in ("name", "title", "label", "status_name"):
-                                continue
-                            val = row.get(h)
-                            if val is not None:
-                                if isinstance(val, float) and val > 100:
-                                    val_str = f"BHD {val:,.2f}"
-                                elif isinstance(val, (int, float)):
-                                    val_str = f"{val:,}"
-                                else:
-                                    val_str = str(val)
-                                parts.append(f"**{h.replace('_', ' ').title()}:** {val_str}")
-                        prefix = f"- **{name}:** " if name else "- "
-                        lines.append(prefix + " | ".join(parts))
-                else:
+            if len(data) == 1:
+                from engine.renderer_engine import _render_single_entity_kpi
+                lines.append(_render_single_entity_kpi(data[0], cap.replace("_", " ").title()))
+            else:
+                keys = list(data[0].keys())
+                display_headers = [
+                    k for k in keys 
+                    if k.lower() not in _SUPPRESSED_FIELDS 
+                    and k.lower() not in {"id", "status_id", "raw_record"}
+                ][:6]
+                if display_headers:
                     header_str = "| " + " | ".join([h.replace("_", " ").title() for h in display_headers]) + " |"
                     sep_str = "| " + " | ".join(["---"] * len(display_headers)) + " |"
                     lines.append(header_str)

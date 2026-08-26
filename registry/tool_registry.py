@@ -23,6 +23,15 @@ logger = logging.getLogger(__name__)
 
 CRM_API_BASE = os.getenv("CRM_API_BASE", "http://localhost:3001/api/v1").rstrip("/")
 
+def _sanitize_log_dict(d: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(d, dict):
+        return d
+    sanit = dict(d)
+    for sensitive_key in ("jwt_token", "authorization", "token", "password", "secret", "bearer", "cookie"):
+        if sensitive_key in sanit and sanit[sensitive_key]:
+            sanit[sensitive_key] = "[REDACTED]"
+    return sanit
+
 def format_capability_envelope(capability_id: str, result_data: Any, error_err: Any = None) -> Dict[str, Any]:
     cap_meta = get_capability_metadata(capability_id) or {}
     default_msg = cap_meta.get("default_error_message", "The requested information is currently unavailable. Please try again later.")
@@ -58,17 +67,27 @@ def format_capability_envelope(capability_id: str, result_data: Any, error_err: 
     sanitized_payload = {}
     if isinstance(payload, dict):
         if response_schema:
-            for field in response_schema.keys():
-                if field in payload:
-                    sanitized_payload[field] = payload[field]
-            # If whitelist filtering stripped all keys, but original payload contains valid report/data fields, preserve original payload
-            if not sanitized_payload and payload:
-                if any(k in payload for k in ["data", "rows", "summary", "count", "records", "results", "list", "items", "table", "billing", "strictly_active_projects_count"]):
-                    sanitized_payload = payload
-                elif not any(k in payload for k in ["error", "error_message"]):
-                    sanitized_payload = payload
+            allowed_keys = set(response_schema.keys()) | {
+                "data", "rows", "summary", "summary_cards", "billing_revenue_gp_table",
+                "date_range", "projects_by_status", "gp_performance", "status", "report_type", "count",
+                "ranking_data", "comparison_periods", "result_type", "operation", "requested_metric",
+                "returned_metric", "metric", "metric_type", "metric_label", "dimension", "limit",
+                "sort_order", "variance", "variance_pct", "formatted_variance", "authoritative",
+                "source", "start_date", "end_date", "error_message", "error_code",
+                "is_organization_aggregate", "service_line_id", "service_line", "endpoint"
+            }
+            for field, val in payload.items():
+                if field in allowed_keys:
+                    sanitized_payload[field] = val
         else:
             sanitized_payload = payload
+
+        # If whitelist filtering stripped all keys, but original payload contains valid report/data fields, preserve original payload
+        if not sanitized_payload and payload:
+            if any(k in payload for k in ["data", "rows", "summary", "count", "records", "results", "list", "items", "table", "billing", "strictly_active_projects_count", "ranking_data", "comparison_periods"]):
+                sanitized_payload = payload
+            elif not any(k in payload for k in ["error", "error_message"]):
+                sanitized_payload = payload
     else:
         sanitized_payload = payload
 
@@ -77,7 +96,7 @@ def format_capability_envelope(capability_id: str, result_data: Any, error_err: 
         if not sanitized_payload:
             has_primary = False
         # If payload is non-empty, do not fail primary metric check for report responses
-        elif isinstance(payload, dict) and any(k in payload for k in ["data", "rows", "summary", "records", "results", "list", "items", "projects_by_status"]):
+        elif isinstance(payload, dict) and any(k in payload for k in ["data", "rows", "summary", "records", "results", "list", "items", "projects_by_status", "ranking_data", "comparison_periods"]):
             has_primary = True
 
     if not sanitized_payload or not has_primary:
@@ -89,6 +108,18 @@ def format_capability_envelope(capability_id: str, result_data: Any, error_err: 
                 "error_message": default_msg
             }
         }
+
+    if capability_id == "kpi_summary":
+        raw_k = list(sanitized_payload.keys()) if isinstance(sanitized_payload, dict) else []
+        inner_d = sanitized_payload.get("data") if isinstance(sanitized_payload, dict) and isinstance(sanitized_payload.get("data"), dict) else (sanitized_payload if isinstance(sanitized_payload, dict) else {})
+        r_cnt = len(inner_d.get("rows") or []) if isinstance(inner_d, dict) else 0
+        print(f"\n=============================================================")
+        print(f"[TOOL_REGISTRY KPI RETURN] cap_id={capability_id}")
+        print(f"EXACT PAYLOAD KEYS: {raw_k}")
+        print(f"INNER DATA KEYS: {list(inner_d.keys()) if isinstance(inner_d, dict) else []}")
+        print(f"ROWS COUNT: {r_cnt}")
+        print(f"=============================================================\n")
+        logger.info(f"[TOOL_REGISTRY KPI RETURN] keys={raw_k} inner_keys={list(inner_d.keys()) if isinstance(inner_d, dict) else []} rows_count={r_cnt}")
 
     return {
         "status": "success",
@@ -202,7 +233,24 @@ class ToolRegistry:
             else:
                 final_backend_target = f"custom: {selected_target}"
 
-            logger.info(f"[ToolRegistry] STAGE 5 (Backend Endpoint Selection): capability_id='{target_cap_id}' -> Final backend target: '{final_backend_target}'")
+            # Endpoint Invariant & Selection Telemetry Validation
+            expected_endpoint = metadata.get("authoritative_endpoint")
+            selected_ep_str = best_impl.get("endpoint") or best_impl.get("function_call") or ""
+            
+            invariant_pass = True
+            if expected_endpoint:
+                if impl_type in ["report", "api"]:
+                    clean_sel = selected_ep_str.split()[-1] if " " in selected_ep_str else selected_ep_str
+                    clean_exp = expected_endpoint.split()[-1] if " " in expected_endpoint else expected_endpoint
+                    if clean_sel.lower() != clean_exp.lower():
+                        invariant_pass = False
+
+            if not invariant_pass:
+                logger.error(f"[ENDPOINT_INVARIANT] capability={target_cap_id} selected_endpoint={selected_ep_str} expected_endpoint={expected_endpoint} status=FAIL")
+                raise ToolResolutionException(f"ToolResolutionException: Endpoint invariant failure. Capability '{target_cap_id}' cannot execute via mismatched endpoint '{selected_ep_str}'. Expected '{expected_endpoint}'.")
+
+            logger.info(f"[ENDPOINT_SELECTION] capability={target_cap_id} endpoint={final_backend_target} authoritative=true")
+            logger.info(f"[ENDPOINT_INVARIANT] capability={target_cap_id} selected_endpoint={final_backend_target} expected_endpoint={expected_endpoint or final_backend_target} status=PASS")
 
             executable_node = {
                 "capability_id": target_cap_id,
@@ -292,8 +340,15 @@ class ToolRegistry:
             if op_val and str(op_val).lower() not in ["none", "null", "false", ""]:
                 requested_ops.add(str(op_val).lower())
 
-            supported_ops = set(impl.get("supported_operations", ["filter", "summary", "ranking", "comparison", "group_by", "trend", "count", "sum", "average", "sort_order", "limit"]))
-            missing_ops = requested_ops - supported_ops
+            supported_ops = set(impl.get("supported_operations", ["filter", "summary", "generate", "generate_report", "report", "analyze", "ranking", "comparison", "group_by", "trend", "count", "sum", "average", "sort_order", "limit"]))
+            # Map canonical report operations if candidate supports report generation or summary
+            effective_requested_ops = set(requested_ops)
+            if ("generate" in effective_requested_ops or "generate_report" in effective_requested_ops or "report" in effective_requested_ops) and ("summary" in supported_ops or "report" in supported_ops or "generate" in supported_ops or "generate_report" in supported_ops):
+                effective_requested_ops.discard("generate")
+                effective_requested_ops.discard("generate_report")
+                effective_requested_ops.discard("report")
+
+            missing_ops = effective_requested_ops - supported_ops
             if missing_ops:
                 reason = f"Candidate '{impl_name}': Missing required operations {missing_ops} (Supported: {supported_ops})"
                 rejection_reasons.append(reason)
@@ -373,7 +428,13 @@ class ToolRegistry:
                 logger.info(f"[TOOL REGISTRY RETURN] Returning node because error was found in node: {node['error']}")
                 return {"capability": node.get("capability_id", "Unknown"), "error": node["error"]}
                 
-            ctx = node.get("context", {})
+            ctx = dict(node.get("context") or {})
+            for k in ["operation", "metric", "dimension", "ranking", "limit", "sort_order", "comparison", "comparison_periods"]:
+                if k not in ctx and node.get(k) is not None:
+                    ctx[k] = node.get(k)
+
+            if jwt_token and "jwt_token" not in ctx:
+                ctx["jwt_token"] = jwt_token
             cap_id = node.get("capability_id") or node.get("capability") or node.get("id") or "unknown_capability"
             target_cap_id = CAPABILITY_ALIASES.get(cap_id, cap_id)
             node_intent = node.get("intent")
@@ -381,23 +442,25 @@ class ToolRegistry:
             # 1. Dynamically inject ALL resolved entities into context
             for ent in resolved_entities:
                 ent_type = (ent.get("type") or ent.get("entity_type") or "").lower()
-                ent_id = ent.get("id") or ent.get("entity_id")
-                ent_name = ent.get("name") or ent.get("entity_name")
+                ent_id = ent.get("id") or ent.get("entity_id") or ent.get("resolved_id")
+                ent_name = ent.get("name") or ent.get("entity_name") or ent.get("resolved_name")
                 if ent_type and ent_id:
                     key_name = f"{ent_type}_id"
                     if key_name not in ctx:
                         ctx[key_name] = ent_id
                     if ent_name and f"{ent_type}_name" not in ctx:
                         ctx[f"{ent_type}_name"] = ent_name
+                    if ent_name and ent_type not in ctx:
+                        ctx[ent_type] = ent_name
 
             # NEW: Inject global report filters from user_context
             if user_context:
                 import re
 
-                # 1. Merge filters that don't need resolution (like period, dates, scope)
-                for filter_key in ["financial_year", "date_range", "start_date", "end_date", "period", "service_line", "office", "department", "partner", "client", "manager", "industry", "country", "status"]:
+                # 1. Merge filters that don't need resolution (like period, dates, scope, operations)
+                for filter_key in ["financial_year", "date_range", "start_date", "end_date", "period", "service_line", "office", "department", "partner", "client", "manager", "industry", "country", "status", "is_explicit", "is_explicit_temporal", "operation", "dimension", "metric", "ranking", "limit", "sort_order", "comparison", "comparison_periods"]:
                     val = user_context.get(filter_key)
-                    if val and str(val).lower() != "all" and filter_key not in ctx:
+                    if val is not None and str(val).lower() != "all" and filter_key not in ctx:
                         ctx[filter_key] = val
 
             # Auto-parse temporal scope filters (FY, Quarters, Months, Date Ranges)
@@ -414,11 +477,24 @@ class ToolRegistry:
             from agent.entity_resolver import is_fiscal_year_expression, resolve_fiscal_year
             if fy_val and is_fiscal_year_expression(str(fy_val)):
                 fy_res = resolve_fiscal_year(str(fy_val))
-                ctx["financial_year"] = fy_res["financial_year"]
+                if "financial_year" not in ctx or not ctx["financial_year"]:
+                    ctx["financial_year"] = fy_res["financial_year"]
                 if "start_date" not in ctx or not ctx["start_date"]:
                     ctx["start_date"] = fy_res["start_date"]
                 if "end_date" not in ctx or not ctx["end_date"]:
                     ctx["end_date"] = fy_res["end_date"]
+
+            if user_context and "is_explicit" in user_context:
+                ctx["is_explicit"] = bool(user_context["is_explicit"])
+
+            logger.info(
+                f"[TEMPORAL_BACKEND_FILTERS] capability_id='{target_cap_id}' | "
+                f"start_date='{ctx.get('start_date')}' | "
+                f"end_date='{ctx.get('end_date')}' | "
+                f"financial_year='{ctx.get('financial_year')}' | "
+                f"temporal_scope='{ctx.get('temporal_scope')}' | "
+                f"is_explicit={ctx.get('is_explicit', False)}"
+            )
 
             # 2. Dynamically select the correct implementation based on context
             if "question" not in ctx and question:
@@ -438,7 +514,7 @@ class ToolRegistry:
                 raise ToolResolutionException(f"ToolResolutionException: No valid implementation found for capability '{target_cap_id}'.")
 
             if debug_mode:
-                logger.info(f"[AI_DEBUG_MODE] Parameters injected into {cap_id}: {ctx}")
+                logger.info(f"[AI_DEBUG_MODE] Parameters injected into {cap_id}: {_sanitize_log_dict(ctx)}")
 
             impl_type = best_impl.get("type")
             func_name = best_impl.get("function_call", best_impl.get("endpoint", "N/A"))
@@ -451,8 +527,32 @@ class ToolRegistry:
             exception_obj = None
             is_rest_attempt = (impl_type in ["api", "report"])
 
+            # Route 0: Authoritative Operation Overrides for Ranking & Multi-Period Comparison
+            op_intent = str(ctx.get("operation") or "").lower()
+            comp_periods = ctx.get("comparison_periods") or []
+
+            if op_intent == "ranking" and target_cap_id in ["revenue_analysis", "ranking_query", "analytical_query"]:
+                logger.info(f"[TOOL_REGISTRY_DISPATCH] Operation 'ranking' detected for capability '{target_cap_id}'. Dispatching to call_authoritative_ranking_query.")
+                func_name = "call_authoritative_ranking_query"
+                impl_type = "wrapper"
+                wrapper_func = SEMANTIC_TOOL_MAP.get(func_name)
+                try:
+                    raw_backend_response = await wrapper_func(ctx)
+                except Exception as exc:
+                    exception_obj = exc
+                    logger.error(f"[ToolRegistry Wrapper Exception] Cap: {target_cap_id} | Func: {func_name} | Exception: {exc}")
+            elif op_intent == "comparison" or len(comp_periods) >= 2:
+                logger.info(f"[TOOL_REGISTRY_DISPATCH] Operation 'comparison' detected for capability '{target_cap_id}'. Dispatching to call_authoritative_comparison_query.")
+                func_name = "call_authoritative_comparison_query"
+                impl_type = "wrapper"
+                wrapper_func = SEMANTIC_TOOL_MAP.get(func_name)
+                try:
+                    raw_backend_response = await wrapper_func(ctx)
+                except Exception as exc:
+                    exception_obj = exc
+                    logger.error(f"[ToolRegistry Wrapper Exception] Cap: {target_cap_id} | Func: {func_name} | Exception: {exc}")
             # Route 1: Python Semantic Wrapper
-            if impl_type == "wrapper":
+            elif impl_type == "wrapper":
                 wrapper_func = SEMANTIC_TOOL_MAP.get(func_name)
                 
                 if wrapper_func:
@@ -502,7 +602,10 @@ class ToolRegistry:
                             "requires_comparison", "requires_export", "analysis_depth", 
                             "canonical_fy", "all_fiscal_years", "missing_information", 
                             "raw_tool_results", "previous_execution_plan", "user_context", 
-                            "resolved_entities", "entity", "entity_type", "entity_id", "entity_name"
+                            "resolved_entities", "entity", "entity_type", "entity_id", "entity_name",
+                            "execution_contract", "jwt_token", "user_name", "department", "role",
+                            "role_name", "hierarchy_level", "financial_year", "date_range", "period",
+                            "temporal_scope", "is_explicit", "extra_filters", "user_id"
                         }
                         unused_params = {k: v for k, v in ctx.items() if k not in used_keys and k not in NON_API_KEYS}
                         
@@ -553,7 +656,7 @@ class ToolRegistry:
                             req_start_time = time.time()
                             log_stage(logger, "BACKEND_REQ", Method=method, Endpoint=func_name, Auth="Present" if jwt_token else "None")
 
-                            async with session.request(method, endpoint_url, headers=headers, json=json_data, timeout=aiohttp.ClientTimeout(total=2.5)) as response:
+                            async with session.request(method, endpoint_url, headers=headers, json=json_data, timeout=aiohttp.ClientTimeout(total=25.0)) as response:
                                 http_status = response.status
                                 body_text = await response.text()
                                 req_exec_time = round((time.time() - req_start_time) * 1000, 2)

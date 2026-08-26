@@ -86,13 +86,13 @@ async def get_dashboard_snapshot(user_id: int, role: str) -> dict:
 # ---------------------------------------------------------------------------
 # Tool 2: get_anomaly_alerts
 # ---------------------------------------------------------------------------
-async def get_anomaly_alerts(user_id: int, role: str) -> list:
+async def get_anomaly_alerts(employee_id: Optional[int] = None, role: Optional[str] = None) -> list:
     """
     Proactively scans for business anomalies.
     Returns a list of alert dicts with: severity (high/medium/low), category, message, count, action.
     Severity: high = requires immediate attention, medium = review soon, low = informational.
     """
-    employee_id, user_tier = _resolve_rbac_params(user_id, None)
+    employee_id, user_tier = _resolve_rbac_params(employee_id, None)
     ownership_sql = _build_ownership_sql(employee_id, user_tier, "i", True)
 
     alerts = []
@@ -194,15 +194,15 @@ async def compare_periods(
     period_a_end: str,
     period_b_start: str,
     period_b_end: str,
-    user_id: int,
-    role: str,
+    employee_id: Optional[int] = None,
+    role: Optional[str] = None,
 ) -> dict:
     """
     Compares a metric between two date ranges.
     metric: one of 'revenue', 'receivables', 'proposals', 'leads'
     Returns: { period_a: value, period_b: value, delta: value, delta_pct: float, chart_data: dict }
     """
-    employee_id, user_tier = _resolve_rbac_params(user_id, None)
+    employee_id, user_tier = _resolve_rbac_params(employee_id, None)
     ownership_sql = _build_ownership_sql(employee_id, user_tier, "i", True)
 
     async def _get_metric(start: str, end: str) -> float:
@@ -249,14 +249,14 @@ async def compare_periods(
 # ---------------------------------------------------------------------------
 # Tool 4: get_entity_profile
 # ---------------------------------------------------------------------------
-async def get_entity_profile(entity_type: str, entity_name: str, user_id: int, role: str) -> dict:
+async def get_entity_profile(entity_type: str, entity_name: str, employee_id: Optional[int] = None, role: Optional[str] = None) -> dict:
     """
     Fetch a rich profile for an entity.
     entity_type: 'customer' | 'project' | 'employee'
     entity_name: the search term (name, code, or ID)
     Returns a structured profile dict with all related data.
     """
-    employee_id, user_tier = _resolve_rbac_params(user_id, None)
+    employee_id, user_tier = _resolve_rbac_params(employee_id, None)
 
     if entity_type == "customer":
         raw = await get_comprehensive_customer_report.ainvoke({"search_term": entity_name})
@@ -388,8 +388,8 @@ async def submit_feedback(
 async def handle_edit_intent(
     entity_type: str,
     entity_name: str,
-    user_id: int,
-    role: str,
+    employee_id: Optional[int] = None,
+    role: Optional[str] = None,
 ) -> dict:
     """
     Called when the agent detects is_edit_intent=True.
@@ -397,7 +397,7 @@ async def handle_edit_intent(
     Does NOT write any data — that's handled by the CRM backend via the existing API.
     """
     from config.role_tier_config import get_tier_for_role
-    tier = get_tier_for_role(role)
+    tier = get_tier_for_role(role or "Unknown")
 
     # Block write intent for tier 7+ (view-only staff)
     if tier >= 7:
@@ -406,7 +406,7 @@ async def handle_edit_intent(
             "message": f"Your role ({role}) does not have permission to edit CRM records via the AI assistant."
         }
 
-    profile = await get_entity_profile(entity_type, entity_name, user_id, role)
+    profile = await get_entity_profile(entity_type, entity_name, employee_id, role)
 
     return {
         "allowed": True,

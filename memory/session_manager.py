@@ -7,10 +7,11 @@ import json
 import uuid
 import logging
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Any
 
 from db.database_mongo import get_sessions_collection
 from db.database_redis import get_redis
+from cache import get_secure_cache_manager, generate_secure_cache_key
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +82,7 @@ async def create_session(user_context: dict) -> str:
     session_doc = {
         "_id": session_id,
         "user_id": user_id,
-        "employee_id": user_context.get("employee_id", user_id),
+        "employee_id": user_context.get("employee_id"),
         "role": user_context.get("role", "Staff"),
         "hierarchy_level": hierarchy_level,
         "department_id": user_context.get("department_id"),
@@ -112,16 +113,12 @@ async def create_session(user_context: dict) -> str:
         logger.error(f"[Session] MongoDB insert failed: {e}")
         raise
 
-    # Write to Redis with TTL (non-fatal if Redis is down)
+    # Write encrypted session doc to Redis hot tier (non-fatal if Redis is down)
     try:
-        redis = get_redis()
-        await redis.setex(
-            f"session:{session_id}",
-            ttl,
-            _serialize_doc(session_doc),
-        )
+        scm = get_secure_cache_manager()
+        await scm.set_secure(f"session:{session_id}", session_doc, ttl)
     except Exception as e:
-        logger.warning(f"[Session] Redis write failed (non-fatal): {e}")
+        logger.warning(f"[Session] Secure Redis write failed (non-fatal): {e}")
 
     logger.info(
         f"[Session] Created session {session_id} for user {user_id} "
@@ -176,7 +173,7 @@ async def restore_session_from_history(
         session_doc = {
             "_id": session_id,
             "user_id": resolved_user_id,
-            "employee_id": user_ctx.get("employee_id", resolved_user_id),
+            "employee_id": user_ctx.get("employee_id"),
             "role": user_ctx.get("role", "Staff"),
             "hierarchy_level": hierarchy_level,
             "department_id": user_ctx.get("department_id"),
@@ -203,12 +200,8 @@ async def restore_session_from_history(
         await col.replace_one({"_id": session_id}, session_doc, upsert=True)
 
         try:
-            redis = get_redis()
-            await redis.setex(
-                f"session:{session_id}",
-                ttl,
-                _serialize_doc(session_doc),
-            )
+            scm = get_secure_cache_manager()
+            await scm.set_secure(f"session:{session_id}", session_doc, ttl)
         except Exception as e:
             logger.warning(f"[Session] Redis write during restore failed: {e}")
 
@@ -225,24 +218,23 @@ async def get_session(
     user_context: Optional[dict] = None,
 ) -> Optional[dict]:
     """
-    Retrieve a session. Checks Redis first, then MongoDB fallback.
+    Retrieve a session. Checks Redis first (decrypted), then MongoDB fallback.
     If session is missing or expired, attempts auto-restoration from permanent chat_history.
     Returns None if session cannot be retrieved or restored.
     """
-    redis = get_redis()
+    scm = get_secure_cache_manager()
 
-    # --- Tier 1: Redis ---
+    # --- Tier 1: Redis (Decrypted) ---
     try:
-        cached = await redis.get(f"session:{session_id}")
-        if cached:
-            doc = _deserialize_doc(cached)
+        doc = await scm.get_secure(f"session:{session_id}")
+        if doc:
             if user_id is not None and doc.get("user_id") != user_id:
                 logger.warning(f"[Session] User mismatch for session {session_id}")
                 return None
             if not doc.get("is_expired", False):
                 hierarchy_level = doc.get("hierarchy_level", 4)
                 ttl = await get_ttl_seconds(hierarchy_level)
-                await redis.expire(f"session:{session_id}", ttl)
+                await scm.expire_secure(f"session:{session_id}", ttl)
                 return doc
     except Exception as e:
         logger.warning(f"[Session] Redis read failed (falling back to Mongo): {e}")
@@ -263,11 +255,7 @@ async def get_session(
             remaining = (doc["ttl_expires"] - datetime.utcnow()).total_seconds()
             remaining = max(int(remaining), 60)
             try:
-                await redis.setex(
-                    f"session:{session_id}",
-                    remaining,
-                    _serialize_doc(doc),
-                )
+                await scm.set_secure(f"session:{session_id}", doc, remaining)
             except Exception as e:
                 logger.warning(f"[Session] Redis re-warm failed: {e}")
             return doc
@@ -283,7 +271,7 @@ async def append_message(
 ) -> bool:
     """
     Append a message to the session (rolling window, max 20).
-    Updates both Redis and MongoDB.
+    Updates both Redis (encrypted) and MongoDB.
     role must be 'user' or 'assistant'.
     """
     if role not in ("user", "assistant"):
@@ -319,16 +307,12 @@ async def append_message(
         logger.error(f"[Session] MongoDB message update failed: {e}")
         return False
 
-    # Update Redis (re-serialize full doc)
+    # Update Redis (encrypted)
     try:
-        redis = get_redis()
+        scm = get_secure_cache_manager()
         hierarchy_level = session.get("hierarchy_level", 4)
         ttl = await get_ttl_seconds(hierarchy_level)
-        await redis.setex(
-            f"session:{session_id}",
-            ttl,
-            _serialize_doc(session),
-        )
+        await scm.set_secure(f"session:{session_id}", session, ttl)
     except Exception as e:
         logger.warning(f"[Session] Redis message update failed (non-fatal): {e}")
 
@@ -339,8 +323,8 @@ async def invalidate_session(session_id: str) -> bool:
     """Invalidate a session — delete from Redis, mark expired in Mongo."""
     # Delete from Redis
     try:
-        redis = get_redis()
-        await redis.delete(f"session:{session_id}")
+        scm = get_secure_cache_manager()
+        await scm.delete_secure(f"session:{session_id}")
     except Exception as e:
         logger.warning(f"[Session] Redis delete failed: {e}")
 
@@ -390,14 +374,10 @@ async def get_session_messages(session_id: str) -> list[dict]:
 # Clarification state management
 # ---------------------------------------------------------------------------
 async def save_clarification_state(session_id: str, clar_dto: dict) -> bool:
-    """Save clarification state DTO in Redis and MongoDB."""
+    """Save encrypted clarification state DTO in Redis and MongoDB."""
     try:
-        redis = get_redis()
-        await redis.setex(
-            f"clarification:{session_id}",
-            3600,  # 1 hour TTL for pending clarification
-            _serialize_doc(clar_dto)
-        )
+        scm = get_secure_cache_manager()
+        await scm.set_secure(f"clarification:{session_id}", clar_dto, 3600)
     except Exception as e:
         logger.warning(f"[Session] Redis save clarification failed: {e}")
 
@@ -414,12 +394,12 @@ async def save_clarification_state(session_id: str, clar_dto: dict) -> bool:
 
 
 async def get_clarification_state(session_id: str) -> Optional[dict]:
-    """Get clarification state DTO for session."""
+    """Get decrypted clarification state DTO for session."""
     try:
-        redis = get_redis()
-        cached = await redis.get(f"clarification:{session_id}")
+        scm = get_secure_cache_manager()
+        cached = await scm.get_secure(f"clarification:{session_id}")
         if cached:
-            return _deserialize_doc(cached)
+            return cached
     except Exception as e:
         logger.warning(f"[Session] Redis get clarification failed: {e}")
 
@@ -436,8 +416,8 @@ async def get_clarification_state(session_id: str) -> Optional[dict]:
 async def clear_clarification_state(session_id: str) -> bool:
     """Clear clarification state DTO for session."""
     try:
-        redis = get_redis()
-        await redis.delete(f"clarification:{session_id}")
+        scm = get_secure_cache_manager()
+        await scm.delete_secure(f"clarification:{session_id}")
     except Exception as e:
         logger.warning(f"[Session] Redis clear clarification failed: {e}")
 
@@ -457,79 +437,61 @@ async def clear_clarification_state(session_id: str) -> bool:
 # Entity-Aware Cache Functions
 # ---------------------------------------------------------------------------
 def build_entity_cache_key(
-    user_id: int,
+    user_id: Any,
     capability: str,
     resolved_entities: list = None,
     financial_year: str = "",
-    filters: dict = None
+    filters: dict = None,
+    user_context: Optional[dict] = None
 ) -> str:
     """
-    Build a deterministic cache key for entity-aware queries based on:
-    user_id, capability, resolved entities, financial_year, and extra filters.
+    Build an opaque, deterministic HMAC-SHA256 cache key for entity-aware queries based on:
+    user_context/user_id (RBAC scope), capability, resolved entities, financial_year, and extra filters.
     """
-    import hashlib
-    ent_parts = []
-    for ent in (resolved_entities or []):
-        if isinstance(ent, dict):
-            e_type = str(ent.get("entity_type") or ent.get("type") or "").lower()
-            e_id = str(ent.get("entity_id") or ent.get("id") or ent.get("value") or "").lower()
-            ent_parts.append(f"{e_type}:{e_id}")
-    ent_str = "|".join(sorted(ent_parts))
-
-    filter_parts = []
-    if filters and isinstance(filters, dict):
-        for k, v in sorted(filters.items()):
-            if v and k not in ("raw_tool_results", "previous_execution_plan"):
-                filter_parts.append(f"{k}:{v}")
-    filter_str = "|".join(filter_parts)
-
-    raw_key = f"u:{user_id}|cap:{capability}|fy:{financial_year}|ent:{ent_str}|flt:{filter_str}"
-    digest = hashlib.md5(raw_key.encode("utf-8")).hexdigest()
-    return f"entity_cache:{digest}"
+    u_ctx = user_context if isinstance(user_context, dict) else {"user_id": user_id}
+    extra_p = {
+        "financial_year": financial_year,
+        "resolved_entities": resolved_entities or [],
+        "filters": filters or {}
+    }
+    return generate_secure_cache_key("entity_cache", u_ctx, capability, extra_p)
 
 
 async def get_entity_cache(cache_key: str) -> Optional[dict]:
-    """Retrieve cached response from Redis for an entity-aware query."""
+    """Retrieve decrypted cached response from Redis for an entity-aware query."""
     try:
-        redis = get_redis()
-        cached = await redis.get(cache_key)
-        if cached:
-            doc = _deserialize_doc(cached)
-            if isinstance(doc, dict):
-                content = str(doc.get("content", "")).lower()
-                if any(phrase in content for phrase in [
-                    "currently unavailable", "please try again later", "failed", 
-                    "does not include", "not available", "customer-specific", "bhd 0", "at 0%"
-                ]):
-                    logger.info(f"[EntityCache] Ignoring stale error/incomplete cached response for key={cache_key}")
-                    return None
-                if "recoverability" in cache_key and not any(p in content for p in ["actual recoverability", "portfolio recoverability", "recoverability percentage"]):
-                    logger.info(f"[EntityCache] Ignoring stale cached response missing recoverability percentage for key={cache_key}")
-                    return None
+        scm = get_secure_cache_manager()
+        doc = await scm.get_secure(cache_key)
+        if doc and isinstance(doc, dict):
+            content = str(doc.get("content", "")).lower()
+            if any(phrase in content for phrase in [
+                "currently unavailable", "please try again later", "failed", 
+                "does not include", "not available", "customer-specific", "bhd 0", "at 0%"
+            ]):
+                logger.info(f"[EntityCache] Ignoring stale error/incomplete cached response for key={cache_key[:24]}...")
+                return None
+            if "recoverability" in cache_key and not any(p in content for p in ["actual recoverability", "portfolio recoverability", "recoverability percentage"]):
+                logger.info(f"[EntityCache] Ignoring stale cached response missing recoverability percentage for key={cache_key[:24]}...")
+                return None
             return doc
     except Exception as e:
-        logger.warning(f"[EntityCache] Redis read failed for key={cache_key}: {e}")
+        logger.warning(f"[EntityCache] Redis read failed for key={cache_key[:24]}...: {e}")
     return None
 
 
 async def set_entity_cache(cache_key: str, response: dict, ttl_seconds: int = 1800) -> bool:
-    """Store query response in Redis entity cache (default 30 min TTL)."""
+    """Store encrypted query response in Redis entity cache (default 30 min TTL)."""
     if not response or not isinstance(response, dict):
         return False
     content = str(response.get("content", "")).lower()
     if "currently unavailable" in content or "please try again later" in content:
-        logger.info(f"[EntityCache] Skipping caching of error/unavailable response for key={cache_key}")
+        logger.info(f"[EntityCache] Skipping caching of error/unavailable response for key={cache_key[:24]}...")
         return False
     try:
-        redis = get_redis()
-        await redis.setex(
-            cache_key,
-            ttl_seconds,
-            _serialize_doc(response)
-        )
-        return True
+        scm = get_secure_cache_manager()
+        return await scm.set_secure(cache_key, response, ttl_seconds)
     except Exception as e:
-        logger.warning(f"[EntityCache] Redis write failed for key={cache_key}: {e}")
+        logger.warning(f"[EntityCache] Redis write failed for key={cache_key[:24]}...: {e}")
         return False
 
 
@@ -566,23 +528,45 @@ async def update_session_memory(
     cap_ids = [c.get("id") for c in caps if c.get("id")]
 
     merged_filters: dict = {}
-    PERSISTENT_KEYS = {"financial_year", "service_line", "department", "office"}
+    PERSISTENT_KEYS = {
+        "financial_year", "service_line", "service_line_id", "department", 
+        "department_id", "office", "metric", "capability", "operation", 
+        "start_date", "end_date"
+    }
     for cap in caps:
         ctx = cap.get("context") or {}
         for k, v in ctx.items():
-            if v and k in PERSISTENT_KEYS:
+            if v is not None and k in PERSISTENT_KEYS:
                 merged_filters[k] = v
+
+    ext_filters = execution_plan.get("extracted_filters") or {}
+    for k, v in ext_filters.items():
+        if v is not None and k in PERSISTENT_KEYS:
+            merged_filters[k] = v
 
     for filter_key in PERSISTENT_KEYS:
         val = execution_plan.get(filter_key)
-        if val:
+        if val is not None:
             merged_filters[filter_key] = val
+
+    # Include resolved_entities mapping into merged_filters if present
+    for res_ent in execution_plan.get("resolved_entities", []):
+        e_type = str(res_ent.get("entity_type", "")).lower()
+        e_id = res_ent.get("resolved_id") or res_ent.get("entity_id")
+        e_name = res_ent.get("resolved_name") or res_ent.get("entity_name")
+        if e_type in ["service_line", "serviceline"]:
+            merged_filters["service_line"] = e_name
+            merged_filters["service_line_id"] = e_id
+        elif e_type == "department":
+            merged_filters["department"] = e_name
+            merged_filters["department_id"] = e_id
 
     new_memory = {
         "active_topic": execution_plan.get("business_goal") or None,
         "active_reports": cap_ids,
         "active_filters": merged_filters,
         "active_entities": execution_plan.get("resolved_entities", []),
+        "active_followup_options": execution_plan.get("available_followup_options", []),
         "presentation_mode": execution_plan.get("presentation_mode"),
         "comparison_baseline": execution_plan.get("comparison"),
         "last_capability_ids": cap_ids,
@@ -603,10 +587,10 @@ async def update_session_memory(
         session = await get_session(session_id)
         if session:
             session["executive_memory"] = new_memory
-            redis = get_redis()
+            scm = get_secure_cache_manager()
             hierarchy_level = session.get("hierarchy_level", 4)
             ttl = await get_ttl_seconds(hierarchy_level)
-            await redis.setex(f"session:{session_id}", ttl, _serialize_doc(session))
+            await scm.set_secure(f"session:{session_id}", session, ttl)
     except Exception as e:
         logger.warning(f"[ExecutiveMemory] Redis update failed (non-fatal): {e}")
 

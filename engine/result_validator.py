@@ -57,6 +57,7 @@ class ResultValidationEngine:
             req_dict = {}
 
         req_status = req_dict.get("status_filter") or requested_constraints.get("status")
+        req_comparison = req_dict.get("comparison_type") or requested_constraints.get("comparison_type")
         req_employee = req_dict.get("employee_name") or requested_constraints.get("employee_name") or requested_constraints.get("employee")
         req_employee_id = req_dict.get("employee_id") or requested_constraints.get("employee_id")
         req_op = req_dict.get("operation") or requested_constraints.get("operation")
@@ -90,12 +91,34 @@ class ResultValidationEngine:
             req_emp_norm = " ".join(str(req_employee).split()).lower() if req_employee else ""
             pay_emp_norm = " ".join(str(payload_emp).split()).lower() if payload_emp else ""
             
+            emp_errs_before = len(errors)
             if is_org is True and not payload_emp:
                 errors.append(f"Employee scope mismatch: requested employee '{req_employee or req_employee_id}', but returned organization-wide KPI aggregate.")
             elif req_employee_id and payload_emp_id and int(req_employee_id) != int(payload_emp_id):
                 errors.append(f"Employee ID mismatch: requested ID '{req_employee_id}', payload returned ID '{payload_emp_id}'.")
             elif pay_emp_norm and req_emp_norm and (req_emp_norm not in pay_emp_norm and pay_emp_norm not in req_emp_norm):
                 errors.append(f"Employee mismatch: requested '{req_employee}', payload returned '{payload_emp}'.")
+            
+            val_status = "PASS" if len(errors) == emp_errs_before else "FAIL"
+            logger.info(
+                f"[KPI_ENTITY_VALIDATION] requested_employee_id={req_employee_id} "
+                f"returned_employee_id={payload_emp_id} status={val_status}"
+            )
+
+        # 2b. Validate Customer Scope
+        req_customer = req_dict.get("customer_name") or requested_constraints.get("customer_name") or requested_constraints.get("customer")
+        req_customer_id = req_dict.get("customer_id") or requested_constraints.get("customer_id")
+
+        if (req_customer or req_customer_id) and isinstance(payload, dict):
+            summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else payload
+            payload_cust = summary.get("customer_name") or summary.get("customer") or payload.get("customer_name") or payload.get("customer")
+            payload_cust_id = summary.get("customer_id") or summary.get("cust_id") or payload.get("customer_id") or payload.get("cust_id")
+            is_cust_scoped = summary.get("is_customer_scoped") or payload.get("is_customer_scoped")
+
+            if not is_cust_scoped and not payload_cust and not payload_cust_id and payload.get("is_generic_unfiltered_search"):
+                errors.append(f"Customer scope mismatch: requested customer '{req_customer or req_customer_id}', but returned generic unfiltered aggregate.")
+            elif req_customer_id and payload_cust_id and int(req_customer_id) != int(payload_cust_id):
+                errors.append(f"Customer ID mismatch: requested ID '{req_customer_id}', payload returned ID '{payload_cust_id}'.")
 
         # 3. Validate Status Scope
         if req_status and isinstance(payload, dict):
@@ -103,23 +126,102 @@ class ResultValidationEngine:
             has_status_metrics = any(k in payload for k in [
                 "rejected_proposals", "accepted_proposals", "sent_proposals", "created_proposals",
                 "dashboard_proposal_metrics_breakdown", "open_proposals", "won_proposals",
-                "total_proposals", "status_breakdown", "proposal_status_id", "service_leads_breakdown"
+                "total_proposals", "status_breakdown", "proposal_status_id", "service_leads_breakdown", "strictly_active_projects_count"
             ])
             if not payload_status and not has_status_metrics and payload.get("is_generic_unfiltered_search"):
                 errors.append(f"Status filter mismatch: requested status '{req_status}', but execution payload lacks status filtering.")
 
-        # 4. Validate Operation / Granularity (Ranking vs Total Revenue Downgrade)
-        if req_op == "ranking" and req_dim == "customer" and isinstance(payload, dict):
-            # Must contain customer-level records/list
-            records = payload.get("records") or payload.get("data") or payload.get("rows") or payload.get("billing") or payload.get("customers")
-            if isinstance(records, list) and len(records) > 0:
-                pass  # Good, contains customer records
-            elif "total_net_amount" in payload or "total_revenue" in payload:
-                errors.append("Operation mismatch: requested customer ranking/top-N, but payload only contains organization-wide total revenue without customer breakdown.")
+        # 3b. Validate Comparison Scope
+        if req_comparison and isinstance(payload, dict):
+            if req_comparison == "budget":
+                has_budget = any(k in payload for k in ["target", "budget", "total_kpi_target", "target_rev", "gp_performance_ytd_breakdown", "performing"]) or any(
+                    "target" in str(k).lower() or "budget" in str(k).lower() for k in payload.keys()
+                )
+                if not has_budget:
+                    errors.append("Comparison type mismatch: requested 'budget' comparison, but payload lacks budget/target metrics.")
+            elif req_comparison == "previous_fy":
+                has_prev_fy = "previous_fy_revenue" in payload or any("prev" in str(k).lower() or "prior" in str(k).lower() for k in payload.keys())
+                if not has_prev_fy:
+                    errors.append("Comparison type mismatch: requested 'previous_fy' comparison, but payload lacks previous FY metrics.")
+
+        # 4. Validate Operation / Granularity (Ranking & Multi-Period Comparison Fail-Closed Rules)
+        if req_op == "ranking":
+            ranking_list = payload.get("ranking_data") if isinstance(payload, dict) else None
+            records = payload.get("records") or payload.get("data") or payload.get("rows") if isinstance(payload, dict) else None
+            if not ranking_list and not (isinstance(records, list) and len(records) > 0):
+                errors.append("Operation mismatch: requested ranking operation, but backend returned generic summary report instead of ranking dataset.")
+
+        # 4b. Validate Dimension Match for Ranking
+        if req_op == "ranking" or (isinstance(payload, dict) and (payload.get("operation") == "ranking" or "ranking_data" in payload)):
+            ret_dim = payload.get("dimension") if isinstance(payload, dict) else None
+            if req_dim and ret_dim:
+                req_dim_clean = str(req_dim).lower().replace("_", "").replace(" ", "")
+                ret_dim_clean = str(ret_dim).lower().replace("_", "").replace(" ", "")
+                if req_dim_clean != ret_dim_clean and req_dim_clean not in ret_dim_clean and ret_dim_clean not in req_dim_clean:
+                    errors.append(f"Dimension mismatch: requested dimension '{req_dim}', but payload returned dimension '{ret_dim}'.")
+                    logger.warning(
+                        f"[RESULT_SEMANTIC_VALIDATION] requested_dimension={req_dim} returned_dimension={ret_dim} status=FAIL"
+                    )
+                else:
+                    logger.info(
+                        f"[RESULT_SEMANTIC_VALIDATION] requested_dimension={req_dim} returned_dimension={ret_dim} status=PASS"
+                    )
+
+        # 4c. Validate Entity Lineage for Ranking Data
+        if isinstance(payload, dict) and "ranking_data" in payload:
+            ranking_items = payload.get("ranking_data", [])
+            for item in ranking_items:
+                ent_name = item.get("entity_name")
+                ent_source = item.get("source", "node_authoritative_ranking_api")
+                logger.info(
+                    f"[ENTITY_LINEAGE] requested_dimension={req_dim} requested_entity=None resolved_entity={ent_name} "
+                    f"entity_id=None backend_source={ent_source} result_source={ent_source}"
+                )
+
+        # 4d. Validate Capability Result Isolation
+        if capability_id in ["receivables_analysis", "receivables"]:
+            has_receivables_data = isinstance(payload, dict) and any(k in payload for k in [
+                "total_receivables", "receivables", "ageing_summary", "outstanding_amount", "receivable_records", "rows", "records", "total_records"
+            ])
+            if not has_receivables_data and payload.get("billing_revenue_gp_table"):
+                errors.append("Capability mismatch: requested receivables analysis, but payload returned revenue billing table.")
+                logger.warning(
+                    f"[RESULT_SEMANTIC_VALIDATION] requested_capability=receivables_analysis returned_payload=revenue_billing_table status=FAIL"
+                )
+
+        if req_op == "comparison" or len(req_dict.get("comparison_periods", [])) >= 2:
+            comp_list = payload.get("comparison_periods") if isinstance(payload, dict) else None
+            req_period_count = len(req_dict.get("comparison_periods", [])) or 2
+            payload_status = payload.get("status") if isinstance(payload, dict) else None
+
+            if payload_status in ["AUTH_ERROR", "BACKEND_ERROR", "VALIDATION_ERROR", "PERIOD_MISMATCH"]:
+                errors.append(f"Comparison execution failed with backend status '{payload_status}'.")
+            elif not comp_list or not isinstance(comp_list, list) or len(comp_list) < req_period_count:
+                errors.append(f"Comparison mismatch: requested {req_period_count}-period comparison, but payload returned {len(comp_list) if isinstance(comp_list, list) else 0} periods.")
+            else:
+                failed_periods = [p for p in comp_list if p.get("status") != "PASS"]
+                if failed_periods:
+                    errors.append(f"Comparison failure: {len(failed_periods)} of {len(comp_list)} periods failed execution.")
+                for p in comp_list:
+                    req_p = p.get("requested_period") or p.get("period")
+                    ret_p = p.get("returned_period")
+                    if p.get("status") == "PERIOD_MISMATCH" or (ret_p and req_p and str(req_p).strip().lower() != str(ret_p).strip().lower()):
+                        errors.append(f"Period identity mismatch: requested '{req_p}', backend returned '{ret_p}'.")
+
+        # 4e. Validate Metric Semantics
+        req_metric = (req_dict.get("metric") or "").lower().strip()
+        if req_metric and isinstance(payload, dict):
+            metric_type = payload.get("metric_type")
+            if "count" in req_metric and metric_type == "monetary":
+                errors.append(f"Metric semantics mismatch: requested count metric '{req_metric}', but returned monetary value.")
+                logger.warning(f"[METRIC_MISMATCH_FAIL] requested_metric='{req_metric}' returned_metric_type='{metric_type}'. Fail-Closed.")
+            elif ("amount" in req_metric or "revenue" in req_metric or "receivables" in req_metric) and "count" not in req_metric and metric_type == "count":
+                errors.append(f"Metric semantics mismatch: requested monetary metric '{req_metric}', but returned count value.")
+                logger.warning(f"[METRIC_MISMATCH_FAIL] requested_metric='{req_metric}' returned_metric_type='{metric_type}'. Fail-Closed.")
 
         # 5. Validate Primary Metric Existence
         if primary_metric and isinstance(payload, dict):
-            if primary_metric not in payload and not any(k in payload for k in ["data", "rows", "summary", "count", "records", "results", "list", "items", "table", "billing", "dashboard_proposal_metrics_breakdown", "open_proposals", "won_proposals", "total_proposals"]):
+            if primary_metric not in payload and not any(k in payload for k in ["data", "rows", "summary", "count", "records", "results", "list", "items", "table", "billing", "dashboard_proposal_metrics_breakdown", "open_proposals", "won_proposals", "total_proposals", "ranking_data", "comparison_periods"]):
                 errors.append(f"Primary metric '{primary_metric}' missing from response payload.")
 
         # 6. Validate Financial Year Matching if explicitly requested

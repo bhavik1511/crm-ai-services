@@ -16,6 +16,8 @@ logger = logging.getLogger(__name__)
 # Config
 AI_DEBUG_MODE = os.getenv("AI_DEBUG_MODE", "False").lower() in ("true", "1", "yes")
 
+from agent.secure_log_sanitizer import sanitize_for_log
+
 class DiagnosticsTracker:
     def __init__(self, session_id: str):
         # 1. Generate Request Correlation ID (e.g., AI-20260710-ab34cd)
@@ -84,7 +86,7 @@ class DiagnosticsTracker:
 
     # --- Data Collectors ---
     def record_request_context(self, question: str, history_len: int, role: str):
-        self.replay["1_original_user_query"] = question
+        self.replay["1_original_user_query"] = sanitize_for_log(question)
 
     def record_planner_output(self, execution_plan: Dict[str, Any]):
         caps = execution_plan.get("business_capabilities", [])
@@ -96,7 +98,7 @@ class DiagnosticsTracker:
             "selected_business_capabilities": [c.get("id") for c in caps],
             "confidence": execution_plan.get("confidence_score", 1.0),
             "presentation_mode": execution_plan.get("presentation_mode", "REPORT"),
-            "extracted_filters": filters,
+            "extracted_filters": sanitize_for_log(filters),
             "missing_information": execution_plan.get("missing_information", [])
         }
 
@@ -112,8 +114,8 @@ class DiagnosticsTracker:
             "date_range": None
         }
         for ent in resolved_entities:
-            e_type = ent.get("entity_type", "").lower()
-            val = ent.get("entity_value") or ent.get("query")
+            e_type = str(ent.get("entity_type") or ent.get("type") or "").lower()
+            val = ent.get("resolved_name") or ent.get("name") or ent.get("canonical_name") or ent.get("entity_name") or ent.get("value") or ent.get("entity_value") or ent.get("query")
             if "project" in e_type: entity_summary["project"] = val
             elif "customer" in e_type: entity_summary["customer"] = val
             elif "employee" in e_type or "emp" in e_type: entity_summary["employee"] = val
@@ -122,7 +124,7 @@ class DiagnosticsTracker:
             elif "year" in e_type or "fy" in e_type: entity_summary["financial_year"] = val
             elif "month" in e_type: entity_summary["month"] = val
             elif "date" in e_type or "range" in e_type: entity_summary["date_range"] = val
-        self.replay["3_entity_resolver_output"] = entity_summary
+        self.replay["3_entity_resolver_output"] = sanitize_for_log(entity_summary)
 
     def record_validation(self, is_valid: bool, errors: List[str]):
         self.replay["execution_validation"] = {
@@ -137,8 +139,8 @@ class DiagnosticsTracker:
             selections.append({
                 "capability_id": node.get("capability_id"),
                 "backend_endpoint_selected": impl.get("endpoint") or impl.get("function_call") or node.get("endpoint"),
-                "query_parameters": node.get("query_parameters") or node.get("context") or {},
-                "request_body": node.get("request_body") or {}
+                "query_parameters": sanitize_for_log(node.get("query_parameters") or node.get("context") or {}),
+                "request_body": sanitize_for_log(node.get("request_body") or {})
             })
         self.replay["4_tool_registry_output"] = selections
 
@@ -146,29 +148,43 @@ class DiagnosticsTracker:
         safe_results = []
         synthesizer_inputs = []
         for res in tool_results:
+            raw_res = res.get("result")
+            sanitized_res = sanitize_for_log(raw_res)
+
+            fields_list = []
+            if isinstance(raw_res, dict):
+                fields_list = list(raw_res.keys())
+            elif isinstance(raw_res, list) and len(raw_res) > 0 and isinstance(raw_res[0], dict):
+                fields_list = list(raw_res[0].keys())
+
+            records_count = len(raw_res) if isinstance(raw_res, (list, dict)) else 1
+
             safe_results.append({
                 "http_status": res.get("http_status", 200),
-                "records_returned": len(res.get("result", [])) if isinstance(res.get("result"), list) else (len(res.get("result", {})) if isinstance(res.get("result"), dict) else 1),
-                "payload_summary": str(res.get("result"))[:300]
+                "records_returned": records_count,
+                "fields": fields_list,
+                "source": "NODEJS_CRM_API",
+                "payload_summary": str(sanitized_res)[:300]
             })
             synthesizer_inputs.append({
                 "capability": res.get("capability"),
-                "data": res.get("result")
+                "data": sanitized_res
             })
         self.replay["5_backend_response"] = safe_results
         self.replay["6_synthesizer_input"] = synthesizer_inputs
 
     def record_synthesis(self, final_response: Dict[str, Any]):
+        sanitized_resp = sanitize_for_log(final_response)
         self.replay["7_final_response"] = {
-            "type": final_response.get("type"),
-            "content_preview": str(final_response.get("content", ""))[:300],
-            "has_chart": bool(final_response.get("chart_data")),
-            "is_clarification": final_response.get("is_clarification", False)
+            "type": sanitized_resp.get("type"),
+            "content_preview": str(sanitized_resp.get("content", ""))[:300],
+            "has_chart": bool(sanitized_resp.get("chart_data")),
+            "is_clarification": sanitized_resp.get("is_clarification", False)
         }
 
     # --- Replay Generation ---
     def dump_trace(self):
-        """Prints the full 7-Stage Execution Replay JSON."""
+        """Prints the full 7-Stage Execution Replay JSON if AI_DEBUG_MODE is enabled."""
         self.timings["total_ms"] = round((time.time() - self.start_time) * 1000, 2)
         
         trace = {
@@ -177,8 +193,11 @@ class DiagnosticsTracker:
             "CONVERSATION_REPLAY": self.replay
         }
         
-        print("\n" + "="*80)
-        print(f"[DEBUG TRACE] AI Execution Pipeline | ID: {self.request_id}")
-        print("="*80)
-        print(json.dumps(trace, indent=2, default=str))
-        print("="*80 + "\n")
+        sanitized_trace = sanitize_for_log(trace)
+
+        if os.getenv("AI_DEBUG_MODE", "").lower() in ("true", "1", "yes"):
+            print("\n" + "="*80)
+            print(f"[DEBUG TRACE] AI Execution Pipeline | ID: {self.request_id}")
+            print("="*80)
+            print(json.dumps(sanitized_trace, indent=2, default=str))
+            print("="*80 + "\n")

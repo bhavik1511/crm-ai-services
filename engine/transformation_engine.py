@@ -87,14 +87,17 @@ class ResultTransformationEngine:
         keys_lower = {k.lower(): k for k in keys}
 
         if requested_metric:
-            m = requested_metric.lower()
+            m = requested_metric.lower().replace(" ", "_")
             patterns = {
                 "actual_cost": ["actual_cost", "actual_costs", "cost", "costs", "expense"],
                 "budget": ["budget", "total_budget", "proposed_fee", "approved_fee"],
                 "recoverability": ["recoverability", "realization", "recoverability_rate", "rate", "percentage"],
                 "proposals": ["count", "total_proposals", "open_proposals", "won_proposals"],
                 "revenue": ["total_net_amount", "net_amount", "amount", "revenue", "billing", "billed_amount", "total_fee", "fee"],
-                "count": ["count", "quantity", "total_count", "total_projects"]
+                "count": ["count", "quantity", "total_count", "total_projects"],
+                "actual_gp": ["performing", "actual_gp", "gp_actual", "gp", "performing_gp", "actual"],
+                "target_gp": ["target", "target_gp", "gp_target"],
+                "gp_percent": ["trend", "gp_percent", "gp_pct", "variance"]
             }
 
             matched_patterns = patterns.get(m, [m])
@@ -103,7 +106,7 @@ class ResultTransformationEngine:
                     return keys_lower[pat]
 
             for k in keys:
-                if m in k.lower():
+                if m in k.lower() or k.lower() in m:
                     return k
 
         # Fallback: return first numeric key that is not an ID
@@ -155,24 +158,30 @@ class ResultTransformationEngine:
             return payload_envelope
 
         # Group By & Aggregate
-        groups: Dict[str, List[float]] = {}
+        groups: Dict[str, Dict[str, Any]] = {}
         for row in rows:
             dim_val = str(row.get(dim_key, "Unknown")) if dim_key else "Total"
             
-            if query_op.aggregation == "COUNT":
+            if query_op.aggregation == "COUNT" and query_op.metric == "count":
                 metric_val = 1.0
             elif metric_key:
                 metric_val = _parse_numeric(row.get(metric_key))
             else:
-                metric_val = 1.0
+                num_v = None
+                for k, v in row.items():
+                    if isinstance(v, (int, float)) and not k.lower().endswith("id") and not k.startswith("_"):
+                        num_v = float(v)
+                        break
+                metric_val = num_v if num_v is not None else 1.0
 
             if dim_val not in groups:
-                groups[dim_val] = []
-            groups[dim_val].append(metric_val)
+                groups[dim_val] = {"vals": [], "row": row}
+            groups[dim_val]["vals"].append(metric_val)
 
         # Aggregate values per group
         aggregated_groups: List[Dict[str, Any]] = []
-        for dim_val, vals in groups.items():
+        for dim_val, group_data in groups.items():
+            vals = group_data["vals"]
             if query_op.aggregation == "SUM":
                 agg_val = sum(vals)
             elif query_op.aggregation == "COUNT":
@@ -188,7 +197,8 @@ class ResultTransformationEngine:
 
             aggregated_groups.append({
                 "dimension": dim_val,
-                "metric_val": agg_val
+                "metric_val": agg_val,
+                "row": group_data["row"]
             })
 
         # Sort
@@ -205,10 +215,10 @@ class ResultTransformationEngine:
         # Build clean transformed payload table
         transformed_records = []
         for item in aggregated_groups:
-            transformed_records.append({
-                dim_title: item["dimension"],
-                metric_title: item["metric_val"]
-            })
+            rec = dict(item.get("row") or {})
+            rec[dim_title] = item["dimension"]
+            rec[metric_title] = item["metric_val"]
+            transformed_records.append(rec)
 
         transformed_payload = {
             "operation": query_op.operation,
@@ -218,6 +228,12 @@ class ResultTransformationEngine:
             "total_records": len(transformed_records),
             "records": transformed_records
         }
+
+        # Preserve root contract keys (e.g. summary_cards, summary, date_range) if present on original payload
+        if isinstance(payload, dict):
+            for k, v in payload.items():
+                if k not in transformed_payload:
+                    transformed_payload[k] = v
 
         new_envelope = dict(payload_envelope)
         new_envelope["payload"] = transformed_payload

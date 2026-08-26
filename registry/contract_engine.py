@@ -76,39 +76,24 @@ class ContractEngine:
             
         return modes or ["INSIGHT"]
 
-EXPORT_KEYWORDS = (
-    "export", "download", "to excel", "as excel", "excel", "xlsx", "csv", "download report"
-)
-
-GENERATE_KEYWORDS = (
-    "generate", "create", "build", "run report", "produce", "generate report"
-)
-
-VIEW_KEYWORDS = (
-    "show", "get", "view", "display", "give me", "fetch", "list", "what is", "tell me"
-)
-
-def resolve_presentation_intent(question: str, metadata: Optional[Dict[str, Any]] = None) -> str:
+def resolve_presentation_intent(canonical_intent: Optional[Dict[str, Any]] = None, capability_id: str = "") -> str:
     """
-    Metadata-driven intent classification.
-    Determines whether user's presentation intent is 'EXPORT', 'GENERATE', or 'VIEW'.
-    Defaults to 'VIEW' when ambiguous.
+    Metadata-driven presentation intent resolution.
+    Reads presentation_action directly from structured CanonicalIntent / ExecutionContract metadata.
+    Defaults to capability metadata default or 'VIEW' (Zero raw text keyword parsing).
     """
-    if not question or not isinstance(question, str):
-        return "VIEW"
+    if canonical_intent and isinstance(canonical_intent, dict):
+        action = canonical_intent.get("presentation_action") or canonical_intent.get("presentation_intent") or canonical_intent.get("action")
+        if action and str(action).upper() in ("VIEW", "EXPORT", "GENERATE", "REPORT"):
+            return str(action).upper()
 
-    import re
-    q_clean = question.strip().lower()
+    if capability_id:
+        engine = get_contract_engine()
+        contract = engine.get_contract(capability_id) or {}
+        default_pres = contract.get("default_presentation")
+        if default_pres:
+            return str(default_pres).upper()
 
-    # Rule 2: Explicit EXPORT intent check
-    if any(re.search(r'\b' + re.escape(kw) + r'\b', q_clean) for kw in EXPORT_KEYWORDS):
-        return "EXPORT"
-
-    # Rule 1: Explicit GENERATE / CREATE intent check
-    if any(re.search(r'\b' + re.escape(kw) + r'\b', q_clean) for kw in GENERATE_KEYWORDS):
-        return "GENERATE"
-
-    # Rule 3 & 4: Explicit VIEW or Ambiguous (Default to VIEW)
     return "VIEW"
 
 
@@ -116,11 +101,12 @@ def build_presentation_actions(
     capability_id: str,
     presentation_intent: str,
     query_params: Optional[Dict[str, Any]] = None,
-    export_payload: Optional[Dict[str, Any]] = None
+    export_payload: Optional[Dict[str, Any]] = None,
+    export_available: bool = False
 ) -> List[Dict[str, Any]]:
     """
-    Generates presentation action DTOs based on response_contract metadata and resolved intent.
-    Completely generic and capability-agnostic.
+    Generates presentation action DTOs based on response_contract metadata, resolved intent,
+    and single-authority PresentationPolicy export decision.
     """
     engine = get_contract_engine()
     contract = engine.get_contract(capability_id) or {}
@@ -130,7 +116,7 @@ def build_presentation_actions(
     actions = []
 
     if presentation_intent == "EXPORT":
-        if supports_export:
+        if supports_export or export_available:
             actions.append({
                 "label": "Download Excel Report",
                 "type": "EXPORT",
@@ -148,7 +134,7 @@ def build_presentation_actions(
         })
 
     elif presentation_intent == "GENERATE":
-        if supports_export:
+        if supports_export or export_available:
             actions.append({
                 "label": "Export to Excel",
                 "type": "EXPORT",
@@ -174,7 +160,7 @@ def build_presentation_actions(
                 "action": "generate",
                 "capability_id": capability_id
             })
-        if supports_export:
+        if export_available and supports_export:
             actions.append({
                 "label": "Export to Excel",
                 "type": "EXPORT",
@@ -187,24 +173,39 @@ def build_presentation_actions(
     return actions
 
 
-def wrap_presentation_intent(res_dict: Dict[str, Any], question: str, capability_id: str = "report") -> Dict[str, Any]:
+def wrap_presentation_intent(res_dict: Dict[str, Any], canonical_intent: Optional[Dict[str, Any]] = None, capability_id: str = "report") -> Dict[str, Any]:
     """
     Wraps response payload with metadata-driven presentation_intent, actions array,
-    and conditional export payload enforcement.
+    and structured export metadata evaluated by PresentationPolicy.
     """
     if not isinstance(res_dict, dict):
         return res_dict
 
-    p_intent = resolve_presentation_intent(question)
+    from engine.presentation_policy import PresentationPolicy
+
+    can_dict = canonical_intent if isinstance(canonical_intent, dict) else None
+    p_intent = resolve_presentation_intent(can_dict, capability_id=capability_id)
+    
+    export_policy = PresentationPolicy.evaluate_export_policy(p_intent, payload=res_dict)
+    export_avail = export_policy.get("export_available", False)
+    
     export_payload = res_dict.get("export_data")
-    actions = build_presentation_actions(capability_id, p_intent, export_payload=export_payload)
+    actions = build_presentation_actions(
+        capability_id,
+        p_intent,
+        export_payload=export_payload,
+        export_available=export_avail
+    )
 
-    # RULES:
-    # 1. GENERATE / EXPORT: Show report result & automatically provide/attach Export action.
-    # 2. VIEW / Ambiguous: Show result normally. Do NOT automatically attach primary export_data.
-    final_export = export_payload if p_intent in ("GENERATE", "EXPORT") else None
+    final_export = export_payload if export_avail else None
 
+    res_dict["presentation_action"] = export_policy["presentation_action"]
     res_dict["presentation_intent"] = p_intent
+    res_dict["presentation_type"] = "single_entity_kpi" if export_policy.get("row_count") == 1 else "table"
+    res_dict["export_available"] = export_avail
+    res_dict["export_format"] = export_policy["export_format"]
+    res_dict["row_count"] = export_policy["row_count"]
+    res_dict["column_count"] = export_policy["column_count"]
     res_dict["actions"] = actions
     res_dict["export_data"] = final_export
     return res_dict

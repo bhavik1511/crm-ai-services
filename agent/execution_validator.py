@@ -130,6 +130,9 @@ def validate_execution(execution_plan: Dict[str, Any]) -> Tuple[bool, List[str]]
             p_info = param_meta.get(mp, {})
             if isinstance(p_info, dict) and p_info.get("smart_default") is not None:
                 continue
+            if mp in ("temporal_scope", "date_range"):
+                # Standard smart default (current_fy) applies automatically via TemporalResolver
+                continue
             if _is_parameter_provided(mp, ctx, resolved_entities, time_filter, user_ctx):
                 continue
             cleaned_missing.add(mp)
