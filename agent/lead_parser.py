@@ -415,12 +415,28 @@ Return ONLY a valid JSON object with these EXACT keys:
         confidence_score_val = 0
     confidence_level_val = str(parsed.get("confidence_level", "high")).lower()
 
-    # 6. Save Telemetry — unified DB sink ai_email_parsing
-    from db.database import save_ai_email_parsing_async
+    # 6. Save Telemetry & ML dataset — unified DB sinks
+    ctx_obj = context or {}
+    ref_id = (
+        ctx_obj.get("reference_id") or 
+        ctx_obj.get("message_id") or 
+        ctx_obj.get("messageId") or
+        ctx_obj.get("source_email_id") or
+        ctx_obj.get("email_id") or
+        ctx_obj.get("id") or
+        parsed_email.get("message_id") or
+        parsed_email.get("source_email_id") or
+        parsed_email.get("reference_id")
+    )
+    ref_str = None
+    if ref_id and str(ref_id).strip() and str(ref_id).strip().lower() not in ("none", "null", "undefined"):
+        ref_str = str(ref_id).strip()[:255]
+
+    from db.database import save_ai_email_parsing_async, save_email_ml_dataset_async
     asyncio.create_task(save_ai_email_parsing_async(
         employee_id=employee_id if employee_id != 0 else None,
         document_type="email_lead",
-        reference_id=subject[:50],
+        reference_id=ref_str,
         input_tokens=in_tok,
         output_tokens=out_tok,
         total_tokens=tot_tok,
@@ -430,8 +446,24 @@ Return ONLY a valid JSON object with these EXACT keys:
         file_extension=None,
         confidence_score=int(confidence_score_val),
         confidence_level=confidence_level_val,
-        processing_status="Success",
+        processing_status="PENDING",
         processing_time_ms=execution_time_ms
+    ))
+
+    asyncio.create_task(save_email_ml_dataset_async(
+        reference_id=ref_str,
+        sender_email=sender_email,
+        to_emails=outer_to,
+        subject=subject,
+        body_clean=clean_text,
+        thread_count=1,
+        is_forwarded=is_forwarded,
+        forwarded_by_email=outer_from if is_forwarded else None,
+        predicted_intent="Service Lead",
+        extracted_keywords=[],
+        extracted_entities=parsed,
+        confidence_score=int(confidence_score_val),
+        employee_id=employee_id if employee_id != 0 else None
     ))
 
     extracted_dict = extracted_obj.model_dump()

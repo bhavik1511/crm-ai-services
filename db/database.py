@@ -4,14 +4,20 @@ from dotenv import load_dotenv
 from urllib.parse import quote_plus
 from typing import Optional, Any, Union
 import os
+import time
+import asyncio
+import logging
+import json
 
 load_dotenv(override=True)
-import time
+
 unique_id = int(time.time())
 print(f"[DEBUG ENV] Server unique ID: {unique_id}")
 print(f"[DEBUG ENV] Loaded .env from: {os.path.abspath('.env')}")
 print(f"[DEBUG ENV] OPENROUTER_PRIMARY_MODEL: {os.getenv('OPENROUTER_PRIMARY_MODEL')}")
 print(f"[DEBUG ENV] LLM_PROVIDER: {os.getenv('LLM_PROVIDER')}")
+
+logger = logging.getLogger(__name__)
 
 _engine = None
 
@@ -50,10 +56,10 @@ def get_db_engine() -> Engine:
         )
         cursor.close()
 
-    # Automatically initialize the AI telemetry tables (ai_chatbot_usage & ai_email_parsing)
+    # Automatically initialize the AI telemetry tables
     with _engine.begin() as conn:
 
-        # Automatically initialize the standardized chatbot telemetry table
+        # 1. Chatbot Telemetry Table
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS ai_chatbot_usage (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -65,15 +71,24 @@ def get_db_engine() -> Engine:
                 total_tokens INT DEFAULT 0,
                 total_cost_usd DECIMAL(10, 6) DEFAULT 0.000000,
                 status VARCHAR(50) DEFAULT 'success',
-                execution_path VARCHAR(50) DEFAULT 'fast_path',
+                error_type VARCHAR(50) NULL,
+                error_message VARCHAR(512) NULL,
+                trace_id VARCHAR(255) NULL,
                 capability_id VARCHAR(100) DEFAULT 'general_query',
                 operation VARCHAR(100) DEFAULT 'chat_response',
+                execution_path VARCHAR(50) DEFAULT 'fast_path',
+                planner_tokens INT DEFAULT 0,
+                synthesizer_tokens INT DEFAULT 0,
+                clarification_required BOOLEAN DEFAULT FALSE,
+                clarification_reason VARCHAR(255) NULL,
                 backend_execution_ms INT DEFAULT 0,
+                total_execution_ms INT DEFAULT 0,
+                user_query TEXT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """))
 
-        # Automatically initialize the standardized email parsing telemetry table
+        # 2. Standardized Email Parsing Telemetry Table
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS ai_email_parsing (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -95,7 +110,7 @@ def get_db_engine() -> Engine:
             );
         """))
 
-        # Automatically initialize the unified ML dataset & human feedback table
+        # 3. Unified ML Dataset & Human Feedback Table
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS ai_email_ml_dataset (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -139,37 +154,51 @@ def get_db_engine() -> Engine:
             );
         """))
 
-        # Alter table migrations for existing installations
-        for col_stmt in [
-            "ALTER TABLE ai_chatbot_usage ADD COLUMN status VARCHAR(50) DEFAULT 'success';",
-            "ALTER TABLE ai_chatbot_usage ADD COLUMN execution_path VARCHAR(50) DEFAULT 'fast_path';",
-            "ALTER TABLE ai_chatbot_usage ADD COLUMN capability_id VARCHAR(100) DEFAULT 'general_query';",
-            "ALTER TABLE ai_chatbot_usage ADD COLUMN operation VARCHAR(100) DEFAULT 'chat_response';",
-            "ALTER TABLE ai_chatbot_usage ADD COLUMN backend_execution_ms INT DEFAULT 0;",
-            "ALTER TABLE ai_email_ml_dataset ADD COLUMN review_count INT DEFAULT 1;",
-            "ALTER TABLE ai_email_ml_dataset ADD COLUMN discard_count INT DEFAULT 0;"
+    # Safe column migration loop (adds missing columns to existing MySQL tables)
+    _col_migrations = [
+        ("ai_chatbot_usage", "status", "ALTER TABLE ai_chatbot_usage ADD COLUMN status VARCHAR(50) NOT NULL DEFAULT 'success'"),
+        ("ai_chatbot_usage", "error_type", "ALTER TABLE ai_chatbot_usage ADD COLUMN error_type VARCHAR(50) NULL"),
+        ("ai_chatbot_usage", "error_message", "ALTER TABLE ai_chatbot_usage ADD COLUMN error_message VARCHAR(512) NULL"),
+        ("ai_chatbot_usage", "trace_id", "ALTER TABLE ai_chatbot_usage ADD COLUMN trace_id VARCHAR(255) NULL"),
+        ("ai_chatbot_usage", "capability_id", "ALTER TABLE ai_chatbot_usage ADD COLUMN capability_id VARCHAR(100) DEFAULT 'general_query'"),
+        ("ai_chatbot_usage", "operation", "ALTER TABLE ai_chatbot_usage ADD COLUMN operation VARCHAR(100) DEFAULT 'chat_response'"),
+        ("ai_chatbot_usage", "execution_path", "ALTER TABLE ai_chatbot_usage ADD COLUMN execution_path VARCHAR(50) DEFAULT 'fast_path'"),
+        ("ai_chatbot_usage", "planner_tokens", "ALTER TABLE ai_chatbot_usage ADD COLUMN planner_tokens INT DEFAULT 0"),
+        ("ai_chatbot_usage", "synthesizer_tokens", "ALTER TABLE ai_chatbot_usage ADD COLUMN synthesizer_tokens INT DEFAULT 0"),
+        ("ai_chatbot_usage", "clarification_required", "ALTER TABLE ai_chatbot_usage ADD COLUMN clarification_required BOOLEAN DEFAULT FALSE"),
+        ("ai_chatbot_usage", "clarification_reason", "ALTER TABLE ai_chatbot_usage ADD COLUMN clarification_reason VARCHAR(255) NULL"),
+        ("ai_chatbot_usage", "backend_execution_ms", "ALTER TABLE ai_chatbot_usage ADD COLUMN backend_execution_ms INT DEFAULT 0"),
+        ("ai_chatbot_usage", "total_execution_ms", "ALTER TABLE ai_chatbot_usage ADD COLUMN total_execution_ms INT DEFAULT 0"),
+        ("ai_chatbot_usage", "user_query", "ALTER TABLE ai_chatbot_usage ADD COLUMN user_query TEXT NULL"),
+        ("ai_email_ml_dataset", "review_count", "ALTER TABLE ai_email_ml_dataset ADD COLUMN review_count INT DEFAULT 1"),
+        ("ai_email_ml_dataset", "discard_count", "ALTER TABLE ai_email_ml_dataset ADD COLUMN discard_count INT DEFAULT 0"),
+    ]
+
+    for tbl_name, col_name, col_sql in _col_migrations:
+        with _engine.begin() as _conn:
+            exists = _conn.execute(text(
+                "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                f"WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{tbl_name}' AND COLUMN_NAME = '{col_name}'"
+            )).scalar()
+            if not exists:
+                try:
+                    _conn.execute(text(col_sql))
+                except Exception as _e:
+                    logger.warning(f"[DB Migration] Could not add column {col_name} to {tbl_name}: {_e}")
+
+    # Drop legacy bloated JSON columns if present
+    with _engine.begin() as _conn:
+        for drop_stmt in [
+            "ALTER TABLE ai_email_ml_dataset DROP COLUMN llm_predictions",
+            "ALTER TABLE ai_email_ml_dataset DROP COLUMN human_approved_values"
         ]:
             try:
-                conn.execute(text(col_stmt))
+                _conn.execute(text(drop_stmt))
             except Exception:
                 pass
 
-        # Drop legacy bloated unreadable JSON columns if they exist
-        try:
-            conn.execute(text("ALTER TABLE ai_email_ml_dataset DROP COLUMN llm_predictions;"))
-        except Exception:
-            pass
-        try:
-            conn.execute(text("ALTER TABLE ai_email_ml_dataset DROP COLUMN human_approved_values;"))
-        except Exception:
-            pass
-
     return _engine
 
-
-import asyncio
-import logging
-logger = logging.getLogger(__name__)
 
 async def save_token_usage_async(
     employee_id: int, 
@@ -179,19 +208,28 @@ async def save_token_usage_async(
     output_tokens: int, 
     total_tokens: int, 
     total_cost_usd: float,
-    execution_path: str = "fast_path",
+    status: str = "success",
+    error_type: str = None,
+    error_message: str = None,
+    trace_id: str = None,
     capability_id: str = "general_query",
     operation: str = "chat_response",
-    status: str = "success",
-    backend_execution_ms: int = 0
+    execution_path: str = "fast_path",
+    planner_tokens: int = 0,
+    synthesizer_tokens: int = 0,
+    clarification_required: bool = False,
+    clarification_reason: str = None,
+    backend_execution_ms: int = 0,
+    total_execution_ms: int = 0,
+    user_query: str = None
 ):
     """
-    Asynchronously saves the token usage record for chatbot to MySQL (ai_chatbot_usage).
+    Asynchronously saves the telemetry record for chatbot queries to MySQL (ai_chatbot_usage).
     """
     def _insert_sync():
         try:
             engine = get_db_engine()
-            safe_emp_id = 1
+            safe_emp_id = 0
             if employee_id is not None:
                 try:
                     s_emp = str(employee_id).strip()
@@ -199,14 +237,21 @@ async def save_token_usage_async(
                         s_emp = s_emp.split(":")[-1]
                     safe_emp_id = int(s_emp)
                 except Exception:
-                    safe_emp_id = 1
+                    safe_emp_id = 0
 
             with engine.begin() as conn:
                 conn.execute(
                     text("""
                         INSERT INTO ai_chatbot_usage 
-                        (employee_id, session_id, model_name, input_tokens, output_tokens, total_tokens, total_cost_usd, status, execution_path, capability_id, operation, backend_execution_ms)
-                        VALUES (:emp_id, :sess_id, :model, :in_tok, :out_tok, :tot_tok, :cost, :status, :exec_path, :cap_id, :oper, :exec_ms)
+                        (employee_id, session_id, model_name, input_tokens, output_tokens, total_tokens, 
+                         total_cost_usd, status, error_type, error_message, trace_id, capability_id, 
+                         operation, execution_path, planner_tokens, synthesizer_tokens, clarification_required, 
+                         clarification_reason, backend_execution_ms, total_execution_ms, user_query)
+                        VALUES 
+                        (:emp_id, :sess_id, :model, :in_tok, :out_tok, :tot_tok, 
+                         :cost, :status, :error_type, :error_message, :trace_id, :cap_id, 
+                         :op, :exec_path, :p_tok, :s_tok, :clar_req, 
+                         :clar_reason, :b_ms, :t_ms, :u_query)
                     """),
                     {
                         "emp_id": safe_emp_id,
@@ -217,10 +262,19 @@ async def save_token_usage_async(
                         "tot_tok": int(total_tokens or 0),
                         "cost": float(total_cost_usd or 0.0),
                         "status": str(status or "success")[:50],
-                        "exec_path": str(execution_path or "fast_path")[:100],
+                        "error_type": error_type,
+                        "error_message": (error_message or "")[:512] if error_message else None,
+                        "trace_id": trace_id,
                         "cap_id": str(capability_id or "general_query")[:100],
-                        "oper": str(operation or "chat_response")[:50],
-                        "exec_ms": int(backend_execution_ms or 0)
+                        "op": str(operation or "chat_response")[:100],
+                        "exec_path": str(execution_path or "fast_path")[:50],
+                        "p_tok": int(planner_tokens or 0),
+                        "s_tok": int(synthesizer_tokens or 0),
+                        "clar_req": bool(clarification_required),
+                        "clar_reason": clarification_reason,
+                        "b_ms": int(backend_execution_ms or 0),
+                        "t_ms": int(total_execution_ms or 0),
+                        "u_query": user_query
                     }
                 )
             logger.info(f"[TokenTracker] Successfully saved usage record to ai_chatbot_usage table: emp_id={safe_emp_id}, session={session_id}, path={execution_path}")
@@ -228,6 +282,19 @@ async def save_token_usage_async(
             logger.error(f"[TokenTracker] Failed to save chatbot token usage: {e}")
 
     await asyncio.to_thread(_insert_sync)
+
+
+def _clean_outlook_reference_id(ref_id: Optional[str]) -> Optional[str]:
+    """
+    Sanitizes reference_id to ensure a clean, non-empty string up to 255 chars is stored.
+    """
+    if not ref_id or not str(ref_id).strip():
+        return None
+    ref_str = str(ref_id).strip()
+    if ref_str.lower() in ("none", "null", "undefined"):
+        return None
+    return ref_str[:255]
+
 
 async def save_parsing_token_usage_async(
     employee_id: int, 
@@ -253,14 +320,16 @@ async def save_parsing_token_usage_async(
             "qwen/qwen3.6-27b"
         )
 
+    clean_ref = _clean_outlook_reference_id(reference_id)
+
     def _insert_sync():
         try:
             engine = get_db_engine()
             with engine.begin() as conn:
-                if reference_id and str(reference_id).strip():
+                if clean_ref:
                     existing = conn.execute(
                         text("SELECT id FROM ai_email_parsing WHERE reference_id = :ref LIMIT 1"),
-                        {"ref": str(reference_id).strip()}
+                        {"ref": clean_ref}
                     ).fetchone()
                     if existing:
                         conn.execute(
@@ -296,7 +365,7 @@ async def save_parsing_token_usage_async(
                     {
                         "emp_id": employee_id,
                         "doc_type": document_type,
-                        "ref_id": reference_id,
+                        "ref_id": clean_ref,
                         "model": model_name,
                         "in_tok": input_tokens,
                         "out_tok": output_tokens,
@@ -310,6 +379,7 @@ async def save_parsing_token_usage_async(
             logger.error(f"[TokenTracker] Failed to save parsing token usage: {e}")
 
     await asyncio.to_thread(_insert_sync)
+
 
 def save_parsing_token_usage(
     employee_id: int, 
@@ -335,13 +405,14 @@ def save_parsing_token_usage(
             "qwen/qwen3.6-27b"
         )
         
+    clean_ref = _clean_outlook_reference_id(reference_id)
     try:
         engine = get_db_engine()
         with engine.begin() as conn:
-            if reference_id and str(reference_id).strip():
+            if clean_ref:
                 existing = conn.execute(
                     text("SELECT id FROM ai_email_parsing WHERE reference_id = :ref LIMIT 1"),
-                    {"ref": str(reference_id).strip()}
+                    {"ref": clean_ref}
                 ).fetchone()
                 if existing:
                     conn.execute(
@@ -377,7 +448,7 @@ def save_parsing_token_usage(
                 {
                     "emp_id": employee_id,
                     "doc_type": document_type,
-                    "ref_id": reference_id,
+                    "ref_id": clean_ref,
                     "model": model_name,
                     "in_tok": input_tokens,
                     "out_tok": output_tokens,
@@ -419,14 +490,16 @@ async def save_ai_email_parsing_async(
             "qwen/qwen3.6-27b"
         )
 
+    clean_ref = _clean_outlook_reference_id(reference_id)
+
     def _insert_sync():
         try:
             engine = get_db_engine()
             with engine.begin() as conn:
-                if reference_id and str(reference_id).strip():
+                if clean_ref:
                     existing = conn.execute(
                         text("SELECT id FROM ai_email_parsing WHERE reference_id = :ref LIMIT 1"),
-                        {"ref": str(reference_id).strip()}
+                        {"ref": clean_ref}
                     ).fetchone()
                     if existing:
                         conn.execute(
@@ -468,7 +541,7 @@ async def save_ai_email_parsing_async(
                     {
                         "emp_id": employee_id,
                         "doc_type": document_type,
-                        "ref_id": reference_id,
+                        "ref_id": clean_ref,
                         "model": model_name,
                         "in_tok": input_tokens,
                         "out_tok": output_tokens,
@@ -488,13 +561,13 @@ async def save_ai_email_parsing_async(
     await asyncio.to_thread(_insert_sync)
 
 
-def calculate_llm_cost(model_name: str, input_tokens: int, output_tokens: int) -> float:
+def calculate_llm_cost(model_name: str = None, input_tokens: int = 0, output_tokens: int = 0) -> float:
     """
     Calculates the USD cost of an LLM call based on model pricing per 1M tokens.
     Guarantees non-zero estimation for active models.
     """
     if not model_name:
-        model_name = "qwen/qwen3.6-27b"
+        model_name = os.getenv("LLM_MODEL") or os.getenv("PRIMARY_MODEL") or "openai/gpt-oss-20b"
     
     model_key = str(model_name).lower().strip()
     
@@ -502,16 +575,7 @@ def calculate_llm_cost(model_name: str, input_tokens: int, output_tokens: int) -
         # Groq & OpenRouter Models
         "qwen/qwen3.6-27b": {"in": 0.27, "out": 0.40},
         "openai/gpt-oss-20b": {"in": 0.10, "out": 0.15},
-        "llama-3.3-70b-versatile": {"in": 0.59, "out": 0.79},
-        "llama-3.3-70b": {"in": 0.59, "out": 0.79},
-        "llama-3.1-8b-instant": {"in": 0.05, "out": 0.08},
-        "llama-3.1-8b": {"in": 0.05, "out": 0.08},
-        "llama-3.2-90b": {"in": 0.90, "out": 0.90},
-        "llama3-70b-8192": {"in": 0.59, "out": 0.79},
-        "llama3-8b-8192": {"in": 0.05, "out": 0.08},
-        "mixtral-8x7b-32768": {"in": 0.24, "out": 0.24},
-        "gemma2-9b-it": {"in": 0.20, "out": 0.20},
-        
+        "openai/gpt-oss-120b": {"in": 0.50, "out": 0.75},
         # OpenAI Models
         "gpt-4o": {"in": 2.50, "out": 10.00},
         "gpt-4o-mini": {"in": 0.15, "out": 0.60},
@@ -542,9 +606,6 @@ def calculate_llm_cost(model_name: str, input_tokens: int, output_tokens: int) -
     cost = (input_tokens / 1_000_000.0 * rates["in"]) + (output_tokens / 1_000_000.0 * rates["out"])
     return round(cost, 6)
 
-
-
-import json
 
 def check_duplicate_message_id(reference_id: str) -> Optional[dict]:
     """
@@ -619,17 +680,17 @@ async def save_email_ml_dataset_async(
     """
     keywords_str = json.dumps(extracted_keywords or [])
     entities_json = json.dumps(extracted_entities or {})
+    clean_ref = _clean_outlook_reference_id(reference_id)
 
     def _save_sync():
-        # 1. Insert/Update initial parse in MySQL DB table
         try:
             engine = get_db_engine()
             with engine.begin() as conn:
                 existing = None
-                if reference_id and str(reference_id).strip():
+                if clean_ref:
                     existing = conn.execute(
                         text("SELECT id FROM ai_email_ml_dataset WHERE reference_id = :ref AND (reviewed_by_user_id = :emp_id OR reviewed_by_user_id IS NULL) LIMIT 1"),
-                        {"ref": str(reference_id).strip(), "emp_id": employee_id}
+                        {"ref": clean_ref, "emp_id": employee_id}
                     ).fetchone()
                 
                 if not existing and subject and str(subject).strip():
@@ -657,7 +718,7 @@ async def save_email_ml_dataset_async(
                         """),
                         {
                             "row_id": existing[0],
-                            "ref_id": reference_id,
+                            "ref_id": clean_ref,
                             "sender": sender_email,
                             "to_e": to_emails,
                             "subj": subject,
@@ -678,7 +739,7 @@ async def save_email_ml_dataset_async(
                             VALUES (:ref_id, :sender, :to_e, :subj, :body, :t_cnt, :is_fwd, :fwd_by, :intent, :kw, :conf, :emp_id)
                         """),
                         {
-                            "ref_id": reference_id,
+                            "ref_id": clean_ref,
                             "sender": sender_email,
                             "to_e": to_emails,
                             "subj": subject,
@@ -695,7 +756,7 @@ async def save_email_ml_dataset_async(
         except Exception as e:
             logger.error(f"[MLDataset] Failed to insert DB ML dataset row: {e}")
 
-        # 2. Append to local JSONL dataset file for LLM fine-tuning
+        # Append to local JSONL dataset file for LLM fine-tuning
         try:
             log_dir = os.path.join(os.path.dirname(__file__), "..", "logs")
             os.makedirs(log_dir, exist_ok=True)
@@ -732,6 +793,7 @@ async def save_email_ml_dataset_async(
 async def update_email_ml_dataset_feedback_async(
     reference_id: str,
     action_status: str,
+    document_type: Optional[str] = None,
     is_task_required: bool = True,
     was_edited: bool = False,
     intent_edited: bool = False,
@@ -747,14 +809,12 @@ async def update_email_ml_dataset_feedback_async(
     include_in_training: bool = True
 ):
     """
-    Asynchronously updates the exact same record in ai_email_ml_dataset when a user acts in the UI modal
-    AND logs the supervised training pair to logs/email_ml_feedback_pairs.jsonl.
+    Asynchronously updates the exact same record in ai_email_ml_dataset and ai_email_parsing
+    when a user completes or discards an email action.
     """
     vals = human_approved_values or {}
-    approved_json = json.dumps(vals)
 
     def _update_sync():
-        # 1. Update existing row in MySQL DB table
         try:
             engine = get_db_engine()
             is_disc = 1 if action_status == 'DISCARDED' else 0
@@ -767,7 +827,6 @@ async def update_email_ml_dataset_feedback_async(
                         {"ref": ref_str}
                     ).fetchone()
                     if not existing and "_" in ref_str:
-                        # Try partial match on raw email ID or subject component
                         subj_part = ref_str.split("_")[-1]
                         if len(subj_part) > 3:
                             existing = conn.execute(
@@ -873,10 +932,50 @@ async def update_email_ml_dataset_feedback_async(
                             "is_disc": is_disc
                         }
                     )
+
+                if reference_id and str(reference_id).strip():
+                    ref_str = str(reference_id).strip()
+                    subj_part = ref_str.split("_")[-1] if "_" in ref_str else ref_str
+
+                    # Retrieve current document_type if present
+                    existing_dt = None
+                    try:
+                        row = conn.execute(
+                            text("SELECT document_type FROM ai_email_parsing WHERE reference_id = :ref OR (reference_id LIKE :pat AND reference_id IS NOT NULL) ORDER BY id DESC LIMIT 1"),
+                            {"ref": ref_str, "pat": f"%{subj_part}%"}
+                        ).fetchone()
+                        if row and row[0] and row[0] != 'email_parsing':
+                            existing_dt = row[0]
+                    except Exception:
+                        pass
+
+                    target_dt = document_type or existing_dt
+                    if action_status in ('APPROVED', 'ACCEPTED', 'CONVERTED', 'SUCCESS', 'CONVERTED_TO_GENERAL_QUERY'):
+                        if not target_dt or target_dt == 'email_parsing':
+                            target_dt = 'general_query' if action_status in ('CONVERTED', 'CONVERTED_TO_GENERAL_QUERY') else 'email_task'
+                        conn.execute(
+                            text("""
+                                UPDATE ai_email_parsing
+                                SET document_type = :doc_type, processing_status = 'CONVERTED'
+                                WHERE reference_id = :ref OR (reference_id LIKE :pat AND reference_id IS NOT NULL)
+                            """),
+                            {"doc_type": target_dt, "ref": ref_str, "pat": f"%{subj_part}%"}
+                        )
+                    elif action_status == 'DISCARDED':
+                        if not target_dt or target_dt == 'email_parsing':
+                            target_dt = 'email_task'
+                        conn.execute(
+                            text("""
+                                UPDATE ai_email_parsing
+                                SET document_type = :doc_type, processing_status = 'DISCARDED'
+                                WHERE reference_id = :ref OR (reference_id LIKE :pat AND reference_id IS NOT NULL)
+                            """),
+                            {"doc_type": target_dt, "ref": ref_str, "pat": f"%{subj_part}%"}
+                        )
         except Exception as e:
             logger.error(f"[MLDataset] Failed to update feedback in DB: {e}")
 
-        # 2. Append ground-truth feedback pair to local JSONL for ML fine-tuning
+        # Append ground-truth feedback pair to local JSONL for ML fine-tuning
         try:
             log_dir = os.path.join(os.path.dirname(__file__), "..", "logs")
             os.makedirs(log_dir, exist_ok=True)
@@ -905,6 +1004,3 @@ async def update_email_ml_dataset_feedback_async(
             logger.error(f"[MLDataset] Failed to write feedback JSONL file: {fe}")
 
     await asyncio.to_thread(_update_sync)
-
-
-

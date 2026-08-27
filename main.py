@@ -55,6 +55,14 @@ except Exception as e:
     print(f"[WARNING] Failed to load chat_routes: {e}")
     print("[INFO] API will work but JWT chat routes unavailable")
 
+try:
+    from api.reports_routes import router as reports_router
+    app.include_router(reports_router)
+    print("[INFO] Successfully registered AI Reports Router")
+except Exception as e:
+    print(f"[WARNING] Failed to load reports_routes: {e}")
+
+
 # ── Server-load marker for hot-reload debugging ──────────────────────────────
 try:
     _main_marker_path = os.path.join(os.path.dirname(__file__), "main_server_load_marker.txt")
@@ -2592,6 +2600,7 @@ class EmailTaskRequest(BaseModel):
     message_id: Optional[str] = None
     email_id: Optional[str] = None
     source_email_id: Optional[str] = None
+    context: Optional[Dict] = {}
 
 class EmailLeadRequest(BaseModel):
     subject: Optional[str] = ""
@@ -2632,18 +2641,22 @@ async def extract_email_task(request: EmailTaskRequest):
     try:
         from agent.email_parser import strip_html_to_text, parse_forwarded_email, classify_sender, extract_entities_with_llm
         
-        import urllib.parse
-        emp_id_str = str(request.employee_id or 0)
-        subj_clean = (request.subject or 'email').strip()
-        resolved_ref_id = (
+        ctx = dict(request.context or {})
+        raw_ref = (
             request.reference_id or 
-            request.email_url or 
-            request.web_link or 
-            request.webLink or 
             request.message_id or 
             request.email_id or 
-            f"email_{emp_id_str}_{urllib.parse.quote(subj_clean)}"
+            request.source_email_id or
+            getattr(request, 'internetMessageId', None) or
+            ctx.get("reference_id") or
+            ctx.get("message_id") or
+            ctx.get("messageId") or
+            ctx.get("source_email_id") or
+            ctx.get("email_id")
         )
+        resolved_ref_id = None
+        if raw_ref and str(raw_ref).strip() and str(raw_ref).strip().lower() not in ("none", "null", "undefined"):
+            resolved_ref_id = str(raw_ref).strip()[:255]
 
         # Resolve field alias fallbacks
         sender_val = request.outer_from or request.sender_email or request.from_email or ""
@@ -2797,19 +2810,32 @@ async def extract_email_task(request: EmailTaskRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Endpoint for AI Lead Extraction via agent/lead_parser.py
 @app.post("/api/extract-email-lead", dependencies=[Depends(verify_internal_api_key)])
 async def extract_email_lead(request: EmailLeadRequest):
     try:
         from agent.lead_parser import extract_lead_from_email
         
+        ctx = dict(request.context or {})
+        raw_ref = (
+            request.reference_id or 
+            request.message_id or 
+            request.email_id or 
+            request.source_email_id or
+            getattr(request, 'internetMessageId', None) or
+            ctx.get("reference_id") or
+            ctx.get("message_id") or
+            ctx.get("messageId")
+        )
+        if raw_ref:
+            ctx["reference_id"] = str(raw_ref).strip()
+
         json_result = await extract_lead_from_email(
             subject=request.subject,
             html_body=request.html_body,
             text_body=request.text_body,
             outer_from=request.outer_from,
             outer_to=request.outer_to,
-            context=request.context,
+            context=ctx,
             employee_id=request.employee_id
         )
 
@@ -2886,6 +2912,7 @@ class EmailDraftFeedbackRequest(BaseModel):
     reviewed_by_user_id: Optional[Union[int, str]] = None
     reviewed_by_user_name: Optional[str] = None
     reviewed_by_user_email: Optional[str] = None
+    document_type: Optional[str] = None
     include_in_training: Optional[bool] = True
 
 
@@ -2894,14 +2921,15 @@ class EmailDraftFeedbackRequest(BaseModel):
 @app.post("/email-drafts/feedback")
 async def email_draft_feedback(request: EmailDraftFeedbackRequest):
     """
-    Receives human feedback (approval, discard, edit diffs) from the frontend EmailTaskPopup modal
-    and asynchronously updates the unified ML dataset row in ai_email_ml_dataset.
+    Receives human feedback (approval, discard, edit diffs) from frontend actions
+    and asynchronously updates the telemetry row in ai_email_parsing and ai_email_ml_dataset.
     """
     try:
         from db.database import update_email_ml_dataset_feedback_async
         asyncio.create_task(update_email_ml_dataset_feedback_async(
             reference_id=request.reference_id,
             action_status=request.action_status,
+            document_type=request.document_type,
             is_task_required=request.is_task_required if request.is_task_required is not None else True,
             was_edited=request.was_edited or False,
             intent_edited=request.intent_edited or False,
