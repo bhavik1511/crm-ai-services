@@ -338,18 +338,13 @@ def get_gq_master_hierarchy(force_refresh: bool = False) -> List[Dict[str, Any]]
 
 def format_gq_hierarchy_for_prompt(hierarchy: List[Dict[str, Any]]) -> str:
     """
-    Formats the CRM General Query master hierarchy cleanly into a compact text block for the LLM prompt.
+    Formats ONLY the request type names and subject names for the LLM prompt.
+    Queries are omitted — the LLM is given a focused cheatsheet in RULE 15 directly.
+    This keeps the hierarchy contribution to <300 chars to avoid TPM overflows.
+    Full query validation happens in validate_gq_hierarchy() against the live DB.
     """
-    lines = []
-    for req in hierarchy:
-        lines.append(f"Request Type: '{req['name']}'")
-        for sub in req.get("subjects", []):
-            q_names = [f"'{q['name']}'" for q in sub.get("queries", [])]
-            if q_names:
-                lines.append(f"  - Subject: '{sub['name']}' -> Valid Queries: [{', '.join(q_names)}]")
-            else:
-                lines.append(f"  - Subject: '{sub['name']}' -> Valid Queries: []")
-    return "\n".join(lines)
+    req_names = [f"'{req['name']}'" for req in hierarchy]
+    return f"Valid Request Types: [{', '.join(req_names)}]"
 
 
 def validate_gq_hierarchy(
@@ -375,6 +370,25 @@ def validate_gq_hierarchy(
 
     req_clean = str(raw_req_name).strip().lower()
 
+    # Request Type synonym mapping for common aliases / intent outputs
+    REQ_SYNONYMS = {
+        "service lead": "Marketing & Business Development",
+        "service_lead": "Marketing & Business Development",
+        "business development": "Marketing & Business Development",
+        "bd": "Marketing & Business Development",
+        "proposal": "Marketing & Business Development",
+        "proposal request": "Marketing & Business Development",
+        "estimation": "Marketing & Business Development",
+        "marketing": "Marketing & Business Development",
+        "it": "IT Support",
+        "general it": "IT Support",
+        "crm issue": "CRM Issues",
+        "crm problem": "CRM Issues",
+    }
+
+    if req_clean in REQ_SYNONYMS:
+        req_clean = REQ_SYNONYMS[req_clean].lower()
+
     # 1. Match Request Type
     matched_req = None
     for req in hierarchy:
@@ -387,43 +401,100 @@ def validate_gq_hierarchy(
     if not matched_req:
         return None, None, None
 
-    if not raw_sub_name:
-        return matched_req, None, None
-
-    sub_clean = str(raw_sub_name).strip().lower()
-
     # 2. Match Subject ONLY under valid Subjects of matched_req
     valid_subjects = matched_req.get("subjects", [])
     matched_sub = None
-    for sub in valid_subjects:
-        if sub["name"].strip().lower() == sub_clean:
-            matched_sub = sub
-            break
-        elif sub_clean in sub["name"].strip().lower() or sub["name"].strip().lower() in sub_clean:
-            matched_sub = sub
+    
+    if raw_sub_name:
+        sub_clean = str(raw_sub_name).strip().lower()
+        for sub in valid_subjects:
+            s_name = sub["name"].strip().lower()
+            if s_name == sub_clean or sub_clean in s_name or s_name in sub_clean:
+                matched_sub = sub
+                break
 
     if not matched_sub:
-        # Invalid relationship: Subject does not belong to Request Type!
+        req_name_l = matched_req["name"].lower()
+        combined_context = f"{raw_sub_name or ''} {raw_query_name or ''}".lower()
+        
+        if "marketing" in req_name_l:
+            if any(k in combined_context for k in ["el", "engagement"]):
+                target_sub = "el request"
+            elif any(k in combined_context for k in ["press", "social", "campaign"]):
+                target_sub = "marketing"
+            else:
+                target_sub = "proposal request"
+            for s in valid_subjects:
+                if target_sub in s["name"].lower():
+                    matched_sub = s
+                    break
+
+        elif "it support" in req_name_l:
+            if any(k in combined_context for k in ["email", "bounce", "delivery", "550"]):
+                target_sub = "email related"
+            elif any(k in combined_context for k in ["hardware", "printer"]):
+                target_sub = "general it"
+            else:
+                target_sub = "crm"
+            for s in valid_subjects:
+                if target_sub in s["name"].lower():
+                    matched_sub = s
+                    break
+
+        elif "crm issues" in req_name_l:
+            target_sub = "customer master"
+            for s in valid_subjects:
+                if target_sub in s["name"].lower():
+                    matched_sub = s
+                    break
+
+    if not matched_sub:
         return matched_req, None, None
-
-    if not raw_query_name:
-        return matched_req, matched_sub, None
-
-    query_clean = str(raw_query_name).strip().lower()
 
     # 3. Match Query ONLY under valid Queries of matched_sub
     valid_queries = matched_sub.get("queries", [])
     matched_query = None
-    for q in valid_queries:
-        if q["name"].strip().lower() == query_clean:
-            matched_query = q
-            break
-        elif query_clean in q["name"].strip().lower() or q["name"].strip().lower() in query_clean:
-            matched_query = q
+
+    if raw_query_name:
+        query_clean = str(raw_query_name).strip().lower()
+        for q in valid_queries:
+            q_name = q["name"].strip().lower()
+            if q_name == query_clean or query_clean in q_name or q_name in query_clean:
+                matched_query = q
+                break
 
     if not matched_query:
-        # Invalid relationship: Query does not belong to Subject!
-        return matched_req, matched_sub, None
+        sub_name_l = matched_sub["name"].lower()
+        combined_q_context = f"{raw_sub_name or ''} {raw_query_name or ''}".lower()
+
+        if "proposal" in sub_name_l:
+            for q in valid_queries:
+                if "new proposal" in q["name"].lower():
+                    matched_query = q
+                    break
+
+        elif "email" in sub_name_l:
+            if any(k in combined_q_context for k in ["bounce", "550", "delivery", "bouncing", "error", "fix", "resolve"]):
+                for q in valid_queries:
+                    if "bounce" in q["name"].lower():
+                        matched_query = q
+                        break
+
+        elif "crm" in sub_name_l:
+            if any(k in combined_q_context for k in ["login", "password", "access", "reset", "denied", "help"]):
+                for q in valid_queries:
+                    if "login" in q["name"].lower():
+                        matched_query = q
+                        break
+
+        elif "customer master" in sub_name_l:
+            # If LLM gives a null query under Customer Master, try the most common issue (export)
+            # as a default. If the combined context has export signals, prefer it explicitly.
+            if not combined_q_context.strip() or any(k in combined_q_context for k in ["export", "excel", "error", "record"]):
+                for q in valid_queries:
+                    if "export" in q["name"].lower():
+                        matched_query = q
+                        break
 
     return matched_req, matched_sub, matched_query
 
@@ -578,6 +649,8 @@ def extract_entities_with_llm(
     subject: str = None
 ) -> dict:
     import time
+    from dotenv import load_dotenv
+    load_dotenv()
     start_time = time.time()
     api_key = os.environ.get("EMAIL_API_KEY") or os.environ.get("GROQ_EMAIL_API_KEY") or os.environ.get("CHATBOT_API_KEY") or os.environ.get("GROQ_API_KEY")
     if not api_key:
@@ -601,6 +674,13 @@ def extract_entities_with_llm(
     forwarded_note = 'NOTE: This is a FORWARDED email. The "=== FULL EMAIL THREAD ===" section contains the REAL content. The task should typically be assigned to whoever was in the "Forwarded to:" field.' if is_forwarded else ""
 
     gq_hierarchy_text = format_gq_hierarchy_for_prompt(get_gq_master_hierarchy())
+
+    # Cap email body to 1500 chars to stay under the model's TPM limit.
+    # The full instruction rules are ~6800 chars + hierarchy names ~120 chars.
+    # Total budget for email body: ~1500 chars to stay safely under 8000 TPM.
+    EMAIL_BODY_MAX_CHARS = 1500
+    if len(text) > EMAIL_BODY_MAX_CHARS:
+        text = text[:EMAIL_BODY_MAX_CHARS] + "\n...[Email body truncated. Key classification signals above are sufficient.]"
 
     prompt = f"""You are a precise CRM data extraction assistant for Grant Thornton Bahrain.
 {sender_context}
@@ -691,62 +771,66 @@ RULE 15 — GENERAL QUERY HIERARCHICAL CLASSIFICATION:
 Classify the email against the following valid CRM Master Hierarchy options:
 {gq_hierarchy_text}
 
-CRITICAL — SEMANTIC INTENT DISAMBIGUATION (read before classifying):
+CRITICAL RULES FOR gq_request_type, gq_subject, and gq_query:
 
-STEP 1 — Determine the BUSINESS INTENT of the email:
-Ask yourself: "Is this email about a SALES OPPORTUNITY, or is it a TECHNICAL PROBLEM REPORT?"
+1. "gq_request_type" MUST BE ONE OF THESE EXACT 6 NAMES:
+   - "Marketing & Business Development"
+   - "IT Support"
+   - "CRM Issues"
+   - "Finance"
+   - "Client Support"
+   - "HR"
+   (DO NOT output "Service Lead", "Estimation", "Proposal", or any other string for gq_request_type!)
 
-A. SALES / BUSINESS DEVELOPMENT INTENT signals (→ Marketing & Business Development):
-   - A new prospective client, potential customer, or external prospect is introduced
-   - Someone is pitching a new engagement, business opportunity, or service requirement
-   - Words like: "new client", "prospective", "discovery call", "initial meeting", "business opportunity",
-     "request for proposal", "RFP", "quotation", "budget", "implementation requirement", "new project",
-     "new engagement", "client onboarding", "new service", "interested in", "seeking services"
-   - The email describes WHAT A CLIENT WANTS TO BUY, not a technical failure
-   - The mention of any software/technology (e.g. "CRM software", "ERP system", "accounting system")
-     in the context of what a CLIENT WANTS TO IMPLEMENT is a SALES OPPORTUNITY, NOT a technical issue
-   → Use: Marketing & Business Development → Proposal Request or EL Request or Marketing
-   → IMPORTANT: "CRM software implementation for a client" = SALES INTENT, NOT CRM Issues or IT Support
+2. "gq_subject" MUST BE AN EXACT SUBJECT NAME FROM THE HIERARCHY UNDER THAT gq_request_type:
+   - Under "Marketing & Business Development": "Proposal Request", "EL Request", "Marketing"
+   - Under "IT Support": "General IT", "CRM", "Email related", "DMS", "Client Portal", "Tally"
+   - Under "CRM Issues": "Customer Master", "Contact Master", "Service Lead", "Proposal", "Projects", etc.
 
-B. TECHNICAL PROBLEM / SUPPORT INTENT signals (→ IT Support or CRM Issues):
-   - An EXISTING user or employee is reporting a BROKEN or MALFUNCTIONING system
-   - Words like: "not working", "error", "can't login", "access denied", "password reset",
-     "system is down", "unable to export", "data is wrong", "records not displaying",
-     "can't save", "bug", "malfunction", "configuration problem", "troubleshooting"
-   - The email is about the firm's OWN internal systems failing
-   → Use: IT Support (for internal tools, email, access) or CRM Issues (for CRM-specific bugs)
-   → IMPORTANT: "CRM is not working" = CRM Issues. "Can't login to email" = IT Support.
+3. "gq_query" MUST BE AN EXACT QUERY NAME FROM THE HIERARCHY UNDER THAT gq_subject:
+   - Under "Proposal Request": "New Proposal", "Copy of Proposal", "Others"
+   - Under "CRM" (IT Support): "Login Issue", "User Rights", "Block User", "User ID Creation", "Others"
+   - Under "Email related" (IT Support): "Bounce back email issues", "New Email ID", "Auto response", "Attachment", "Suspicious Link", "Others"
 
-C. ONE-KEYWORD OVERRIDE IS FORBIDDEN:
-   - The word "CRM" alone MUST NOT classify an email as IT Support or CRM Issues.
-   - The word "software" or "system" alone MUST NOT classify as IT Support.
-   - The word "proposal" alone MUST NOT classify as Marketing & BD if the email is about a technical proposal review error.
-   - Always use the FULL semantic context — subject, body, intent, customer_name, project_name together.
+MANDATORY STEP 1 — DETERMINE THE BUSINESS INTENT OF THE EMAIL BEFORE CLASSIFYING:
+Ask yourself: "Is the sender communicating a NEW BUSINESS / SALES OPPORTUNITY, or reporting a TECHNICAL SYSTEM PROBLEM?"
 
-D. QUICK DISAMBIGUATION EXAMPLES:
-   "New client wants CRM implementation, budget BHD 15,000"
-   → SALES INTENT → Marketing & Business Development → Proposal Request → New Proposal
+A. SALES / BUSINESS OPPORTUNITY SIGNALS (→ MUST CLASSIFY AS "Marketing & Business Development"):
+If the email contains ANY sales or business development signals, such as:
+- new prospective client, prospective customer, new client, client interested in, client wants, client needs our services, pitched a client, business opportunity, new opportunity, implementation requirement, project requirement, budget/value mentioned, quotation request, proposal request, discovery call, meeting with prospective client, client looking to start a project, client wants to purchase/implement a service, request to prepare proposal, request to take up a new client, service requirement from a prospect.
 
-   "Client is seeking ERP software for their warehouse"
-   → SALES INTENT → Marketing & Business Development → Proposal Request → New Proposal
+YOU MUST CLASSIFY AS:
+- gq_request_type: "Marketing & Business Development"
+- gq_subject: "Proposal Request" (for new proposal, quotation, discovery call, project implementation for a prospect)
+- gq_query: "New Proposal"
 
-   "CRM is not loading, records are missing"
-   → TECHNICAL ISSUE → CRM Issues → (match appropriate subject from hierarchy)
+CRITICAL PRODUCT VS PROBLEM DISAMBIGUATION:
+- The word "CRM" in "CRM software implementation", "CRM system for client", "custom CRM software", etc. refers to the PRODUCT/SERVICE the prospective client wants to purchase or implement. It is a SALES OPPORTUNITY → "Marketing & Business Development" → "Proposal Request" → "New Proposal". It is NOT an IT Support or CRM Issue!
+- Receiving an email about a lead/prospect is NOT an "Email related" IT Support issue! "Email related" is ONLY for technical email system delivery errors (e.g. bounce back, spam).
 
-   "Unable to log into email, password expired"
-   → TECHNICAL ISSUE → IT Support → (match appropriate subject from hierarchy)
+B. TECHNICAL SUPPORT SIGNALS (→ ONLY USE "IT Support" OR "CRM Issues"):
+Classify as IT Support or CRM Issues ONLY IF the email describes an actual technical malfunction, system bug, or IT failure:
+- "Client cannot login to CRM" → "IT Support" → "CRM" → "Login Issue"
+- "CRM export to excel is broken" → "CRM Issues" → "Customer Master" → "Not able to export to excel"
+- "Email bounce back error 550" → "IT Support" → "Email related" → "Bounce back email issues"
 
-   "Please prepare engagement letter for audit"
-   → BUSINESS DEVELOPMENT → Marketing & Business Development → EL Request → EL
+C. CRITICAL DISAMBIGUATION EXAMPLES:
+1. "We have a new prospective client interested in custom CRM software implementation... budget BHD 15,000... set up initial discovery call"
+   → gq_request_type: "Marketing & Business Development", gq_subject: "Proposal Request", gq_query: "New Proposal"
 
-   "Invoice for last quarter has not been processed"
-   → Finance → Payable Management → Others (or relevant query)
+2. "Client pitched for new software implementation services"
+   → gq_request_type: "Marketing & Business Development", gq_subject: "Proposal Request", gq_query: "New Proposal"
 
-STEP 2 — After determining INTENT, select the EXACT matching hierarchy:
-- Match Request Type first, then Subject under that Request Type, then Query under that Subject.
+3. "Inquiry regarding CRM software purchase"
+   → gq_request_type: "Marketing & Business Development", gq_subject: "Proposal Request", gq_query: "New Proposal"
+
+4. "Cannot log into CRM"
+   → gq_request_type: "IT Support", gq_subject: "CRM", gq_query: "Login Issue"
+
+STEP 2 — SELECT EXACT MATCHING HIERARCHY:
+- Match gq_request_type first, then gq_subject under that Request Type, then gq_query under that Subject.
 - Names must match EXACTLY as listed in the hierarchy above.
-- If a level cannot be confidently matched, return null for that level and deeper levels.
-- Never guess or invent hierarchy entries.
+- Return null if uncertain.
 
 Fields to extract for General Query classification:
 - gq_request_type: Exactly match a Request Type name from the hierarchy above, or null if uncertain.
@@ -828,20 +912,29 @@ Email Text:
     # }
     # -------------------------------------------------------------
 
-    # 2. Build Langchain payload (with safe prompt truncation to prevent Groq 413 TPM rate limits)
+    # 2. Build Langchain payload
+    # NOTE: Email body was already capped to 2000 chars BEFORE the prompt was assembled,
+    # so the full instruction rules (including RULE 15) are always preserved.
+    # Do NOT truncate the assembled prompt here — it would destroy the classification rules.
     from config.llm_factory import get_llm
     from langchain_core.messages import SystemMessage, HumanMessage
 
     safe_prompt = masked_prompt
-    if len(safe_prompt) > 4500:
-        safe_prompt = safe_prompt[:3000] + "\n...[Middle content truncated to comply with model token limits]...\n" + safe_prompt[-1200:]
-        
+    
     user_content = [{"type": "text", "text": safe_prompt}]
     if image_contents:
         user_content.extend(image_contents)
         
+    sys_msg_text = (
+        "You are an expert CRM AI assistant. Extract structured CRM data from the input email, "
+        "including General Query classification (gq_request_type, gq_subject, gq_query). "
+        "Respond ONLY with a valid JSON object matching the requested schema. "
+        "CRITICAL: You MUST include gq_request_type, gq_subject, and gq_query in the JSON response. "
+        "gq_request_type MUST be one of: 'Marketing & Business Development', 'IT Support', 'CRM Issues', 'Finance', 'Client Support', 'HR'. "
+        "Do NOT output any <think> tags or reasoning blocks. Your response MUST start IMMEDIATELY with '{' on line 1."
+    )
     messages = [
-        SystemMessage(content="You are an expert CRM AI assistant. Extract structured CRM data from the input email, synthesize a concise 2-3 sentence executive summary for task_description, and respond ONLY with a valid JSON object matching the requested schema. CRITICAL: Do NOT output any <think> tags, chain-of-thought, or reasoning blocks. Your response MUST start IMMEDIATELY with '{' on line 1."),
+        SystemMessage(content=sys_msg_text),
         HumanMessage(content=user_content if image_contents else safe_prompt)
     ]
     
@@ -1600,6 +1693,42 @@ def build_general_query_mapping(parsed: dict) -> dict:
     raw_sub_name = parsed.get("gq_subject")
     raw_query_name = parsed.get("gq_query")
 
+    # 2b. Semantic Intent Disambiguation Fallback if raw hints are missing or invalid
+    req_clean_test = str(raw_req_name or "").strip().lower()
+    valid_req_names = ["marketing & business development", "it support", "crm issues", "finance", "client support", "hr"]
+    if not raw_req_name or req_clean_test in ["none", "null", "undefined", ""] or req_clean_test not in valid_req_names:
+        combined_text = (
+            f"{parsed.get('intent') or ''} {parsed.get('task_title') or ''} "
+            f"{parsed.get('task_description') or ''} {parsed.get('service_line_hint') or ''} "
+            f"{raw_req_name or ''} {raw_sub_name or ''} {raw_query_name or ''}"
+        ).lower()
+        
+        sales_signals = [
+            "prospective", "prospect", "new client", "discovery call", "proposal",
+            "quotation", "pitched", "budget", "implementation requirement", "new lead",
+            "service lead", "estimation", "business opportunity", "seeking services"
+        ]
+        login_signals = ["login", "access denied", "password", "can't login", "cannot login", "block user"]
+        email_signals = ["bounce back", "email delivery", "550", "bouncing", "email failure", "emails bouncing"]
+        crm_export_signals = ["export", "cannot export", "not able to export", "excel error", "customer master"]
+        
+        if any(sig in combined_text for sig in sales_signals) and not any(sig in combined_text for sig in login_signals + email_signals + crm_export_signals):
+            raw_req_name = "Marketing & Business Development"
+            raw_sub_name = "Proposal Request"
+            raw_query_name = "New Proposal"
+        elif any(sig in combined_text for sig in login_signals):
+            raw_req_name = "IT Support"
+            raw_sub_name = "CRM"
+            raw_query_name = "Login Issue"
+        elif any(sig in combined_text for sig in email_signals):
+            raw_req_name = "IT Support"
+            raw_sub_name = "Email related"
+            raw_query_name = "Bounce back email issues"
+        elif any(sig in combined_text for sig in crm_export_signals):
+            raw_req_name = "CRM Issues"
+            raw_sub_name = "Customer Master"
+            raw_query_name = "Not able to export to excel"
+
     def _clean_conf(val: Any, default: float = 0.90) -> float:
         if val is None:
             return default
@@ -1607,6 +1736,8 @@ def build_general_query_mapping(parsed: dict) -> dict:
             f = float(val)
             if f > 1.0:
                 f = f / 100.0
+            if f < 0.5:
+                return default
             return max(0.0, min(1.0, f))
         except (ValueError, TypeError):
             return default
