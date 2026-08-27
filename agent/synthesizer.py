@@ -33,14 +33,30 @@ async def synthesize_response(original_query: str, tool_results: List[Dict[str, 
             "7. Do not explain your reasoning process."
         )
         
-        prompt = f"User Query: {original_query}\n\nTool Results:\n{json.dumps(tool_results, default=str, indent=2)}\n\nFormat this into a clear, professional answer."
+        # Truncate overly large JSON payload to prevent exceeding LLM rate limits (e.g. 8k TPM)
+        raw_json_str = json.dumps(tool_results, default=str, indent=2)
+        if len(raw_json_str) > 12000:
+            compact_json_str = json.dumps(tool_results, default=str)
+            if len(compact_json_str) > 12000:
+                raw_json_str = compact_json_str[:12000] + "\n... [TRUNCATED DATA DUE TO PAYLOAD SIZE LIMIT]"
+            else:
+                raw_json_str = compact_json_str
+
+        prompt = f"User Query: {original_query}\n\nTool Results:\n{raw_json_str}\n\nFormat this into a clear, professional answer."
         
         try:
-            response = await llm_client.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=prompt)])
-            final_text = response.content
+            from agent.pseudonymizer import prepare_for_external_llm, unmask_data, PrivacySecurityError
+            privacy_res = prepare_for_external_llm(prompt)
+            if not privacy_res.safe:
+                logger.error(f"Privacy validation failed in synthesizer: {privacy_res.blocked_reason}")
+                final_text = "Data formatting paused due to security privacy policy enforcement."
+            else:
+                response = await llm_client.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=privacy_res.masked_text)])
+                final_text = unmask_data(response.content, privacy_res.token_mapping)
+                privacy_res.clear_mapping()
         except Exception as e:
             logger.error(f"Dynamic synthesis failed: {e}")
-            final_text = "I encountered an error while formatting your response, but here is the raw data I retrieved:\n\n```json\n" + json.dumps(tool_results, default=str, indent=2) + "\n```"
+            final_text = "I encountered an issue formatting your response securely."
     else:
         # Fallback to structured formatting
         final_text = "Here is the raw information you requested:\n\n```json\n" + json.dumps(tool_results, default=str, indent=2) + "\n```"

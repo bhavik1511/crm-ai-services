@@ -86,6 +86,16 @@ class EnterprisePlanner:
         
         logger.info(f"[Req: {tracker.request_id}] Starting business reasoning for query: {context.question}")
         
+        # Security Guardrail Check for Schema / Internal System Queries
+        from config.security_guard import check_security_guardrail
+        sec_block = check_security_guardrail(context.question or "")
+        if sec_block:
+            return {
+                "type": "done",
+                "content": sec_block["content"],
+                "is_clarification": False
+            }
+
         # 1. Check for Clarification State Persistence
         previous_plan = context.user_context.get("previous_execution_plan")
         is_internal = context.request_metadata.get("is_internal", False)
@@ -104,8 +114,7 @@ class EnterprisePlanner:
                 logger.info(f"[Req: {tracker.request_id}] Resuming previous execution plan deterministically.")
                 execution_plan = previous_plan
                 
-                # Deterministic Context Injection:
-                # Map any provided keys (like 'financial_year') into the capability context.
+                # Update context of capabilities with raw clarification answer
                 for cap in execution_plan.get("business_capabilities", []):
                     # We inject the raw context sent by the frontend UI
                     if context.user_context.get("financial_year"):
@@ -131,7 +140,11 @@ class EnterprisePlanner:
                 tracker.record_planner_output(execution_plan)
             except Exception as e:
                 logger.error(f"[Req: {tracker.request_id}] Failed to generate business plan: {e}")
-                return {"type": "done", "content": "I encountered an error trying to plan your request. Please try rephrasing.", "is_clarification": True}
+                return {
+                    "type": "done",
+                    "content": "I'm sorry, I couldn't process that request. I am designed to assist with CRM analytics, revenue reports, customer accounts, project tracking, and sales pipelines. Please let me know how I can help with your business data!",
+                    "is_clarification": True
+                }
 
         logger.info(f"Active Business Execution Plan: {json.dumps(execution_plan, indent=2)}")
 
@@ -161,7 +174,9 @@ class EnterprisePlanner:
         if not is_valid:
             logger.warning(f"[Req: {tracker.request_id}] Execution blocked by Validator.")
             tracker.dump_trace()
-            return {"type": "done", "content": "⚠️ **Execution Blocked**\n\n" + "\n".join([f"- {err}" for err in validation_errors]), "is_clarification": True, "execution_plan": execution_plan}
+            clean_errs = [err for err in validation_errors if err]
+            err_content = clean_errs[0] if clean_errs else "I need a bit more detail to answer your request accurately. Could you please specify which customer, project, or revenue report you would like to view?"
+            return {"type": "done", "content": err_content, "is_clarification": True, "execution_plan": execution_plan}
             
         # 4. Tool Registry Resolution & Execution
         import sys

@@ -401,20 +401,11 @@ Return ONLY a valid JSON object with these EXACT keys:
         getattr(llm, 'model', None) or 
         getattr(getattr(llm, 'bound', None), 'model_name', None) or 
         getattr(getattr(llm, 'bound', None), 'model', None) or 
-        os.getenv("PRIMARY_MODEL", "llama-3.3-70b-versatile")
+        os.getenv("LLM_MODEL") or os.getenv("PRIMARY_MODEL") or "qwen/qwen3.6-27b"
     )
 
-    model_lower = str(model_name_used).lower()
-    if "llama-3.3-70b" in model_lower:
-        cost = (in_tok / 1_000_000 * 0.59) + (out_tok / 1_000_000 * 0.79)
-    elif "llama-3.1-8b" in model_lower:
-        cost = (in_tok / 1_000_000 * 0.05) + (out_tok / 1_000_000 * 0.08)
-    elif "llama-3.2-90b" in model_lower:
-        cost = (in_tok / 1_000_000 * 0.90) + (out_tok / 1_000_000 * 0.90)
-    elif "gpt-4o-mini" in model_lower:
-        cost = (in_tok / 1_000_000 * 0.150) + (out_tok / 1_000_000 * 0.600)
-    elif "gpt-4o" in model_lower:
-        cost = (in_tok / 1_000_000 * 2.50) + (out_tok / 1_000_000 * 10.00)
+    from db.database import calculate_llm_cost
+    cost = calculate_llm_cost(model_name_used, in_tok, out_tok)
 
     execution_time_ms = int((time.time() - start_time) * 1000)
 
@@ -424,12 +415,28 @@ Return ONLY a valid JSON object with these EXACT keys:
         confidence_score_val = 0
     confidence_level_val = str(parsed.get("confidence_level", "high")).lower()
 
-    # 6. Save Telemetry — unified DB sink ai_email_parsing
-    from db.database import save_ai_email_parsing_async
+    # 6. Save Telemetry & ML dataset — unified DB sinks
+    ctx_obj = context or {}
+    ref_id = (
+        ctx_obj.get("reference_id") or 
+        ctx_obj.get("message_id") or 
+        ctx_obj.get("messageId") or
+        ctx_obj.get("source_email_id") or
+        ctx_obj.get("email_id") or
+        ctx_obj.get("id") or
+        parsed_email.get("message_id") or
+        parsed_email.get("source_email_id") or
+        parsed_email.get("reference_id")
+    )
+    ref_str = None
+    if ref_id and str(ref_id).strip() and str(ref_id).strip().lower() not in ("none", "null", "undefined"):
+        ref_str = str(ref_id).strip()[:255]
+
+    from db.database import save_ai_email_parsing_async, save_email_ml_dataset_async
     asyncio.create_task(save_ai_email_parsing_async(
         employee_id=employee_id if employee_id != 0 else None,
         document_type="email_lead",
-        reference_id=subject[:50],
+        reference_id=ref_str,
         input_tokens=in_tok,
         output_tokens=out_tok,
         total_tokens=tot_tok,
@@ -439,8 +446,24 @@ Return ONLY a valid JSON object with these EXACT keys:
         file_extension=None,
         confidence_score=int(confidence_score_val),
         confidence_level=confidence_level_val,
-        processing_status="Success",
+        processing_status="PENDING",
         processing_time_ms=execution_time_ms
+    ))
+
+    asyncio.create_task(save_email_ml_dataset_async(
+        reference_id=ref_str,
+        sender_email=sender_email,
+        to_emails=outer_to,
+        subject=subject,
+        body_clean=clean_text,
+        thread_count=1,
+        is_forwarded=is_forwarded,
+        forwarded_by_email=outer_from if is_forwarded else None,
+        predicted_intent="Service Lead",
+        extracted_keywords=[],
+        extracted_entities=parsed,
+        confidence_score=int(confidence_score_val),
+        employee_id=employee_id if employee_id != 0 else None
     ))
 
     extracted_dict = extracted_obj.model_dump()
