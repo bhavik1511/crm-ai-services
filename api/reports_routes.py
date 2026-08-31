@@ -36,6 +36,8 @@ def _parse_date(d_str: Optional[str]) -> Optional[datetime]:
 @router.get("/ai-email-usage")
 async def get_ai_email_usage_report(
     credentials: HTTPAuthorizationCredentials = Depends(security),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
     employee_id: Optional[int] = Query(None),
@@ -43,6 +45,9 @@ async def get_ai_email_usage_report(
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=500),
 ):
+    # Boundary normalization: Map incoming external start_date/end_date to internal date_from/date_to
+    date_from = start_date or date_from
+    date_to = end_date or date_to
     """
     Returns aggregated KPIs, User Leaderboard, Document Type Breakdown,
     and paginated telemetry logs from `ai_email_parsing` joined with `employees`.
@@ -237,6 +242,8 @@ async def get_ai_email_usage_report(
 @router.get("/ai-chatbot-usage")
 async def get_ai_chatbot_usage_report(
     credentials: HTTPAuthorizationCredentials = Depends(security),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
     employee_id: Optional[int] = Query(None),
@@ -244,6 +251,9 @@ async def get_ai_chatbot_usage_report(
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=500),
 ):
+    # Boundary normalization: Map incoming external start_date/end_date to internal date_from/date_to
+    date_from = start_date or date_from
+    date_to = end_date or date_to
     """
     Returns aggregated KPIs, User Leaderboard, Execution Path & Model Breakdown,
     and paginated telemetry logs from `ai_chatbot_usage` joined with `employees`.

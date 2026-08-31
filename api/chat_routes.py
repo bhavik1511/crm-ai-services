@@ -976,6 +976,8 @@ async def get_history(
     limit: int = Query(50, ge=1, le=200),
     skip: int = Query(0, ge=0),
     search: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None, description="ISO format: 2025-01-01"),
+    end_date: Optional[str] = Query(None, description="ISO format: 2025-12-31"),
     date_from: Optional[str] = Query(None, description="ISO format: 2025-01-01"),
     date_to: Optional[str] = Query(None, description="ISO format: 2025-12-31"),
     credentials: HTTPAuthorizationCredentials = Depends(security),
@@ -983,6 +985,10 @@ async def get_history(
     """Get paginated chat history for the authenticated user."""
     user_context = _decode_jwt(credentials)
     user_id = user_context["user_id"]
+
+    # Boundary normalization
+    date_from = start_date or date_from
+    date_to = end_date or date_to
 
     try:
         # Parse date strings if provided (strip timezone info for naive UTC MongoDB comparison)
