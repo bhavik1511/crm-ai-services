@@ -266,6 +266,377 @@ def clean_and_parse_json(text: str) -> dict:
 
     return {}
 
+
+_GQ_MASTER_HIERARCHY_CACHE = {"timestamp": 0, "data": []}
+_GQ_CACHE_TTL_SECONDS = 300  # 5 minutes TTL
+
+def get_gq_master_hierarchy(force_refresh: bool = False) -> List[Dict[str, Any]]:
+    """
+    Retrieves the current active General Query hierarchy from the database:
+    Request Type -> Subject -> Query / General Issue.
+    Uses dynamic DB queries and in-memory TTL caching.
+    """
+    global _GQ_MASTER_HIERARCHY_CACHE
+    now = time.time()
+    if not force_refresh and _GQ_MASTER_HIERARCHY_CACHE["data"] and (now - _GQ_MASTER_HIERARCHY_CACHE["timestamp"] < _GQ_CACHE_TTL_SECONDS):
+        return _GQ_MASTER_HIERARCHY_CACHE["data"]
+
+    try:
+        from db.database import get_db_engine
+        from sqlalchemy import text
+
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            req_types = conn.execute(
+                text("SELECT id, name FROM m_gen_request_type WHERE is_active = 1 ORDER BY id ASC")
+            ).mappings().all()
+
+            subjects = conn.execute(
+                text("SELECT id, name, request_type_id FROM m_subject WHERE is_active = 1 ORDER BY id ASC")
+            ).mappings().all()
+
+            issues = conn.execute(
+                text("SELECT id, name, subject_id FROM m_general_issue WHERE is_active = 1 ORDER BY id ASC")
+            ).mappings().all()
+
+        issues_by_subject = {}
+        for issue in issues:
+            s_id = issue["subject_id"]
+            if s_id not in issues_by_subject:
+                issues_by_subject[s_id] = []
+            issues_by_subject[s_id].append({
+                "id": issue["id"],
+                "name": issue["name"]
+            })
+
+        subjects_by_req = {}
+        for subj in subjects:
+            r_id = subj["request_type_id"]
+            if r_id not in subjects_by_req:
+                subjects_by_req[r_id] = []
+            subjects_by_req[r_id].append({
+                "id": subj["id"],
+                "name": subj["name"],
+                "queries": issues_by_subject.get(subj["id"], [])
+            })
+
+        hierarchy = []
+        for req in req_types:
+            hierarchy.append({
+                "id": req["id"],
+                "name": req["name"],
+                "subjects": subjects_by_req.get(req["id"], [])
+            })
+
+        _GQ_MASTER_HIERARCHY_CACHE["timestamp"] = now
+        _GQ_MASTER_HIERARCHY_CACHE["data"] = hierarchy
+        return hierarchy
+    except Exception as e:
+        print(f"[get_gq_master_hierarchy] Error loading master hierarchy from DB: {e}")
+        return _GQ_MASTER_HIERARCHY_CACHE.get("data", [])
+
+
+def format_gq_hierarchy_for_prompt(hierarchy: List[Dict[str, Any]]) -> str:
+    """
+    Formats ONLY the request type names and subject names for the LLM prompt.
+    Queries are omitted — the LLM is given a focused cheatsheet in RULE 15 directly.
+    This keeps the hierarchy contribution to <300 chars to avoid TPM overflows.
+    Full query validation happens in validate_gq_hierarchy() against the live DB.
+    """
+    req_names = [f"'{req['name']}'" for req in hierarchy]
+    return f"Valid Request Types: [{', '.join(req_names)}]"
+
+
+def validate_gq_hierarchy(
+    raw_req_name: Optional[str],
+    raw_sub_name: Optional[str],
+    raw_query_name: Optional[str],
+    hierarchy: Optional[List[Dict[str, Any]]] = None
+) -> tuple:
+    """
+    Validates that:
+    1. Request Type exists in CRM master data.
+    2. Subject exists under that Request Type.
+    3. Query exists under that Subject.
+
+    Returns (matched_req, matched_sub, matched_query) or None for invalid levels.
+    Strictly NO first-option or default fallbacks!
+    """
+    if hierarchy is None:
+        hierarchy = get_gq_master_hierarchy()
+
+    if not raw_req_name:
+        return None, None, None
+
+    req_clean = str(raw_req_name).strip().lower()
+
+    # Request Type synonym mapping for common aliases / intent outputs
+    REQ_SYNONYMS = {
+        "service lead": "Marketing & Business Development",
+        "service_lead": "Marketing & Business Development",
+        "business development": "Marketing & Business Development",
+        "bd": "Marketing & Business Development",
+        "proposal": "Marketing & Business Development",
+        "proposal request": "Marketing & Business Development",
+        "estimation": "Marketing & Business Development",
+        "marketing": "Marketing & Business Development",
+        "it": "IT Support",
+        "general it": "IT Support",
+        "crm issue": "CRM Issues",
+        "crm problem": "CRM Issues",
+    }
+
+    if req_clean in REQ_SYNONYMS:
+        req_clean = REQ_SYNONYMS[req_clean].lower()
+
+    # 1. Match Request Type
+    matched_req = None
+    for req in hierarchy:
+        if req["name"].strip().lower() == req_clean:
+            matched_req = req
+            break
+        elif req_clean in req["name"].strip().lower() or req["name"].strip().lower() in req_clean:
+            matched_req = req
+
+    if not matched_req:
+        return None, None, None
+
+    # 2. Match Subject ONLY under valid Subjects of matched_req
+    valid_subjects = matched_req.get("subjects", [])
+    matched_sub = None
+    
+    if raw_sub_name:
+        sub_clean = str(raw_sub_name).strip().lower()
+        for sub in valid_subjects:
+            s_name = sub["name"].strip().lower()
+            if s_name == sub_clean or sub_clean in s_name or s_name in sub_clean:
+                matched_sub = sub
+                break
+
+    if not matched_sub:
+        req_name_l = matched_req["name"].lower()
+        combined_context = f"{raw_sub_name or ''} {raw_query_name or ''}".lower()
+        
+        if "marketing" in req_name_l:
+            if any(k in combined_context for k in ["el", "engagement"]):
+                target_sub = "el request"
+            elif any(k in combined_context for k in ["press", "social", "campaign"]):
+                target_sub = "marketing"
+            else:
+                target_sub = "proposal request"
+            for s in valid_subjects:
+                if target_sub in s["name"].lower():
+                    matched_sub = s
+                    break
+
+        elif "it support" in req_name_l:
+            if any(k in combined_context for k in ["email", "bounce", "delivery", "550"]):
+                target_sub = "email related"
+            elif any(k in combined_context for k in ["hardware", "printer"]):
+                target_sub = "general it"
+            else:
+                target_sub = "crm"
+            for s in valid_subjects:
+                if target_sub in s["name"].lower():
+                    matched_sub = s
+                    break
+
+        elif "crm issues" in req_name_l:
+            target_sub = "customer master"
+            for s in valid_subjects:
+                if target_sub in s["name"].lower():
+                    matched_sub = s
+                    break
+
+    if not matched_sub:
+        return matched_req, None, None
+
+    # 3. Match Query ONLY under valid Queries of matched_sub
+    valid_queries = matched_sub.get("queries", [])
+    matched_query = None
+
+    if raw_query_name:
+        query_clean = str(raw_query_name).strip().lower()
+        for q in valid_queries:
+            q_name = q["name"].strip().lower()
+            if q_name == query_clean or query_clean in q_name or q_name in query_clean:
+                matched_query = q
+                break
+
+    if not matched_query:
+        sub_name_l = matched_sub["name"].lower()
+        combined_q_context = f"{raw_sub_name or ''} {raw_query_name or ''}".lower()
+
+        if "proposal" in sub_name_l:
+            for q in valid_queries:
+                if "new proposal" in q["name"].lower():
+                    matched_query = q
+                    break
+
+        elif "email" in sub_name_l:
+            if any(k in combined_q_context for k in ["bounce", "550", "delivery", "bouncing", "error", "fix", "resolve"]):
+                for q in valid_queries:
+                    if "bounce" in q["name"].lower():
+                        matched_query = q
+                        break
+
+        elif "crm" in sub_name_l:
+            if any(k in combined_q_context for k in ["login", "password", "access", "reset", "denied", "help"]):
+                for q in valid_queries:
+                    if "login" in q["name"].lower():
+                        matched_query = q
+                        break
+
+        elif "customer master" in sub_name_l:
+            # If LLM gives a null query under Customer Master, try the most common issue (export)
+            # as a default. If the combined context has export signals, prefer it explicitly.
+            if not combined_q_context.strip() or any(k in combined_q_context for k in ["export", "excel", "error", "record"]):
+                for q in valid_queries:
+                    if "export" in q["name"].lower():
+                        matched_query = q
+                        break
+
+    return matched_req, matched_sub, matched_query
+
+
+def resolve_general_query_entities(
+    parsed: dict,
+    req_type_id: Optional[int],
+    sub_id: Optional[int],
+    issue_id: Optional[int]
+) -> dict:
+    """
+    Resolves conditional CRM entities (customer_id, project_id, proposal_id, saleslead_id)
+    only when explicitly applicable based on the selected General Query classification.
+    """
+    customer_id = parsed.get("db_customer_id")
+    customer_name = parsed.get("db_customer_name") or parsed.get("customer_name")
+
+    intent_lower = str(parsed.get("intent") or "").lower()
+
+    # Proposal is applicable for proposal/EL subjects/issues
+    is_proposal_applicable = False
+    if sub_id in [16, 17, 29] or (issue_id and issue_id in [39, 53, 54, 55, 56, 57, 58, 111, 112, 113, 114, 115]) or "proposal" in intent_lower or "engagement" in intent_lower:
+        is_proposal_applicable = True
+
+    # Sales Lead is applicable for sales lead inquiries
+    is_saleslead_applicable = False
+    if issue_id == 53 or (sub_id == 16 and not is_proposal_applicable) or "lead" in intent_lower:
+        is_saleslead_applicable = True
+
+    # Project is applicable for project-related subjects (sub_id in [11, 12, 13, 28, 30]) AND NOT HR/CRM/IT
+    is_project_applicable = False
+    if sub_id and sub_id not in [14, 16, 17] and req_type_id not in [1, 5, 9] and not is_proposal_applicable:
+        is_project_applicable = True
+
+    resolved_project_id = None
+    resolved_proposal_id = None
+    resolved_saleslead_id = None
+
+    project_status = "NOT_APPLICABLE"
+    proposal_status = "NOT_APPLICABLE"
+    saleslead_status = "NOT_APPLICABLE"
+
+    try:
+        from db.database import get_db_engine
+        from sqlalchemy import text
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            # --- Project Resolution ---
+            if is_project_applicable:
+                project_hint = parsed.get("project_name")
+                proj_rows = []
+                if project_hint and len(str(project_hint).strip()) > 2:
+                    proj_rows = conn.execute(
+                        text("SELECT id, name FROM projects WHERE (LOWER(name) LIKE :p OR LOWER(code) LIKE :p OR LOWER(id) = :pid) AND is_active = 1"),
+                        {"p": f"%{str(project_hint).lower().strip()}%", "pid": str(project_hint).lower().strip()}
+                    ).fetchall()
+                elif customer_id:
+                    proj_rows = conn.execute(
+                        text("SELECT id, name FROM projects WHERE client = :cid AND is_active = 1"),
+                        {"cid": customer_id}
+                    ).fetchall()
+
+                if len(proj_rows) == 1:
+                    resolved_project_id = proj_rows[0][0]
+                    project_status = "FOUND"
+                elif len(proj_rows) > 1:
+                    exact_matches = [r for r in proj_rows if project_hint and str(project_hint).lower().strip() in r[1].lower()]
+                    if len(exact_matches) == 1:
+                        resolved_project_id = exact_matches[0][0]
+                        project_status = "FOUND"
+                    else:
+                        resolved_project_id = None
+                        project_status = "MULTIPLE_MATCHES"
+                else:
+                    resolved_project_id = None
+                    project_status = "NOT_FOUND"
+
+            # --- Proposal Resolution ---
+            if is_proposal_applicable:
+                prop_rows = []
+                prop_ref = parsed.get("proposal_ref") or parsed.get("task_title")
+                if prop_ref and ("prop" in str(prop_ref).lower() or "pr-" in str(prop_ref).lower()):
+                    prop_rows = conn.execute(
+                        text("SELECT id, code FROM proposal WHERE (LOWER(code) LIKE :ref OR LOWER(id) = :ref_id) AND is_active = 1"),
+                        {"ref": f"%{str(prop_ref).lower()}%", "ref_id": str(prop_ref).lower()}
+                    ).fetchall()
+                elif customer_id:
+                    prop_rows = conn.execute(
+                        text("SELECT id, code FROM proposal WHERE client_id = :cid AND is_active = 1 ORDER BY created_at DESC"),
+                        {"cid": customer_id}
+                    ).fetchall()
+
+                if len(prop_rows) == 1:
+                    resolved_proposal_id = prop_rows[0][0]
+                    proposal_status = "FOUND"
+                elif len(prop_rows) > 1:
+                    resolved_proposal_id = None
+                    proposal_status = "MULTIPLE_MATCHES"
+                else:
+                    resolved_proposal_id = None
+                    proposal_status = "NOT_FOUND"
+
+            # --- Sales Lead Resolution ---
+            if is_saleslead_applicable:
+                lead_rows = []
+                lead_ref = parsed.get("lead_ref") or parsed.get("task_title")
+                if lead_ref and ("lead" in str(lead_ref).lower() or "sl-" in str(lead_ref).lower()):
+                    lead_rows = conn.execute(
+                        text("SELECT id, code FROM saleslead WHERE (LOWER(code) LIKE :ref OR LOWER(id) = :ref_id) AND is_active = 1"),
+                        {"ref": f"%{str(lead_ref).lower()}%", "ref_id": str(lead_ref).lower()}
+                    ).fetchall()
+                elif customer_id:
+                    lead_rows = conn.execute(
+                        text("SELECT id, code FROM saleslead WHERE customer_id = :cid AND is_active = 1 ORDER BY created_at DESC"),
+                        {"cid": customer_id}
+                    ).fetchall()
+
+                if len(lead_rows) == 1:
+                    resolved_saleslead_id = lead_rows[0][0]
+                    saleslead_status = "FOUND"
+                elif len(lead_rows) > 1:
+                    resolved_saleslead_id = None
+                    saleslead_status = "MULTIPLE_MATCHES"
+                else:
+                    resolved_saleslead_id = None
+                    saleslead_status = "NOT_FOUND"
+
+    except Exception as e:
+        print(f"[resolve_general_query_entities] Error resolving entities: {e}")
+
+    return {
+        "customer_id": customer_id if parsed.get("customer_lookup_status") == "FOUND" else None,
+        "customer_name": customer_name,
+        "project_id": resolved_project_id,
+        "project_status": project_status,
+        "proposal_id": resolved_proposal_id,
+        "proposal_status": proposal_status,
+        "saleslead_id": resolved_saleslead_id,
+        "saleslead_status": saleslead_status,
+    }
+
+
 def extract_entities_with_llm(
     text: str, 
     sender_type: str, 
@@ -278,6 +649,8 @@ def extract_entities_with_llm(
     subject: str = None
 ) -> dict:
     import time
+    from dotenv import load_dotenv
+    load_dotenv()
     start_time = time.time()
     api_key = os.environ.get("EMAIL_API_KEY") or os.environ.get("GROQ_EMAIL_API_KEY") or os.environ.get("CHATBOT_API_KEY") or os.environ.get("GROQ_API_KEY")
     if not api_key:
@@ -299,6 +672,15 @@ def extract_entities_with_llm(
     sender_context = "The ORIGINAL SENDER is an INTERNAL EMPLOYEE (bh.gt.com domain). This is an internal task or business lead." if sender_type == 'internal' else "The ORIGINAL SENDER is an EXTERNAL CLIENT or CUSTOMER."
     
     forwarded_note = 'NOTE: This is a FORWARDED email. The "=== FULL EMAIL THREAD ===" section contains the REAL content. The task should typically be assigned to whoever was in the "Forwarded to:" field.' if is_forwarded else ""
+
+    gq_hierarchy_text = format_gq_hierarchy_for_prompt(get_gq_master_hierarchy())
+
+    # Cap email body to 1500 chars to stay under the model's TPM limit.
+    # The full instruction rules are ~6800 chars + hierarchy names ~120 chars.
+    # Total budget for email body: ~1500 chars to stay safely under 8000 TPM.
+    EMAIL_BODY_MAX_CHARS = 1500
+    if len(text) > EMAIL_BODY_MAX_CHARS:
+        text = text[:EMAIL_BODY_MAX_CHARS] + "\n...[Email body truncated. Key classification signals above are sufficient.]"
 
     prompt = f"""You are a precise CRM data extraction assistant for Grant Thornton Bahrain.
 {sender_context}
@@ -387,8 +769,88 @@ RULE 14 — confidence_score and confidence_level:
 - Estimate an integer confidence_score (0 to 100) based on clarity of the email and extracted fields.
 - Set confidence_level as "high" (>= 80), "medium" (50-79), or "low" (< 50).
 
+RULE 15 — GENERAL QUERY HIERARCHICAL CLASSIFICATION:
+Classify the email against the following valid CRM Master Hierarchy options:
+{gq_hierarchy_text}
+
+CRITICAL RULES FOR gq_request_type, gq_subject, and gq_query:
+
+1. "gq_request_type" MUST BE ONE OF THESE EXACT 6 NAMES:
+   - "Marketing & Business Development"
+   - "IT Support"
+   - "CRM Issues"
+   - "Finance"
+   - "Client Support"
+   - "HR"
+   (DO NOT output "Service Lead", "Estimation", "Proposal", or any other string for gq_request_type!)
+
+2. "gq_subject" MUST BE AN EXACT SUBJECT NAME FROM THE HIERARCHY UNDER THAT gq_request_type:
+   - Under "Marketing & Business Development": "Proposal Request", "EL Request", "Marketing"
+   - Under "IT Support": "General IT", "CRM", "Email related", "DMS", "Client Portal", "Tally"
+   - Under "CRM Issues": "Customer Master", "Contact Master", "Service Lead", "Proposal", "Projects", etc.
+
+3. "gq_query" MUST BE AN EXACT QUERY NAME FROM THE HIERARCHY UNDER THAT gq_subject:
+   - Under "Proposal Request": "New Proposal", "Copy of Proposal", "Others"
+   - Under "CRM" (IT Support): "Login Issue", "User Rights", "Block User", "User ID Creation", "Others"
+   - Under "Email related" (IT Support): "Bounce back email issues", "New Email ID", "Auto response", "Attachment", "Suspicious Link", "Others"
+
+MANDATORY STEP 1 — DETERMINE THE BUSINESS INTENT OF THE EMAIL BEFORE CLASSIFYING:
+Ask yourself: "Is the sender communicating a NEW BUSINESS / SALES OPPORTUNITY, or reporting a TECHNICAL SYSTEM PROBLEM?"
+
+A. SALES / BUSINESS OPPORTUNITY SIGNALS (→ MUST CLASSIFY AS "Marketing & Business Development"):
+If the email contains ANY sales or business development signals, such as:
+- new prospective client, prospective customer, new client, client interested in, client wants, client needs our services, pitched a client, business opportunity, new opportunity, implementation requirement, project requirement, budget/value mentioned, quotation request, proposal request, discovery call, meeting with prospective client, client looking to start a project, client wants to purchase/implement a service, request to prepare proposal, request to take up a new client, service requirement from a prospect.
+
+YOU MUST CLASSIFY AS:
+- gq_request_type: "Marketing & Business Development"
+- gq_subject: "Proposal Request" (for new proposal, quotation, discovery call, project implementation for a prospect)
+- gq_query: "New Proposal"
+
+CRITICAL PRODUCT VS PROBLEM DISAMBIGUATION:
+- The word "CRM" in "CRM software implementation", "CRM system for client", "custom CRM software", etc. refers to the PRODUCT/SERVICE the prospective client wants to purchase or implement. It is a SALES OPPORTUNITY → "Marketing & Business Development" → "Proposal Request" → "New Proposal". It is NOT an IT Support or CRM Issue!
+- Receiving an email about a lead/prospect is NOT an "Email related" IT Support issue! "Email related" is ONLY for technical email system delivery errors (e.g. bounce back, spam).
+
+B. TECHNICAL SUPPORT SIGNALS (→ ONLY USE "IT Support" OR "CRM Issues"):
+Classify as IT Support or CRM Issues ONLY IF the email describes an actual technical malfunction, system bug, or IT failure:
+- "Client cannot login to CRM" → "IT Support" → "CRM" → "Login Issue"
+- "CRM export to excel is broken" → "CRM Issues" → "Customer Master" → "Not able to export to excel"
+- "Email bounce back error 550" → "IT Support" → "Email related" → "Bounce back email issues"
+
+C. CRITICAL DISAMBIGUATION EXAMPLES:
+1. "We have a new prospective client interested in custom CRM software implementation... budget BHD 15,000... set up initial discovery call"
+   → gq_request_type: "Marketing & Business Development", gq_subject: "Proposal Request", gq_query: "New Proposal"
+
+2. "Client pitched for new software implementation services"
+   → gq_request_type: "Marketing & Business Development", gq_subject: "Proposal Request", gq_query: "New Proposal"
+
+3. "Inquiry regarding CRM software purchase"
+   → gq_request_type: "Marketing & Business Development", gq_subject: "Proposal Request", gq_query: "New Proposal"
+
+4. "Cannot log into CRM"
+   → gq_request_type: "IT Support", gq_subject: "CRM", gq_query: "Login Issue"
+
+STEP 2 — SELECT EXACT MATCHING HIERARCHY:
+- Match gq_request_type first, then gq_subject under that Request Type, then gq_query under that Subject.
+- Names must match EXACTLY as listed in the hierarchy above.
+- Return null if uncertain.
+
+Fields to extract for General Query classification:
+- gq_request_type: Exactly match a Request Type name from the hierarchy above, or null if uncertain.
+- gq_subject: Exactly match a Subject under that Request Type, or null if uncertain.
+- gq_query: Exactly match a Query under that Subject, or null if uncertain.
+- gq_request_type_confidence: Integer (0-100) confidence in Request Type.
+- gq_subject_confidence: Integer (0-100) confidence in Subject.
+- gq_query_confidence: Integer (0-100) confidence in Query.
+- gq_priority_confidence: Integer (0-100) confidence in Priority.
+
+STRICT CONSTRAINTS:
+- Do NOT invent Request Types, Subjects, or Queries.
+- Do NOT invent IDs.
+- Semantic understanding is required; match implied requests (e.g. "account statement" -> Receivables Management -> SOA).
+- If uncertain, return null.
+
 Return ONLY valid JSON with these exact keys:
-intent, secondary_intent, task_title, project_name, customer_name, contact_name, contact_phone, service_line_hint, task_description, sender_name, sender_designation, due_date, priority, task_tag, invoice_amount, confidence_score, confidence_level
+intent, secondary_intent, task_title, project_name, customer_name, contact_name, contact_phone, service_line_hint, task_description, sender_name, sender_designation, due_date, priority, task_tag, invoice_amount, confidence_score, confidence_level, gq_request_type, gq_subject, gq_query, gq_request_type_confidence, gq_subject_confidence, gq_query_confidence, gq_priority_confidence
 
 Email Text:
 {text}"""
@@ -455,20 +917,29 @@ Email Text:
     # }
     # -------------------------------------------------------------
 
-    # 2. Build Langchain payload (with safe prompt truncation to prevent Groq 413 TPM rate limits)
+    # 2. Build Langchain payload
+    # NOTE: Email body was already capped to 2000 chars BEFORE the prompt was assembled,
+    # so the full instruction rules (including RULE 15) are always preserved.
+    # Do NOT truncate the assembled prompt here — it would destroy the classification rules.
     from config.llm_factory import get_llm
     from langchain_core.messages import SystemMessage, HumanMessage
 
     safe_prompt = masked_prompt
-    if len(safe_prompt) > 4500:
-        safe_prompt = safe_prompt[:3000] + "\n...[Middle content truncated to comply with model token limits]...\n" + safe_prompt[-1200:]
-        
+    
     user_content = [{"type": "text", "text": safe_prompt}]
     if image_contents:
         user_content.extend(image_contents)
         
+    sys_msg_text = (
+        "You are an expert CRM AI assistant. Extract structured CRM data from the input email, "
+        "including General Query classification (gq_request_type, gq_subject, gq_query). "
+        "Respond ONLY with a valid JSON object matching the requested schema. "
+        "CRITICAL: You MUST include gq_request_type, gq_subject, and gq_query in the JSON response. "
+        "gq_request_type MUST be one of: 'Marketing & Business Development', 'IT Support', 'CRM Issues', 'Finance', 'Client Support', 'HR'. "
+        "Do NOT output any <think> tags or reasoning blocks. Your response MUST start IMMEDIATELY with '{' on line 1."
+    )
     messages = [
-        SystemMessage(content="You are an expert CRM AI assistant. Extract structured CRM data from the input email, synthesize a concise 2-3 sentence executive summary for task_description, and respond ONLY with a valid JSON object matching the requested schema. CRITICAL: Do NOT output any <think> tags, chain-of-thought, or reasoning blocks. Your response MUST start IMMEDIATELY with '{' on line 1."),
+        SystemMessage(content=sys_msg_text),
         HumanMessage(content=user_content if image_contents else safe_prompt)
     ]
     
@@ -746,12 +1217,9 @@ Email Text:
             
             import urllib.parse
             emp_id = employee_id if (employee_id and employee_id != 0) else None
-            subj_clean = (subject or 'email').strip()
-            if reference_id and str(reference_id).strip() and str(reference_id).strip().lower() != "none":
-                clean_ref_id = str(reference_id)
-            else:
-                clean_ref_id = f"email_{employee_id or 0}_{urllib.parse.quote(subj_clean)}"
-            ref_str = clean_ref_id[:255]
+            ref_str = None
+            if reference_id and str(reference_id).strip() and str(reference_id).strip().lower() not in ("none", "null", "undefined"):
+                ref_str = str(reference_id).strip()[:255]
 
             asyncio.create_task(save_ai_email_parsing_async(
                 employee_id=emp_id,
@@ -766,7 +1234,7 @@ Email Text:
                 file_extension=ext,
                 confidence_score=conf_score_val,
                 confidence_level=conf_level_val,
-                processing_status="SUCCESS",
+                processing_status="PENDING",
                 processing_time_ms=proc_time_ms
             ))
 
@@ -1233,23 +1701,23 @@ def evaluate_manual_review_conditions(parsed: dict) -> dict:
 
 def build_general_query_mapping(parsed: dict) -> dict:
     """
-    Builds pre-filled UI chip parameters and redirection metadata
-    matching MGeneralRequestType, MSubject, MGeneralIssue, and Project schema.
+    Dynamically classifies incoming email content into CRM General Query master data hierarchy:
+    Request Type -> Subject -> Query (Issue)
+    Using dynamic DB lookup, hierarchy validation, field-level confidence thresholds (0.85 default),
+    and conditional entity resolution. Zero hardcoded if/elif classification rules.
     """
-    intent = str(parsed.get("intent") or "").strip().lower()
-    task_description = str(parsed.get("task_description") or "").strip()
-    task_title = str(parsed.get("task_title") or "").strip()
-    priority = str(parsed.get("priority") or "Medium").strip().capitalize()
-    project_name = parsed.get("project_name")
+    CONFIDENCE_THRESHOLD = 0.85
+    MEDIUM_THRESHOLD = 0.70
 
-    desc_lower = task_description.lower()
-    title_lower = task_title.lower()
+    # 1. Fetch dynamic master hierarchy from DB
+    hierarchy = get_gq_master_hierarchy()
 
-    # 1. Determine Request Type, Subject, and Query based on intent, title & description
-    req_type_name = "Client Support"
-    subject_name = "Other Admin Support"
-    query = "Others"
+    # 2. Extract LLM raw hints and field-level confidence ratings
+    raw_req_name = parsed.get("gq_request_type")
+    raw_sub_name = parsed.get("gq_subject")
+    raw_query_name = parsed.get("gq_query")
 
+<<<<<<< HEAD
     if "leave" in intent or "vacation" in intent or "day off" in intent or "leave" in desc_lower or "leave" in title_lower:
         req_type_name = "HR"
         subject_name = "Leave Request"
@@ -1302,49 +1770,229 @@ def build_general_query_mapping(parsed: dict) -> dict:
             query = "Issues with records not getting displayed properly"
         else:
             query = "Others"
-    else:
-        # Default under Client Support
-        req_type_name = "Client Support"
-        if "delivery" in desc_lower or "deliver" in desc_lower or "schedule" in desc_lower or "status" in desc_lower:
-            subject_name = "Report Delivery"
-            query = "Delivery Schedule" if "schedule" in desc_lower else "Delivery Status"
-        elif "deliverable" in desc_lower or "report" in desc_lower:
-            subject_name = "Deliverables"
-            if "copy" in desc_lower:
-                query = "Copy of Report"
-            elif "change" in desc_lower:
-                query = "Change in Report"
-            elif "issue" in desc_lower:
-                query = "Issue Report"
-            else:
-                query = "Others"
-        elif "create project" in desc_lower or "new project" in desc_lower or "project" in desc_lower:
-            subject_name = "Project Related"
-            query = "Create Project" if "create" in desc_lower or "new" in desc_lower else "Others"
-        else:
-            subject_name = "Other Admin Support"
-            query = "Others"
+=======
+    # 2b. Semantic Intent Disambiguation Fallback if raw hints are missing or invalid
+    req_clean_test = str(raw_req_name or "").strip().lower()
+    valid_req_names = ["marketing & business development", "it support", "crm issues", "finance", "client support", "hr"]
+    if not raw_req_name or req_clean_test in ["none", "null", "undefined", ""] or req_clean_test not in valid_req_names:
+        combined_text = (
+            f"{parsed.get('intent') or ''} {parsed.get('task_title') or ''} "
+            f"{parsed.get('task_description') or ''} {parsed.get('service_line_hint') or ''} "
+            f"{raw_req_name or ''} {raw_sub_name or ''} {raw_query_name or ''}"
+        ).lower()
+        
+        sales_signals = [
+            "prospective", "prospect", "new client", "discovery call", "proposal",
+            "quotation", "pitched", "budget", "implementation requirement", "new lead",
+            "service lead", "estimation", "business opportunity", "seeking services"
+        ]
+        login_signals = ["login", "access denied", "password", "can't login", "cannot login", "block user"]
+        email_signals = ["bounce back", "email delivery", "550", "bouncing", "email failure", "emails bouncing"]
+        crm_export_signals = ["export", "cannot export", "not able to export", "excel error", "customer master"]
+        
+        if any(sig in combined_text for sig in sales_signals) and not any(sig in combined_text for sig in login_signals + email_signals + crm_export_signals):
+            raw_req_name = "Marketing & Business Development"
+            raw_sub_name = "Proposal Request"
+            raw_query_name = "New Proposal"
+        elif any(sig in combined_text for sig in login_signals):
+            raw_req_name = "IT Support"
+            raw_sub_name = "CRM"
+            raw_query_name = "Login Issue"
+        elif any(sig in combined_text for sig in email_signals):
+            raw_req_name = "IT Support"
+            raw_sub_name = "Email related"
+            raw_query_name = "Bounce back email issues"
+        elif any(sig in combined_text for sig in crm_export_signals):
+            raw_req_name = "CRM Issues"
+            raw_sub_name = "Customer Master"
+            raw_query_name = "Not able to export to excel"
 
-    # Evaluate manual review conditions from top-level parsed object
-    requires_manual_review = parsed.get("requires_manual_review", False)
-    manual_review_notice = parsed.get("manual_review_notice")
-    manual_review_reasons = parsed.get("manual_review_reasons", [])
+    def _clean_conf(val: Any, default: float = 0.90) -> float:
+        if val is None:
+            return default
+        try:
+            f = float(val)
+            if f > 1.0:
+                f = f / 100.0
+            if f < 0.5:
+                return default
+            return max(0.0, min(1.0, f))
+        except (ValueError, TypeError):
+            return default
+
+    conf_req_raw = _clean_conf(parsed.get("gq_request_type_confidence"), 0.90)
+    conf_sub_raw = _clean_conf(parsed.get("gq_subject_confidence"), 0.88)
+    conf_query_raw = _clean_conf(parsed.get("gq_query_confidence"), 0.85)
+    conf_prio_raw = _clean_conf(parsed.get("gq_priority_confidence"), 0.90)
+
+    # 3. Validate hierarchy against CRM master database
+    verified_req, verified_sub, verified_query = validate_gq_hierarchy(
+        raw_req_name, raw_sub_name, raw_query_name, hierarchy
+    )
+
+    reasons = list(parsed.get("manual_review_reasons") or [])
+
+    # 4. Request Type Evaluation
+    req_type_id = None
+    req_type_name = None
+    field_conf_req = conf_req_raw if verified_req else 0.0
+
+    if not verified_req:
+        reasons.append("Request Type could not be matched against CRM master data.")
+    elif field_conf_req < CONFIDENCE_THRESHOLD and field_conf_req < MEDIUM_THRESHOLD:
+        reasons.append(f"Request Type classification confidence ({int(field_conf_req*100)}%) is below threshold.")
+>>>>>>> origin/main
+    else:
+        req_type_id = verified_req["id"]
+        req_type_name = verified_req["name"]
+
+    # 5. Subject Evaluation
+    sub_id = None
+    subject_name = None
+    field_conf_sub = conf_sub_raw if (verified_sub and req_type_id) else 0.0
+
+    if not req_type_id:
+        pass  # Cannot populate Subject if Request Type failed
+    elif not verified_sub:
+        reasons.append("Subject could not be matched under selected Request Type.")
+    elif field_conf_sub < CONFIDENCE_THRESHOLD and field_conf_sub < MEDIUM_THRESHOLD:
+        reasons.append(f"Subject classification confidence ({int(field_conf_sub*100)}%) is below threshold.")
+    else:
+        sub_id = verified_sub["id"]
+        subject_name = verified_sub["name"]
+
+    # 6. Query Evaluation
+    issue_id = None
+    query_name = None
+    field_conf_query = conf_query_raw if (verified_query and sub_id) else 0.0
+
+    if not sub_id:
+        pass  # Cannot populate Query if Subject failed
+    elif not verified_query:
+        reasons.append("Query could not be matched under selected Subject.")
+    elif field_conf_query < CONFIDENCE_THRESHOLD and field_conf_query < MEDIUM_THRESHOLD:
+        reasons.append(f"Query classification confidence ({int(field_conf_query*100)}%) is below threshold.")
+    else:
+        issue_id = verified_query["id"]
+        query_name = verified_query["name"]
+
+    # 7. Priority Resolution
+    priority_raw = str(parsed.get("priority") or "Medium").strip().capitalize()
+    if priority_raw not in ["Low", "Medium", "High"]:
+        priority_raw = "Medium"
+    field_conf_prio = conf_prio_raw
+
+    # 8. Conditional Entity Resolution
+    entities = resolve_general_query_entities(parsed, req_type_id, sub_id, issue_id)
+    customer_id = entities.get("customer_id")
+    customer_name = entities.get("customer_name")
+    project_id = entities.get("project_id")
+    proposal_id = entities.get("proposal_id")
+    saleslead_id = entities.get("saleslead_id")
+
+    # Evaluate Customer Confidence & Reasons
+    cust_status = parsed.get("customer_lookup_status", "NOT_FOUND")
+    if cust_status == "FOUND" and customer_id:
+        field_conf_cust = 0.95
+    elif cust_status == "MULTIPLE_MATCHES":
+        field_conf_cust = 0.40
+        reasons.append("Multiple customer matches found in CRM database. Manual selection required.")
+    else:
+        field_conf_cust = 0.50 if customer_name else None
+        if customer_name and not customer_id:
+            reasons.append("Customer name could not be verified in the CRM database.")
+
+    # Evaluate Project Confidence & Reasons
+    proj_status = entities.get("project_status", "NOT_APPLICABLE")
+    if proj_status == "FOUND" and project_id:
+        field_conf_proj = 0.95
+    elif proj_status == "MULTIPLE_MATCHES":
+        field_conf_proj = 0.40
+        reasons.append("Multiple project matches found for this customer. Manual selection required.")
+    elif proj_status == "NOT_FOUND":
+        field_conf_proj = 0.50
+        reasons.append("Specified project was not found in CRM database.")
+    else:
+        field_conf_proj = None
+
+    # Evaluate Proposal Confidence & Reasons
+    prop_status = entities.get("proposal_status", "NOT_APPLICABLE")
+    if prop_status == "FOUND" and proposal_id:
+        field_conf_prop = 0.95
+    elif prop_status == "MULTIPLE_MATCHES":
+        field_conf_prop = 0.40
+        reasons.append("Multiple active proposals found for customer. Manual selection required.")
+    elif prop_status == "NOT_FOUND":
+        field_conf_prop = 0.50
+    else:
+        field_conf_prop = None
+
+    # Evaluate Sales Lead Confidence & Reasons
+    lead_status = entities.get("saleslead_status", "NOT_APPLICABLE")
+    if lead_status == "FOUND" and saleslead_id:
+        field_conf_lead = 0.95
+    elif lead_status == "MULTIPLE_MATCHES":
+        field_conf_lead = 0.40
+        reasons.append("Multiple active sales leads found for customer. Manual selection required.")
+    elif lead_status == "NOT_FOUND":
+        field_conf_lead = 0.50
+    else:
+        field_conf_lead = None
+
+    # 9. Verify Minimum Extracted Fields (< 3 fields filled)
+    filled_fields_count = len([f for f in [req_type_id, sub_id, issue_id, customer_id, project_id, proposal_id, saleslead_id] if f is not None])
+    if filled_fields_count < 3:
+        reasons.append("Limited details extracted from email (fewer than 3 key CRM fields verified).")
+
+    # Deduplicate reasons
+    unique_reasons = []
+    for r in reasons:
+        if r not in unique_reasons:
+            unique_reasons.append(r)
+
+    manual_review_required = len(unique_reasons) > 0
+
+    sub_detail = str(parsed.get("task_description") or "").strip()
+
+    field_confidence = {
+        "request_type": field_conf_req if req_type_id else (field_conf_req if field_conf_req > 0 else None),
+        "subject": field_conf_sub if sub_id else (field_conf_sub if field_conf_sub > 0 else None),
+        "query": field_conf_query if issue_id else (field_conf_query if field_conf_query > 0 else None),
+        "priority": field_conf_prio,
+        "customer": field_conf_cust,
+        "project": field_conf_proj,
+        "proposal": field_conf_prop,
+        "service_lead": field_conf_lead
+    }
 
     mapping = {
+        "req_type_id": req_type_id,
         "req_type_name": req_type_name,
+        "req_id": req_type_id,
+
+        "sub_id": sub_id,
         "subject_name": subject_name,
-        "query": query,
-        "priority": priority if priority in ["Low", "Medium", "High"] else "Medium",
-        "sub_detail": task_description,
-        "project_name": project_name,
-        "project_id": parsed.get("matched_project_id") or parsed.get("project_id"),
-        "customer_name": parsed.get("customer_name"),
-        "customer_id": parsed.get("db_customer_id") or parsed.get("customer_id"),
-        "field_count": len([f for f in [req_type_name, subject_name, query, project_name, parsed.get("customer_name"), task_description] if f]),
-        "insufficient_info": requires_manual_review,
-        "insufficient_message": manual_review_notice,
-        "manual_review_reasons": manual_review_reasons
+        "subject_id": sub_id,
+
+        "issue_id": issue_id,
+        "query": query_name,
+
+        "priority": priority_raw,
+        "sub_detail": sub_detail,
+
+        "project_id": project_id,
+        "customer_id": customer_id,
+        "customer_name": customer_name,
+        "proposal_id": proposal_id,
+        "saleslead_id": saleslead_id,
+
+        "field_confidence": field_confidence,
+        "insufficient_info": manual_review_required,
+        "insufficient_message": "Partial AI Auto-Fill: Some query fields could not be verified automatically. Please review and complete the remaining details manually." if manual_review_required else None,
+        "manual_review_required": manual_review_required,
+        "manual_review_reasons": unique_reasons
     }
+<<<<<<< HEAD
     
     intent_clean = intent.lower()
     if any(k in intent_clean for k in ["service lead", "lead", "proposal", "pitch", "estimation"]):
@@ -1364,6 +2012,15 @@ def build_general_query_mapping(parsed: dict) -> dict:
             "yes": {
                 "label": "Yes",
                 "redirect_to": target_route,
+=======
+
+    redirection_prompt = {
+        "message": mapping["insufficient_message"] if manual_review_required else "Do you want to redirect to General Query for this task?",
+        "options": {
+            "yes": {
+                "label": "Yes",
+                "redirect_to": "/self-services/general-queries/add",
+>>>>>>> origin/main
                 "auto_fill_filters": True,
                 "description": f"Redirects to {target_name} page with pre-filled AI details."
             },
@@ -1388,5 +2045,6 @@ def build_general_query_mapping(parsed: dict) -> dict:
         "redirection_prompt": redirection_prompt,
         "notification_badge": notification_badge
     }
+
 
 
