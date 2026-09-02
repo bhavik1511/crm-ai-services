@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 # Automatically load environment variables from .env
 load_dotenv()
 
-def get_llm(model_name: Optional[str] = None, temperature: float = 0.0, max_tokens: Optional[int] = None, is_vision: bool = False):
+def get_llm(model_name: Optional[str] = None, temperature: float = 0.0, max_tokens: Optional[int] = None, is_vision: bool = False, reasoning_effort: Optional[str] = None):
     """
     LLM Factory driven 100% by .env variables.
     Reads LLM_PROVIDER, LLM_MODEL, and LLM_API_KEY directly from .env without hardcoded model defaults.
@@ -25,6 +25,8 @@ def get_llm(model_name: Optional[str] = None, temperature: float = 0.0, max_toke
     kwargs = {"temperature": temperature}
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
+    if reasoning_effort is not None:
+        kwargs["reasoning_effort"] = reasoning_effort
 
     print(f"[DEBUG LLM_FACTORY] Provider: '{provider}' | Model: '{model_name}'")
 

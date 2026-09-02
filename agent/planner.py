@@ -14,8 +14,6 @@ from dataclasses import dataclass
 
 # LangChain imports for dynamic structured output
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
-from langchain_groq import ChatGroq
 
 from .entity_resolver import resolve_entities
 from .execution_validator import validate_execution

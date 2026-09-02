@@ -4,7 +4,7 @@ Reads the REAL database schema live (cached in memory after first load).
 Zero hardcoded column lists — everything comes from the actual DB.
 """
 
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional, Set, Any
 import logging
 
 logger = logging.getLogger(__name__)
@@ -38,12 +38,23 @@ def _load_live_schema():
         logger.warning(f"[SchemaIndex] Live schema load failed, using fallback: {e}")
 
 
-def _fmt_table(table_name: str) -> str:
-    """Format one table as 'tablename(col1, col2, ...)'."""
+TECHNICAL_COLS_TO_SKIP = {
+    "created_by", "updated_by", "deleted_at", "updated_at", "is_deleted",
+    "emp_emergency_contact", "emp_gosi_number", "emp_passport_no", "emp_passport_expiry_date",
+    "emp_visa_no", "emp_visa_expiry_date", "emp_cpr_no", "emp_cpr_expiry_date",
+    "emp_photo", "signature", "password", "token", "hash"
+}
+
+
+def _fmt_table(table_name: str, is_primary: bool = True) -> str:
+    """Format one table as 'tablename(col1, col2, ...)', omitting internal technical bloat."""
     cols = _LIVE_SCHEMA_CACHE.get(table_name, [])
     if not cols:
         return f"{table_name}(/* columns unknown */)"
-    return f"{table_name}({', '.join(cols)})"
+    filtered_cols = [c for c in cols if c not in TECHNICAL_COLS_TO_SKIP]
+    if not is_primary and len(filtered_cols) > 18:
+        filtered_cols = filtered_cols[:18]
+    return f"{table_name}({', '.join(filtered_cols)})"
 
 
 # ---------------------------------------------------------------------------
@@ -267,83 +278,65 @@ _KEYWORD_MAP: List[Dict] = [
 
 
 # ---------------------------------------------------------------------------
-# SQL RULES — injected into every SQL prompt
+# ---------------------------------------------------------------------------
+# INTENT & TECHNICAL COLUMN MAPPING FOR OPTIMIZED PROMPTS
 # ---------------------------------------------------------------------------
 
-SQL_RULES = """
-CRITICAL SQL RULES:
+INTENT_TABLE_MAP: Dict[str, tuple] = {
+    "receivables": (["invoice", "receipt_details", "receipts", "credit_note"], ["customers", "m_serviceline", "employees", "m_invoice_status"]),
+    "revenue": (["invoice", "invoice_details"], ["customers", "employees", "m_serviceline", "m_invoice_status"]),
+    "resource_utilization": (["emp_payroll_timesheet", "timesheet_project", "ts_project_date"], ["employees", "projects", "m_serviceline", "m_department"]),
+    "project_summary": (["projects", "m_project_status"], ["customers", "employees", "m_serviceline", "project_tasks"]),
+    "proposals": (["proposal", "m_proposal_status"], ["customers", "employees", "m_serviceline", "projects"]),
+    "saleslead": (["saleslead", "m_leadstatus"], ["employees", "customers", "m_serviceline"]),
+    "leave_request": (["leave_request", "m_leave_status", "employee_leave_balance"], ["employees", "m_department"]),
+    "employee": (["employees", "m_department", "m_designation"], ["employee_salary_details"]),
+    "customer": (["customers", "customer_contact_details"], ["contacts", "m_industry_type"]),
+}
+
+
+
+# ---------------------------------------------------------------------------
+# SQL RULES — modularized to reduce input prompt bloat
+# ---------------------------------------------------------------------------
+
+BASE_SQL_RULES = """CRITICAL SQL RULES:
 - Return EXACTLY ONE SELECT query. No semicolons separating multiple queries.
-- ROUND all decimals to 2 places.
-- LIMIT 1000 for receivable/export queries. LIMIT 50 for all other large result sets.
-- Currency is BHD (Bahraini Dinar).
-- Use lead_date for saleslead date filters (NOT created_at).
-- Use created_at for invoice / proposal / project / job_estimation date filters.
-- projects.status_id -> m_project_status (NOT project_status_id).
-- job_estimation.status_id -> m_jobestimation_status.
-- proposal.project_id IS NULL means the proposal is still open/pending.
-- project_tasks.status is a string (e.g. 'To Do', 'In Progress', 'Finished').
-- For "pending tasks", filter by project_tasks.status != 'Finished'. DO NOT add date filters unless explicitly requested.
-- For open leads: JOIN m_leadstatus ON saleslead.lead_status_id = m_leadstatus.id WHERE m_leadstatus.name = 'Open'.
-- For untouched leads: use saleslead.updated_at < DATE_SUB(CURDATE(), INTERVAL 6 MONTH).
-- When filtering by name, ALWAYS use LIKE '%name%' to handle spacing/typo issues in the DB.
-- For leave balance: query employee_leave_balance table (columns: employee_id, leave_type_id, balance, year).
-- For payroll: query emp_payroll table (employee_id, month, year, basic_salary, total_allowances, total_deductions, net_salary).
-- For salary: query employee_salary_details or employees (emp_basic_salary, emp_gross_salary).
+- ROUND all decimals to 2 places. Currency is BHD (Bahraini Dinar).
+- LIMIT 1000 for receivable/export queries. LIMIT 50 for all other query result sets.
+- Date filters: saleslead uses lead_date. invoice / proposal / project / job_estimation / leave_request use created_at.
+- Status joins: projects.status_id -> m_project_status.id | job_estimation.status_id -> m_jobestimation_status.id.
+- Foreign keys: invoice.client_name_id -> customers.id | projects.client -> customers.id | projects.manager -> employees.id | projects.partner -> employees.id | saleslead.lead_owner -> employees.id.
+- proposal.project_id IS NULL means proposal is still open/pending.
+- project_tasks.status is string ('To Do', 'In Progress', 'Finished'). Pending tasks: status != 'Finished'.
+- Name filtering: ALWAYS use LIKE '%name%' (case-insensitive substring match).
+- Leave balance: employee_leave_balance (employee_id, leave_type_id, balance, year).
+- Payroll: emp_payroll (employee_id, month, year, basic_salary, total_allowances, total_deductions, net_salary).
+- Salary: employee_salary_details or employees (emp_basic_salary, emp_gross_salary).
+- If asked for two numbers, use conditional aggregation or UNION ALL — never two separate queries."""
 
---- RESOURCE UTILIZATION QUERY TEMPLATE ---
--- The Resource Utilization Report dashboard uses timesheet_project AND ts_project_date.
--- CRITICAL RULES — follow all of these exactly:
---   1. ALWAYS filter status_id = 3 (Approved timesheets only; pending/draft have status_id 1 or 2).
---   2. Hours are stored in the child table `ts_project_date.hours` (TIME column 'HH:MM:SS').
---      Convert to decimal hours with: SUM(TIME_TO_SEC(tpd.hours)) / 3600
---      Format back to HH:MM:SS with: SEC_TO_TIME(SUM(TIME_TO_SEC(tpd.hours)))
---   3. Date range: filter on ACTUAL work date `tpd.project_date BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'`
---      (DO NOT filter on timesheet_project.created_at)
---   4. Group by employee_id, project_id — matches the dashboard report grouping.
---
--- Template: hours per employee per project for a date range
-SEEK_EXAMPLE:
-  SELECT
-    e.employee_name,
-    p.name AS project_name,
-    SEC_TO_TIME(SUM(TIME_TO_SEC(tpd.hours))) AS total_hrs_formatted,
-    ROUND(SUM(TIME_TO_SEC(tpd.hours)) / 3600, 2) AS total_hours
-  FROM timesheet_project tp
-  JOIN ts_project_date tpd ON tp.id = tpd.timesheet_id
-  JOIN employees e ON tp.employee_id = e.id
-  JOIN projects p  ON tp.project_id  = p.id
-  WHERE tp.status_id = 3
-    AND tpd.project_date BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'
-    AND e.employee_name LIKE '%{employee_name}%'
-  GROUP BY e.id, e.employee_name, p.id, p.name
-  ORDER BY total_hours DESC
-  LIMIT 50;
+RESOURCE_UTILIZATION_TEMPLATE = """--- RESOURCE UTILIZATION QUERY TEMPLATE ---
+-- Timesheet hours stored in ts_project_date.hours (TIME column 'HH:MM:SS').
+-- ALWAYS filter tp.status_id = 3 (Approved timesheets only).
+-- Convert to decimal hours: SUM(TIME_TO_SEC(tpd.hours)) / 3600
+-- Date range filter on tpd.project_date BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'.
+SELECT
+  e.employee_name,
+  p.name AS project_name,
+  SEC_TO_TIME(SUM(TIME_TO_SEC(tpd.hours))) AS total_hrs_formatted,
+  ROUND(SUM(TIME_TO_SEC(tpd.hours)) / 3600, 2) AS total_hours
+FROM timesheet_project tp
+JOIN ts_project_date tpd ON tp.id = tpd.timesheet_id
+JOIN employees e ON tp.employee_id = e.id
+JOIN projects p  ON tp.project_id  = p.id
+WHERE tp.status_id = 3
+  AND tpd.project_date BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'
+  AND e.employee_name LIKE '%{employee_name}%'
+GROUP BY e.id, e.employee_name, p.id, p.name
+ORDER BY total_hours DESC
+LIMIT 50;"""
 
--- For employee-level summary (total hours across all projects):
-  SELECT
-    e.employee_name,
-    ROUND(SUM(TIME_TO_SEC(tpd.hours)) / 3600, 2) AS total_hours
-  FROM timesheet_project tp
-  JOIN ts_project_date tpd ON tp.id = tpd.timesheet_id
-  JOIN employees e ON tp.employee_id = e.id
-  WHERE tp.status_id = 3
-    AND tpd.project_date BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'
-  GROUP BY e.id, e.employee_name
-  ORDER BY total_hours DESC
-  LIMIT 50;
---- END RESOURCE UTILIZATION TEMPLATE ---
-- invoice.client_name_id -> customers.id (NOT invoice.client_id).
-- receipt_details.client_id -> customers.id.
-- projects.client -> customers.id (NOT projects.client_id).
-- projects.incharge -> employees.id | projects.partner -> employees.id.
-- saleslead.lead_owner -> employees.id.
-- leave_request.status_id -> m_leave_status.id.
-- leave_request.leave_type_id -> m_leave_request_type.id.
-- customer_contact_details.customer_id -> customers.id.
-- NEVER use columns that don't exist in the schema provided. If unsure, SELECT only the columns listed.
-- If asked for two numbers, use conditional aggregation or UNION ALL — never two separate queries.
-
---- FILTERED RECEIVABLE REPORT TEMPLATE ---
+RECEIVABLE_TEMPLATE = """--- FILTERED RECEIVABLE REPORT TEMPLATE ---
 SELECT
   DATE_FORMAT(i.created_at, '%d-%m-%Y') AS invoice_date,
   i.invoice_no AS reference_no,
@@ -374,10 +367,28 @@ WHERE i.is_active = 1
   AND (i.total_net_amount
        - COALESCE((SELECT SUM(rd.applied_amount) FROM receipt_details rd WHERE rd.invoice_id = i.id), 0)
        - COALESCE((SELECT SUM(cn.total_amount)   FROM credit_note cn   WHERE cn.invoice_id = i.id), 0)) > 0
-HAVING 1=1
 ORDER BY i.created_at DESC
-LIMIT 1000
-"""
+LIMIT 1000"""
+
+# Backwards compatibility alias
+SQL_RULES = BASE_SQL_RULES
+
+
+def get_sql_rules_for_question(question: str, intent: Optional[Any] = None) -> str:
+    """Returns concise SQL rules and injects specific templates ONLY when relevant."""
+    q_lower = question.lower()
+    metric_type = str(getattr(intent, "metric_type", "") or "").lower()
+
+    rules = [BASE_SQL_RULES]
+
+    if metric_type in ("resource_utilization", "timesheet") or any(kw in q_lower for kw in ["utilization", "utilisation", "timesheet", "billable hours"]):
+        rules.append(RESOURCE_UTILIZATION_TEMPLATE)
+
+    if metric_type in ("receivables", "revenue", "aging") or any(kw in q_lower for kw in ["receivable", "aging", "ageing", "overdue", "outstanding"]):
+        rules.append(RECEIVABLE_TEMPLATE)
+
+    return "\n\n".join(rules)
+
 
 FISCAL_YEAR_HEADER = """FISCAL YEAR:
 Current FY: {fy_start} to {fy_end}
@@ -390,32 +401,46 @@ Quarters: Q1=Oct-Dec, Q2=Jan-Mar, Q3=Apr-Jun, Q4=Jul-Sep.
 # PUBLIC API
 # ---------------------------------------------------------------------------
 
-def get_schema_for_question(question: str) -> str:
+def get_schema_for_question(question: str, intent: Optional[Any] = None) -> str:
     """
     Returns a compact schema string for the given question.
-    - Loads the LIVE schema from DB on first call.
-    - Selects only relevant tables via keyword matching.
-    - Falls back to FULL schema if no keywords match.
+    - Uses intent metadata if available for precise table selection.
+    - Matches question keywords against _KEYWORD_MAP.
+    - Omits non-queryable internal technical columns to reduce prompt bloat.
     """
     _load_live_schema()
 
     q_lower = question.lower()
-    selected: Set[str] = set()
+    metric_type = str(getattr(intent, "metric_type", "") or "").lower()
 
+    primary_set: Set[str] = set()
+    buffer_set: Set[str] = set()
+
+    # 1. Check intent-based table mapping
+    if metric_type and metric_type in INTENT_TABLE_MAP:
+        p, b = INTENT_TABLE_MAP[metric_type]
+        primary_set.update(p)
+        buffer_set.update(b)
+
+    # 2. Check keyword matching
     for entry in _KEYWORD_MAP:
         if any(kw in q_lower for kw in entry["keywords"]):
-            selected.update(entry["primary"])
-            selected.update(entry["buffer"])
+            primary_set.update(entry["primary"])
+            buffer_set.update(entry["buffer"])
 
-    # Smart fallback: if nothing matched, use ALL tables from live schema
-    if not selected:
-        selected = set(_LIVE_SCHEMA_CACHE.keys())
+    # 3. Smart fallback: if no tables selected, use core CRM tables
+    if not primary_set:
+        primary_set = {"customers", "employees", "projects", "invoice", "proposal", "saleslead"}
+        buffer_set = {"m_serviceline", "m_department", "m_project_status"}
+
+    selected = primary_set.union(buffer_set)
 
     # Build schema string
     lines = ["RELEVANT TABLES & COLUMNS (from live database):"]
     for tbl in sorted(selected):
         if tbl in _LIVE_SCHEMA_CACHE:
-            lines.append(f"- {_fmt_table(tbl)}")
+            is_p = tbl in primary_set
+            lines.append(f"- {_fmt_table(tbl, is_primary=is_p)}")
 
     # Add key join hints for selected tables
     joins = _get_joins_for_tables(selected)

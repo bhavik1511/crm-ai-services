@@ -11,11 +11,10 @@ from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 from sqlalchemy import text
-from openai import AsyncOpenAI
 from db.database import get_db_engine
 
 # LangChain / LangGraph Imports
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_openai import OpenAIEmbeddings
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 from langgraph.graph import StateGraph, END
@@ -122,7 +121,6 @@ def _looks_like_sql_write_attempt(user_text: str) -> bool:
 
 
 
-_client: AsyncOpenAI | None = None
 GROQ_PRIMARY_MODEL = os.getenv("LLM_MODEL") or os.getenv("PRIMARY_MODEL")
 GROQ_FALLBACK_MODEL = os.getenv("FAST_MODEL") or os.getenv("LLM_MODEL")
 try:
@@ -149,12 +147,6 @@ from config.llm_factory import get_llm
 
 def _build_llm(model_name: Optional[str] = None, temperature: float = 0.0, max_tokens: Optional[int] = None):
     return get_llm(model_name=model_name, temperature=temperature, max_tokens=max_tokens)
-
-def _get_client():
-    global _client
-    if _client is None:
-        _client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    return _client
 
 
 # ---------------------------------------------------------------------------
@@ -463,7 +455,7 @@ async def ad_hoc_sql_query(question: str) -> str:
     try:
         from db.database import get_db_engine
         from sqlalchemy import text
-        from config.schema_index import get_schema_for_question, SQL_RULES, FISCAL_YEAR_HEADER
+        from config.schema_index import get_schema_for_question, get_sql_rules_for_question, FISCAL_YEAR_HEADER
         import asyncio
         import json
         import re
@@ -488,8 +480,9 @@ async def ad_hoc_sql_query(question: str) -> str:
             # DB-verified SQL — skip LLM generation entirely, zero hallucination
             raw_sql = verified_sql
         else:
-            # ── Step 1: Dynamic Schema Retrieval (<1ms, zero LLM call) ───────
-            compact_schema = get_schema_for_question(question)
+            # ── Step 1: Dynamic Schema & Rules Retrieval (<1ms, zero LLM call) 
+            compact_schema = get_schema_for_question(question, intent=_intent)
+            sql_rules = get_sql_rules_for_question(question, intent=_intent)
             fy_header = FISCAL_YEAR_HEADER.format(
                 fy_start=fy_info['fy_start'],
                 fy_end=fy_info['fy_end']
@@ -508,7 +501,7 @@ Given a question, write EXACTLY ONE SELECT query. Return ONLY raw SQL — no mar
 
 {compact_schema}
 
-{SQL_RULES}
+{sql_rules}
 
 QUERY CONTEXT (from intent parser — USE THIS to pick the right tables and WHERE filters):
 {context_hint}
@@ -546,7 +539,7 @@ SQL:"""
             system_prompt += "\n\nReturn ONLY the raw SQL string. No markdown."
 
             # ── Step 4: SQL Generation ─────
-            sql_llm = _build_llm(model_name=GROQ_PRIMARY_MODEL, temperature=0, max_tokens=400)
+            sql_llm = _build_llm(model_name=GROQ_PRIMARY_MODEL, temperature=0, max_tokens=1500)
             sql_resp = await sql_llm.ainvoke([{"role": "system", "content": system_prompt}])
 
             raw_sql = sql_resp.content.strip()

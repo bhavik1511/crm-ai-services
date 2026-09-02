@@ -2711,7 +2711,9 @@ async def extract_email_task(request: EmailTaskRequest):
         # 4b. Pre-check for duplicate Message ID BEFORE calling cloud LLM
         if resolved_ref_id and not str(resolved_ref_id).startswith("draft_"):
             dup_result = check_duplicate_message_id(resolved_ref_id)
-            has_valid_customer = dup_result and dup_result.get("customer_name") and "information for your" not in str(dup_result.get("customer_name")).lower()
+            c_name_stale = str(dup_result.get("customer_name") or "").lower() if dup_result else ""
+            is_stale_customer = any(p in c_name_stale for p in ["information for your", "for bps", "for the new client", "contact information", "take up"]) or c_name_stale.startswith("for ")
+            has_valid_customer = dup_result and dup_result.get("customer_name") and not is_stale_customer
             if dup_result and has_valid_customer:
                 print(f"[extract_email_task] Valid duplicate Message ID detected: {resolved_ref_id}. Skipping LLM.")
                 dup_result["sender_type"] = sender_type

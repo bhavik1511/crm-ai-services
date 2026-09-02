@@ -673,8 +673,6 @@ def extract_entities_with_llm(
     
     forwarded_note = 'NOTE: This is a FORWARDED email. The "=== FULL EMAIL THREAD ===" section contains the REAL content. The task should typically be assigned to whoever was in the "Forwarded to:" field.' if is_forwarded else ""
 
-    gq_hierarchy_text = format_gq_hierarchy_for_prompt(get_gq_master_hierarchy())
-
     # Cap email body to 1500 chars to stay under the model's TPM limit.
     # The full instruction rules are ~6800 chars + hierarchy names ~120 chars.
     # Total budget for email body: ~1500 chars to stay safely under 8000 TPM.
@@ -689,167 +687,66 @@ def extract_entities_with_llm(
 CRITICAL RULES:
 
 RULE 0 — DO NOT HALLUCINATE:
-- The examples in these rules are purely for format illustration. DO NOT copy them unless they actually appear in the email.
-- If a field is not clearly present in the email, return null for that field.
+- If a field is not present in the email, return null for that field. Do not copy illustration examples.
 
 RULE 1 — project_name:
-- Search BOTH the email subject line and email body text for project names, system names, or engagement titles (e.g. "full ERP implementation", "Company XYZ_Audit", "ERP Implementation for Global Logistics Corp").
-- Strip testing/subject prefixes like "(Testing)", "Action Required:", "FW:", "RE:". If a project or system implementation is named (e.g. "full ERP implementation"), extract it as project_name!
-- Short abbreviations like "BPS", "VAT", "MIS", "CBB" are services, NOT project names. Set null.
-- For Leave Request or HR emails, set null.
+- Extract project names, system implementations (e.g. "ERP Implementation"), or engagement titles from subject/body. Strip prefixes (FW:, RE:, Action Required:). Ignore short service abbreviations (BPS, VAT, MIS, CBB). Set null for Leave/HR requests.
 
 RULE 2 — customer_name:
-- You MUST extract the COMPANY or ORGANIZATION name if present.
-- CRITICAL: Search BOTH the email subject line and email body text for company/customer names. Strip testing/subject prefixes like "(Testing)", "Action Required:", "FW:", "RE:", "Hi Sahil,". For example, if subject or body mentions "Proposal Sent for Global Logistics Corp", extract "Global Logistics Corp" as customer_name!
-- If no company name is found, but a client/prospect person's name is mentioned, extract that person's name as the customer_name (e.g., "Mr. Usama").
-- For Leave Request or HR Request emails, set null.
-- NEVER extract the email recipient (e.g. "Dear Mr. Arpit"), internal colleagues, or internal firm network names ("Grant Thornton", "GT Bahrain", "GT Oman", "Grant Thornton Oman") as a customer. Internal firm names are NOT client customers!
+- Extract company/organization name from subject/body. If no company name is found, extract client/prospect person name. If multiple companies are present, return an array of strings ["Company A", "Company B"].
+- NEVER extract internal firm network names ("Grant Thornton", "GT Bahrain", "GT Oman") or internal recipients. Set null for Leave/HR requests.
 
 RULE 3 — contact_name and contact_phone:
-- Extract contact_name if the email mentions a third-party client contact or prospect person by name (e.g., "the client contact is Mr. Usama", "contact: John", "reach out to Sarah").
-- ALWAYS extract this even if you also used it for customer_name.
-- If a phone number or any contact number is mentioned, extract it as contact_phone (e.g. "39579966").
-- NEVER extract internal employees, colleagues, or the person the email is addressed to (e.g. "Dear Mr. Arpit") as the contact_name. Otherwise null.
+- Extract third-party client/prospect contact person and phone number if present. Exclude internal employees/recipients.
 
 RULE 4 — intent (choose EXACTLY one):
-- "Estimation" = cost estimate request, technical estimation, or if subject mentions "Estimation Pending" (CRITICAL: Prioritize this over "Service Lead" even if "Sales Lead" is in the subject).
-- "Service Lead" = new client pitched, new business opportunity (do not use if they are explicitly asking for an estimation or proposal).
-- "General Task" = internal update, team task, meeting follow-up, OR if email states an issue was ALREADY rectified, resolved, or sent by mistake ("rectified that", "fixed", "sent by mistake", "disregard").
-- "Proposal" = existing client wants a proposal.
-- "Engagement Letter" = request or signoff for an engagement letter.
-- "Invoice" = billing related.
-- "Leave Request" = employee leave application (annual, sick, emergency, maternity, etc.). MUST be used whenever subject or body mentions leave, vacation, day off, absence.
-- "HR Request" = other internal HR requests (salary inquiry, documents, onboarding, NOC letter, etc.).
+- "Estimation": cost estimate / technical estimation request or subject mentions "Estimation Pending" (prioritize over Service Lead).
+- "Service Lead": new client pitched or new business opportunity.
+- "General Task": internal update, team task, meeting follow-up, OR if email states an issue was ALREADY rectified, resolved, or sent by mistake ("rectified that", "fixed", "sent by mistake", "disregard").
+- "Proposal": existing client requesting a proposal.
+- "Engagement Letter": request or signoff for an engagement letter.
+- "Invoice": billing related.
+- "Leave Request": employee leave/vacation application (annual, sick, emergency).
+- "HR Request": other internal HR requests (salary inquiry, documents, onboarding, NOC).
 
 RULE 5 — service_line_hint:
-- Extract from context or sender signature. "BPS" = "Business Process Services".
-- For Leave Request or HR Request, set null.
+- Extract from context or signature (e.g., BPS = Business Process Services). Set null for Leave/HR requests.
 
 RULE 6 — task_description:
-- Synthesize a clear, 2-to-3 sentence executive summary of the email content and required action items.
-- Summarize the client's request, key project scope/requirements, and required follow-up actions in clean, professional prose.
-- DO NOT copy-paste the raw email text or form labels verbatim. Write a synthesized, executive-ready summary of what needs to be done!
-- CRITICAL INSTRUCTION: If there is an "=== ATTACHMENT: ... ===" block, YOU MUST extract the key details from the attachment text and synthesize them into this summary.
-- For leave requests: "Process leave request from [sender name]. Review the requested dates and handle approval via the HR portal."
-- CRITICAL INSTRUCTION: If the email states an issue has ALREADY been rectified, resolved, or sent by mistake (e.g. "rectified that", "sent by mistake"), summarize it as an informational resolution update (e.g. "Sender confirms that the proposal issue has been rectified. Informational update only; no further action required."). DO NOT generate a task instructing the user to "investigate and fix".
-- NEVER output meta-commentary like "No description available". Always write something actionable and concise.
+- Output a single, concise, action-oriented task overview (1 sentence, ~15 to 30 words).
+- Focus strictly on WHAT action/request needs to be performed (e.g., "Prepare a technical estimation for the client's CRM migration, covering licensing, data migration, and six months of support." or "Process the employee's annual leave request for the specified dates.").
+- Use generic role references ("the client", "the requester", "the user", "the employee"). Include deadlines only if explicitly requested.
+- STRICT EXCLUSIONS: NEVER include contact names, emails, phones, company names, budget/amount details, sender signatures, email headers, background stories, "Extracted Contact Info" blocks, or entity lists. DO NOT output multi-sentence paragraphs or narrative backgrounds.
+- If the email states an issue has ALREADY been resolved, output a one-line resolution summary.
 
 RULE 7 — sender_name and sender_designation:
-- Extract from the ORIGINAL email signature. Return null if not present in the email text.
+- Extract from original email signature if present; otherwise null.
 
-RULE 8 — MULTIPLE COMPANIES:
-- If the email mentions multiple distinct companies or projects, DO NOT combine them into a single string with "and" or commas.
-- Instead, MUST return an ARRAY of strings for customer_name containing each distinct company separately. (e.g. ["Company A", "Company B"]).
-- If only one, return a single string.
+RULE 8 — due_date:
+- Return YYYY-MM-DD if deadline mentioned; otherwise null.
 
-RULE 9 — due_date:
-- Return YYYY-MM-DD if a deadline is mentioned. Otherwise null.
+RULE 9 — task_tag:
+- Short 1-2 word UI tag (e.g., "Service Lead", "Support Request", "Internal Admin", "Project Task").
 
-RULE 10 — task_tag:
-- Assign a short 1-2 word UI tag for this email based on the intent (e.g., "Service Lead", "Support Request", "Internal Admin", "Project Task"). 
+RULE 10 — invoice_amount:
+- Extract amount/currency if intent is "Invoice"; otherwise null.
 
-RULE 11 — invoice_amount:
-- If the intent is "Invoice" and an amount/currency is clearly mentioned in the email, extract it (e.g., "BHD 1500" or "1500"). Otherwise, return null.
+RULE 11 — task_title (PURE ACTION SYNTHESIS):
+- Synthesize a 2 to 3 word action title describing ONLY the action requested (e.g., "Verify Engagement Letter", "Password Reset", "Leave Request Approval").
+- STRICT EXCLUSION: NEVER include customer names, project names, or company titles in task_title.
 
-RULE 13 — task_title (PURE ACTION SYNTHESIS):
-- Read the email body text and synthesize a 2 to 3 word action title describing ONLY the work/action requested.
-- STRICT EXCLUSION: NEVER include customer names, project names, company titles, or tokens (<CUSTOMER_TOKEN_x>, <PROJECT_TOKEN_x>) in task_title. The customer and project are handled separately by dedicated CRM fields!
-- Examples of PURE ACTION SYNTHESIS:
-  - Email asking to check/verify engagement letters -> "Verify Engagement Letters" or "Engagement Letters Verification"
-  - Email asking to process an invoice -> "Process Invoice" or "Invoice Payment Review"
-  - Email asking to send proposal for audit -> "Audit Proposal Request"
-  - Email reporting missing files -> "Verify Proposal Uploads" or "Missing Proposals Check"
-  - Email asking for leave -> "Leave Request Approval"
-- DO NOT use generic template words like "Proposal Template IT", "Task Request", or "New Task".
-- STRICT MAXIMUM OF 2 OR 3 WORDS. NEVER output customer names, project names, or 4+ words.
+RULE 12 — confidence_score and confidence_level:
+- Estimate integer confidence_score (0-100) and set confidence_level ("high" >= 80, "medium" 50-79, "low" < 50).
 
-RULE 14 — confidence_score and confidence_level:
-- Estimate an integer confidence_score (0 to 100) based on clarity of the email and extracted fields.
-- Set confidence_level as "high" (>= 80), "medium" (50-79), or "low" (< 50).
-
-RULE 15 — GENERAL QUERY HIERARCHICAL CLASSIFICATION:
-Classify the email against the following valid CRM Master Hierarchy options:
-{gq_hierarchy_text}
-
-CRITICAL RULES FOR gq_request_type, gq_subject, and gq_query:
-
-1. "gq_request_type" MUST BE ONE OF THESE EXACT 6 NAMES:
-   - "Marketing & Business Development"
-   - "IT Support"
-   - "CRM Issues"
-   - "Finance"
-   - "Client Support"
-   - "HR"
-   (DO NOT output "Service Lead", "Estimation", "Proposal", or any other string for gq_request_type!)
-
-2. "gq_subject" MUST BE AN EXACT SUBJECT NAME FROM THE HIERARCHY UNDER THAT gq_request_type:
-   - Under "Marketing & Business Development": "Proposal Request", "EL Request", "Marketing"
-   - Under "IT Support": "General IT", "CRM", "Email related", "DMS", "Client Portal", "Tally"
-   - Under "CRM Issues": "Customer Master", "Contact Master", "Service Lead", "Proposal", "Projects", etc.
-
-3. "gq_query" MUST BE AN EXACT QUERY NAME FROM THE HIERARCHY UNDER THAT gq_subject:
-   - Under "Proposal Request": "New Proposal", "Copy of Proposal", "Others"
-   - Under "CRM" (IT Support): "Login Issue", "User Rights", "Block User", "User ID Creation", "Others"
-   - Under "Email related" (IT Support): "Bounce back email issues", "New Email ID", "Auto response", "Attachment", "Suspicious Link", "Others"
-
-MANDATORY STEP 1 — DETERMINE THE BUSINESS INTENT OF THE EMAIL BEFORE CLASSIFYING:
-Ask yourself: "Is the sender communicating a NEW BUSINESS / SALES OPPORTUNITY, or reporting a TECHNICAL SYSTEM PROBLEM?"
-
-A. SALES / BUSINESS OPPORTUNITY SIGNALS (→ MUST CLASSIFY AS "Marketing & Business Development"):
-If the email contains ANY sales or business development signals, such as:
-- new prospective client, prospective customer, new client, client interested in, client wants, client needs our services, pitched a client, business opportunity, new opportunity, implementation requirement, project requirement, budget/value mentioned, quotation request, proposal request, discovery call, meeting with prospective client, client looking to start a project, client wants to purchase/implement a service, request to prepare proposal, request to take up a new client, service requirement from a prospect.
-
-YOU MUST CLASSIFY AS:
-- gq_request_type: "Marketing & Business Development"
-- gq_subject: "Proposal Request" (for new proposal, quotation, discovery call, project implementation for a prospect)
-- gq_query: "New Proposal"
-
-CRITICAL PRODUCT VS PROBLEM DISAMBIGUATION:
-- The word "CRM" in "CRM software implementation", "CRM system for client", "custom CRM software", etc. refers to the PRODUCT/SERVICE the prospective client wants to purchase or implement. It is a SALES OPPORTUNITY → "Marketing & Business Development" → "Proposal Request" → "New Proposal". It is NOT an IT Support or CRM Issue!
-- Receiving an email about a lead/prospect is NOT an "Email related" IT Support issue! "Email related" is ONLY for technical email system delivery errors (e.g. bounce back, spam).
-
-B. TECHNICAL SUPPORT SIGNALS (→ ONLY USE "IT Support" OR "CRM Issues"):
-Classify as IT Support or CRM Issues ONLY IF the email describes an actual technical malfunction, system bug, or IT failure:
-- "Client cannot login to CRM" → "IT Support" → "CRM" → "Login Issue"
-- "CRM export to excel is broken" → "CRM Issues" → "Customer Master" → "Not able to export to excel"
-- "Email bounce back error 550" → "IT Support" → "Email related" → "Bounce back email issues"
-
-C. CRITICAL DISAMBIGUATION EXAMPLES:
-1. "We have a new prospective client interested in custom CRM software implementation... budget BHD 15,000... set up initial discovery call"
-   → gq_request_type: "Marketing & Business Development", gq_subject: "Proposal Request", gq_query: "New Proposal"
-
-2. "Client pitched for new software implementation services"
-   → gq_request_type: "Marketing & Business Development", gq_subject: "Proposal Request", gq_query: "New Proposal"
-
-3. "Inquiry regarding CRM software purchase"
-   → gq_request_type: "Marketing & Business Development", gq_subject: "Proposal Request", gq_query: "New Proposal"
-
-4. "Cannot log into CRM"
-   → gq_request_type: "IT Support", gq_subject: "CRM", gq_query: "Login Issue"
-
-STEP 2 — SELECT EXACT MATCHING HIERARCHY:
-- Match gq_request_type first, then gq_subject under that Request Type, then gq_query under that Subject.
-- Names must match EXACTLY as listed in the hierarchy above.
-- Return null if uncertain.
-
-Fields to extract for General Query classification:
-- gq_request_type: Exactly match a Request Type name from the hierarchy above, or null if uncertain.
-- gq_subject: Exactly match a Subject under that Request Type, or null if uncertain.
-- gq_query: Exactly match a Query under that Subject, or null if uncertain.
-- gq_request_type_confidence: Integer (0-100) confidence in Request Type.
-- gq_subject_confidence: Integer (0-100) confidence in Subject.
-- gq_query_confidence: Integer (0-100) confidence in Query.
-- gq_priority_confidence: Integer (0-100) confidence in Priority.
-
-STRICT CONSTRAINTS:
-- Do NOT invent Request Types, Subjects, or Queries.
-- Do NOT invent IDs.
-- Semantic understanding is required; match implied requests (e.g. "account statement" -> Receivables Management -> SOA).
-- If uncertain, return null.
+RULE 13 — GENERAL QUERY CLASSIFICATION:
+Classify into gq_request_type ("Marketing & Business Development", "IT Support", "CRM Issues", "Finance", "Client Support", "HR"), gq_subject, and gq_query:
+- SALES OPPORTUNITY (new client, pitch, proposal request) -> gq_request_type="Marketing & Business Development", gq_subject="Proposal Request", gq_query="New Proposal".
+- TECH/SYSTEM SUPPORT (login error, bounce 550, export error) -> Use "IT Support" or "CRM Issues".
 
 Return ONLY valid JSON with these exact keys:
 intent, secondary_intent, task_title, project_name, customer_name, contact_name, contact_phone, service_line_hint, task_description, sender_name, sender_designation, due_date, priority, task_tag, invoice_amount, confidence_score, confidence_level, gq_request_type, gq_subject, gq_query, gq_request_type_confidence, gq_subject_confidence, gq_query_confidence, gq_priority_confidence
 
+Subject: {subject or ''}
 Email Text:
 {text}"""
 
@@ -926,12 +823,9 @@ Email Text:
         user_content.extend(image_contents)
         
     sys_msg_text = (
-        "You are an expert CRM AI assistant. Extract structured CRM data from the input email, "
-        "including General Query classification (gq_request_type, gq_subject, gq_query). "
-        "Respond ONLY with a valid JSON object matching the requested schema. "
-        "CRITICAL: You MUST include gq_request_type, gq_subject, and gq_query in the JSON response. "
-        "gq_request_type MUST be one of: 'Marketing & Business Development', 'IT Support', 'CRM Issues', 'Finance', 'Client Support', 'HR'. "
-        "Do NOT output any <think> tags or reasoning blocks. Your response MUST start IMMEDIATELY with '{' on line 1."
+        "You are a precise CRM AI data extraction assistant for Grant Thornton Bahrain. "
+        "Extract structured CRM fields and General Query classification from the email. "
+        "Respond ONLY with a valid JSON object starting immediately with '{'."
     )
     messages = [
         SystemMessage(content=sys_msg_text),
@@ -940,7 +834,7 @@ Email Text:
     
     is_vision = bool(image_contents)
     try:
-        llm = get_llm(temperature=0.0, max_tokens=3072, is_vision=is_vision)
+        llm = get_llm(temperature=0.0, max_tokens=3072, is_vision=is_vision, reasoning_effort="low")
         
         # Try to enforce JSON mode if supported (avoid for Groq Qwen/DeepSeek which output <think> tags)
         provider_name = os.getenv("LLM_PROVIDER", "").lower()
@@ -973,14 +867,14 @@ Email Text:
                 if image_contents:
                     trunc_user_content.extend(image_contents)
                 trunc_messages = [
-                    SystemMessage(content="You are an expert CRM AI assistant. Extract structured CRM data from the input email, synthesize a concise 2-3 sentence executive summary for task_description, and respond ONLY with a valid JSON object matching the requested schema. CRITICAL: Do NOT output any <think> tags, chain-of-thought, or reasoning blocks. Your response MUST start IMMEDIATELY with '{' on line 1."),
+                    SystemMessage(content="You are a precise CRM AI assistant. Extract structured CRM data and respond ONLY with a valid JSON object starting immediately with '{'."),
                     HumanMessage(content=trunc_user_content if image_contents else trunc_prompt)
                 ]
-                plain_llm = get_llm(temperature=0.0, is_vision=is_vision)
+                plain_llm = get_llm(temperature=0.0, is_vision=is_vision, reasoning_effort="low")
                 response = plain_llm.invoke(trunc_messages)
             elif "json_validate_failed" in err_str or "400" in err_str:
                 print(f"[email_parser] JSON mode bind failed ({inv_err}), retrying with un-bound LLM...")
-                plain_llm = get_llm(temperature=0.0, is_vision=is_vision)
+                plain_llm = get_llm(temperature=0.0, is_vision=is_vision, reasoning_effort="low")
                 response = plain_llm.invoke(messages)
             else:
                 raise inv_err
@@ -1089,6 +983,18 @@ Email Text:
                 "confidence_level": "medium"
             }
         
+        DEFAULT_SCHEMA_KEYS = [
+            "intent", "secondary_intent", "task_title", "project_name", "customer_name",
+            "contact_name", "contact_phone", "service_line_hint", "task_description",
+            "sender_name", "sender_designation", "due_date", "priority", "task_tag",
+            "invoice_amount", "confidence_score", "confidence_level", "gq_request_type",
+            "gq_subject", "gq_query", "gq_request_type_confidence",
+            "gq_subject_confidence", "gq_query_confidence", "gq_priority_confidence"
+        ]
+        for k in DEFAULT_SCHEMA_KEYS:
+            if k not in parsed:
+                parsed[k] = None
+
         # 0b. Local Unmasking: Restore real names, numbers, amounts in JSON result
         parsed = unmask_data(parsed, token_mapping)
         
@@ -1110,7 +1016,7 @@ Email Text:
         INVALID_CUSTOMER_PHRASES = [
             "information for your", "contact information", "further take up", 
             "see below", "please see", "thanks & regards", "kind regards", "best regards",
-            "information for", "take up", "regards"
+            "information for", "take up", "regards", "number", "phone", "mobile", "tel", "email", "contact number"
         ]
 
         # 1. Sanitize existing contact_name and customer_name if they contain invalid filler phrases
@@ -1271,6 +1177,15 @@ Email Text:
             parsed["general_query_mapping"] = enrichments["general_query_mapping"]
             parsed["redirection_prompt"] = enrichments["redirection_prompt"]
             parsed["notification_badge"] = enrichments["notification_badge"]
+            
+            gq_map = enrichments.get("general_query_mapping") or {}
+            if gq_map.get("req_type_name") and not parsed.get("gq_request_type"):
+                parsed["gq_request_type"] = gq_map["req_type_name"]
+            if gq_map.get("subject_name") and not parsed.get("gq_subject"):
+                parsed["gq_subject"] = gq_map["subject_name"]
+            if gq_map.get("query") and not parsed.get("gq_query"):
+                parsed["gq_query"] = gq_map["query"]
+                
             if meta_dict:
                 parsed["_meta"] = meta_dict
 
@@ -1675,6 +1590,61 @@ def evaluate_manual_review_conditions(parsed: dict) -> dict:
     return parsed
 
 
+def sanitize_general_query_task_description(desc: str) -> str:
+    """
+    Cleans task_description / sub_detail for General Query tasks to ensure
+    it contains ONLY a concise, one-sentence action-oriented overview (~15 to 30 words).
+    Strips extracted contact info, signatures, headers, and debug tokens.
+    """
+    if not desc or not isinstance(desc, str):
+        return "General Query task requiring review."
+
+    # 1. Truncate any section starting with '---', '👤', or 'Extracted Contact Info'
+    desc = re.sub(r'(?i)\n*\s*-{3,}.*', '', desc, flags=re.DOTALL)
+    desc = re.sub(r'(?i)\n*\s*👤.*', '', desc, flags=re.DOTALL)
+    desc = re.sub(r'(?i)\n*\s*Extracted\s+(?:Contact|Entity|Details)\s+Info:.*', '', desc, flags=re.DOTALL)
+
+    # 2. Remove contact header lines like Name:, Phone:, Email:, Budget:, Contact Name:
+    lines = desc.split('\n')
+    clean_lines = []
+    for line in lines:
+        l_strip = line.strip()
+        if re.match(r'^(?:---|___|===|\*|\s)*$', l_strip):
+            continue
+        if '👤' in l_strip or 'extracted contact info' in l_strip.lower():
+            continue
+        if re.match(r'(?i)^(?:Extracted\s+Contact\s+Info|Contact\s+Info|Name|Phone|Email|Mobile|Tel|Contact\s+Name|Budget|Customer\s+Master)\s*:', l_strip):
+            continue
+        if re.match(r'^(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4}$', l_strip):
+            continue
+        if re.match(r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$', l_strip):
+            continue
+        clean_lines.append(line)
+
+    clean_text = " ".join(clean_lines).strip()
+
+    # 3. Strip pseudonymization tokens if residual
+    clean_text = re.sub(r'<[A-Z_]+_\d+>', '', clean_text)
+    clean_text = re.sub(r'\b[A-Z_]+_\d+\b', '', clean_text)
+
+    # 4. Clean extra whitespace
+    clean_text = re.sub(r'\s{2,}', ' ', clean_text).strip()
+
+    # 5. Restrict strictly to the first meaningful sentence
+    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', clean_text) if s.strip()]
+    if sentences:
+        first = sentences[0]
+        if len(first.split()) >= 4:
+            clean_text = first
+        elif len(sentences) > 1:
+            clean_text = f"{first} {sentences[1]}"
+
+    if not clean_text or len(clean_text) < 5:
+        return "General Query task requiring review."
+
+    return clean_text
+
+
 def build_general_query_mapping(parsed: dict) -> dict:
     """
     Dynamically classifies incoming email content into CRM General Query master data hierarchy:
@@ -1873,7 +1843,8 @@ def build_general_query_mapping(parsed: dict) -> dict:
 
     manual_review_required = len(unique_reasons) > 0
 
-    sub_detail = str(parsed.get("task_description") or "").strip()
+    sub_detail = sanitize_general_query_task_description(str(parsed.get("task_description") or "").strip())
+    parsed["task_description"] = sub_detail
 
     field_confidence = {
         "request_type": field_conf_req if req_type_id else (field_conf_req if field_conf_req > 0 else None),
