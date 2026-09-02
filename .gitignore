@@ -79,3 +79,6 @@ get_employee.py
 get_token.py
 analyze.py
 scratch_kpi_test.py
+
+.agents
+agents.md
