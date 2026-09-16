@@ -39,7 +39,7 @@ class ResultValidationEngine:
             err_msg = payload_data.get("error_message") if isinstance(payload_data, dict) else "Backend returned error status."
             return False, [f"Backend execution failed: {err_msg}"]
 
-        payload = payload_envelope.get("payload")
+        payload = payload_envelope.get("payload") or payload_envelope
         if payload is None:
             return False, ["Payload content is None."]
 
@@ -147,25 +147,98 @@ class ResultValidationEngine:
         # 4. Validate Operation / Granularity (Ranking & Multi-Period Comparison Fail-Closed Rules)
         if req_op == "ranking":
             ranking_list = payload.get("ranking_data") if isinstance(payload, dict) else None
-            records = payload.get("records") or payload.get("data") or payload.get("rows") if isinstance(payload, dict) else None
-            if not ranking_list and not (isinstance(records, list) and len(records) > 0):
+            result_type = payload.get("result_type") if isinstance(payload, dict) else None
+            payload_op = payload.get("operation") if isinstance(payload, dict) else None
+            req_limit = req_dict.get("limit") or requested_constraints.get("limit")
+
+            if ranking_list is not None and isinstance(ranking_list, list):
+                if req_limit is not None:
+                    try:
+                        lim_int = int(req_limit)
+                        if lim_int > 0 and len(ranking_list) > lim_int:
+                            errors.append(f"Ranking contract mismatch: requested limit={lim_int}, but backend returned {len(ranking_list)} ranked items.")
+                    except (ValueError, TypeError):
+                        pass
+            elif result_type == "ranking_table" or payload_op == "ranking":
+                records = payload.get("records") or payload.get("data") or payload.get("rows") if isinstance(payload, dict) else None
+                if isinstance(records, list):
+                    if req_limit is not None:
+                        try:
+                            lim_int = int(req_limit)
+                            if lim_int > 0 and len(records) > lim_int:
+                                errors.append(f"Ranking contract mismatch: requested limit={lim_int}, but backend returned {len(records)} items.")
+                        except (ValueError, TypeError):
+                            pass
+                else:
+                    errors.append("Operation mismatch: requested ranking operation, but backend returned non-list data.")
+            else:
                 errors.append("Operation mismatch: requested ranking operation, but backend returned generic summary report instead of ranking dataset.")
 
-        # 4b. Validate Dimension Match for Ranking
-        if req_op == "ranking" or (isinstance(payload, dict) and (payload.get("operation") == "ranking" or "ranking_data" in payload)):
+        # 4b. Generic Execution-Contract Validation: Planned Dimension -> Backend Response Dimension
+        if req_dim and str(req_dim).lower() not in ("none", "null", "all", ""):
+            req_dim_clean = str(req_dim).lower().strip().replace("_", "").replace(" ", "")
             ret_dim = payload.get("dimension") if isinstance(payload, dict) else None
-            if req_dim and ret_dim:
-                req_dim_clean = str(req_dim).lower().replace("_", "").replace(" ", "")
-                ret_dim_clean = str(ret_dim).lower().replace("_", "").replace(" ", "")
+            is_org_agg = payload.get("is_organization_aggregate", False) if isinstance(payload, dict) else False
+
+            rows = []
+            if isinstance(payload, dict):
+                rows = (
+                    payload.get("rows")
+                    or payload.get("data")
+                    or payload.get("revenue_by_month")
+                    or payload.get("gp_performance_breakdown")
+                    or payload.get("monthly_variance")
+                    or payload.get("items")
+                    or payload.get("ranking_data")
+                    or []
+                )
+            elif isinstance(payload, list):
+                rows = payload
+
+            DIMENSION_KEY_MAP = {
+                "serviceline": ["service_line", "service_line_name", "serviceline", "service_line_id", "name"],
+                "department": ["department", "department_name", "department_id", "dept_name"],
+                "month": ["month", "date", "period", "month_name"],
+                "customer": ["customer", "customer_name", "client", "client_name", "customer_id"],
+                "employee": ["employee", "employee_name", "emp_name", "staff_name", "employee_id"]
+            }
+            expected_keys = DIMENSION_KEY_MAP.get(req_dim_clean, [req_dim_clean, f"{req_dim_clean}_name", f"{req_dim_clean}_id"])
+
+            # Check if top-level payload represents the dimension
+            top_level_dim_val = next((payload.get(k) for k in expected_keys if payload.get(k)), None) if isinstance(payload, dict) else None
+
+            # Check if rows represent the dimension
+            first_row = rows[0] if (isinstance(rows, list) and len(rows) > 0 and isinstance(rows[0], dict)) else {}
+            has_row_dim = any(k in first_row for k in expected_keys) or any(k.lower() in [ek.lower() for ek in expected_keys] for k in first_row.keys()) if first_row else False
+
+            if is_org_agg and not top_level_dim_val and not has_row_dim:
+                errors.append(f"Dimension contract mismatch: requested dimension '{req_dim}', but backend returned an unpartitioned organization aggregate with {req_dim}=None.")
+                logger.warning(f"[RESULT_SEMANTIC_VALIDATION] requested_dimension={req_dim} returned_dimension=None is_org_agg=True status=FAIL")
+            elif ret_dim:
+                ret_dim_clean = str(ret_dim).lower().strip().replace("_", "").replace(" ", "")
                 if req_dim_clean != ret_dim_clean and req_dim_clean not in ret_dim_clean and ret_dim_clean not in req_dim_clean:
                     errors.append(f"Dimension mismatch: requested dimension '{req_dim}', but payload returned dimension '{ret_dim}'.")
-                    logger.warning(
-                        f"[RESULT_SEMANTIC_VALIDATION] requested_dimension={req_dim} returned_dimension={ret_dim} status=FAIL"
-                    )
+                    logger.warning(f"[RESULT_SEMANTIC_VALIDATION] requested_dimension={req_dim} returned_dimension={ret_dim} status=FAIL")
                 else:
-                    logger.info(
-                        f"[RESULT_SEMANTIC_VALIDATION] requested_dimension={req_dim} returned_dimension={ret_dim} status=PASS"
-                    )
+                    logger.info(f"[RESULT_SEMANTIC_VALIDATION] requested_dimension={req_dim} returned_dimension={ret_dim} status=PASS")
+            elif has_row_dim or top_level_dim_val or (isinstance(rows, list) and len(rows) == 0) or (isinstance(payload, dict) and payload.get("count") == 0) or (isinstance(payload, dict) and payload.get("status") == "EMPTY"):
+                logger.info(f"[RESULT_SEMANTIC_VALIDATION] requested_dimension={req_dim} status=PASS")
+            else:
+                errors.append(f"Dimension contract mismatch: requested dimension '{req_dim}', but backend returned no partitioned data.")
+                logger.warning(f"[RESULT_SEMANTIC_VALIDATION] requested_dimension={req_dim} status=FAIL")
+        elif not req_dim or str(req_dim).lower() in ("none", "null", ""):
+            ret_dim = payload.get("dimension") if isinstance(payload, dict) else None
+            is_org_agg = payload.get("is_organization_aggregate", False) if isinstance(payload, dict) else False
+            if ret_dim and str(ret_dim).lower() not in ("none", "null", "") and not is_org_agg:
+                from registry.capability_catalog import get_capability_default_dimension
+                cat_default_dim = get_capability_default_dimension(capability_id)
+                if not cat_default_dim:
+                    errors.append(f"Dimension invention error: canonical dimension is None, but backend silently returned dimension='{ret_dim}'.")
+                    logger.warning(f"[RESULT_SEMANTIC_VALIDATION] requested_dimension=None returned_dimension={ret_dim} status=FAIL reason=silent_dimension_invention")
+                else:
+                    logger.info(f"[RESULT_SEMANTIC_VALIDATION] requested_dimension=None returned_dimension={ret_dim} (capability default) status=PASS")
+            else:
+                logger.info(f"[RESULT_SEMANTIC_VALIDATION] requested_dimension=None returned_dimension={ret_dim} status=PASS")
 
         # 4c. Validate Entity Lineage for Ranking Data
         if isinstance(payload, dict) and "ranking_data" in payload:

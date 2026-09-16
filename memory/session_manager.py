@@ -499,16 +499,36 @@ async def set_entity_cache(cache_key: str, response: dict, ttl_seconds: int = 18
 # Executive Memory Helpers (Phase 3.1.10)
 # ---------------------------------------------------------------------------
 
+_IN_MEMORY_EXECUTIVE_STORE: dict = {}
+
+
+def _sanitize_for_session(obj: Any) -> Any:
+    if obj is None or isinstance(obj, (int, float, str, bool)):
+        return obj
+    if isinstance(obj, dict):
+        return {str(k): _sanitize_for_session(v) for k, v in obj.items() if k not in ("llm", "jwt_token")}
+    if isinstance(obj, (list, tuple, set)):
+        return [_sanitize_for_session(x) for x in obj]
+    if hasattr(obj, "model_dump"):
+        return _sanitize_for_session(obj.model_dump())
+    if hasattr(obj, "to_dict"):
+        return _sanitize_for_session(obj.to_dict())
+    return str(obj)
+
+
 async def get_session_memory(session_id: str) -> dict:
     """
     Returns the executive_memory dict from the active session.
     Used by the Planner to inherit active filters/entities for follow-up queries.
     Returns an empty dict if session or memory is unavailable.
     """
-    session = await get_session(session_id)
-    if session and isinstance(session.get("executive_memory"), dict):
-        return session["executive_memory"]
-    return {}
+    try:
+        session = await get_session(session_id)
+        if session and isinstance(session.get("executive_memory"), dict):
+            return session["executive_memory"]
+    except Exception as e:
+        logger.warning(f"[ExecutiveMemory] get_session failed: {e}")
+    return _IN_MEMORY_EXECUTIVE_STORE.get(session_id, {})
 
 
 async def update_session_memory(
@@ -561,6 +581,9 @@ async def update_session_memory(
             merged_filters["department"] = e_name
             merged_filters["department_id"] = e_id
 
+    clean_plan = _sanitize_for_session(execution_plan)
+    clean_tool_results = _sanitize_for_session(tool_results or [])
+
     new_memory = {
         "active_topic": execution_plan.get("business_goal") or None,
         "active_reports": cap_ids,
@@ -571,7 +594,11 @@ async def update_session_memory(
         "comparison_baseline": execution_plan.get("comparison"),
         "last_capability_ids": cap_ids,
         "discussion_focus": None,
+        "latest_execution_plan": clean_plan,
+        "latest_tool_results": clean_tool_results
     }
+
+    _IN_MEMORY_EXECUTIVE_STORE[session_id] = new_memory
 
     try:
         col = get_sessions_collection()
@@ -581,7 +608,6 @@ async def update_session_memory(
         )
     except Exception as e:
         logger.error(f"[ExecutiveMemory] MongoDB update failed: {e}")
-        return False
 
     try:
         session = await get_session(session_id)
@@ -596,7 +622,7 @@ async def update_session_memory(
 
     logger.info(
         f"[ExecutiveMemory] Updated session {session_id}: "
-        f"caps={cap_ids}, filters={list(merged_filters.keys())}"
+        f"caps={cap_ids}, filters={list(merged_filters.keys())}, has_plan={bool(clean_plan)}, has_tool_results={bool(clean_tool_results)}"
     )
     return True
 

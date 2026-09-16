@@ -110,27 +110,40 @@ RESERVED_BUSINESS_VOCABULARY: frozenset[str] = frozenset({
     "kpi", "recoverability", "dashboard", "summary", "top", "highest", "compare",
     "analysis", "trend", "financial year", "year", "customer", "customers", "client", "clients",
     "active projects", "overdue receivables", "active", "completed", "in progress",
-    "service line", "department", "employee", "tasks", "task", "leads", "lead",
+    "service line", "service_line", "serviceline", "service lines", "department", "departments", "dept", "depts", "employee", "employees", "staff", "tasks", "task", "leads", "lead",
     "generated the highest revenue this year", "fy24 and", "fy25 and",
     "generated the highest revenue", "performed best", "highest revenue", "best performing",
     "highest", "lowest", "top 5", "top 10", "top 3", "top 1", "worst performing",
-    "most revenue", "highest gross profit", "highest gp", "gross profit", "gp"
+    "most revenue", "highest gross profit", "highest gp", "gross profit", "gp",
+    "project name", "customer name", "client name", "service line name", "department name",
+    "employee name", "actual recoverability", "estimated recoverability", "recoverability percentage",
+    "recoverability report", "approved fees", "agreed fees", "actual cost", "estimated cost",
+    "total actual cost", "project status", "status name", "service type", "manager", "partner"
+})
+
+TEMPORAL_ENTITY_TYPES: frozenset[str] = frozenset({
+    "date_range", "temporal", "date", "time_filter", "period", "financial_year",
+    "fy", "time", "month", "year", "week", "date_filter", "date_from", "date_to"
 })
 
 def is_reserved_business_term(val: str) -> bool:
     """
     Returns True if the string is a reserved business keyword, metric name,
-    grammatical ranking phrase, or financial year term that must NEVER be extracted/resolved as an entity value.
+    grammatical ranking phrase, financial year term, or temporal expression that must NEVER be extracted/resolved as an entity value.
     """
     if not val or not isinstance(val, str):
         return True
     clean = val.strip().lower()
-    if clean in RESERVED_BUSINESS_VOCABULARY:
+    if clean in RESERVED_BUSINESS_VOCABULARY or clean in TEMPORAL_ENTITY_TYPES:
         return True
     if clean.isdigit() and clean in ("360", "24", "25", "26"):
         return True
     import re as _re
     if _re.match(r'^(fy\d{2,4}|financial\s*year\s*\d{2,4})$', clean):
+        return True
+    if any(t in clean for t in ["this week", "last week", "this month", "last month", "this year", "last year", "today", "yesterday"]):
+        return True
+    if _re.search(r'\d{4}-\d{2}-\d{2}', clean) or _re.search(r'\d{2}/\d{2}/\d{4}', clean) or "→" in clean:
         return True
     # Filter out common grammatical ranking, temporal, and metric view phrases
     ranking_phrases = [
@@ -142,6 +155,10 @@ def is_reserved_business_term(val: str) -> bool:
         "what is total receivables", "total receivables", "monthly", "show details", "details"
     ]
     if any(phrase in clean for phrase in ranking_phrases) or clean.startswith("what is total"):
+        return True
+    # Filter out multi-word compound expressions made entirely of reserved business terms and conjunctions
+    _tokens = [t for t in clean.replace("and", " ").replace("with", " ").replace("or", " ").replace("&", " ").replace(",", " ").split() if t not in ("and", "with", "or", "&", "the", "a", "an", "of", "for", "in", "by", "to")]
+    if _tokens and all(t in RESERVED_BUSINESS_VOCABULARY or t in ("name", "status", "line", "type", "fee", "fees", "cost", "costs", "value", "values", "report", "data", "records", "actual", "estimated", "recoverability") for t in _tokens):
         return True
     return False
 
@@ -487,6 +504,16 @@ async def resolve_entities(extracted_entities: List[Dict[str, str]], jwt_token: 
     for entity in extracted_entities:
         e_type = entity.get("type", "").lower()
         e_value = entity.get("value", "").strip()
+
+        # Boundary safety: If token was received, recover unmasked entity from full_query
+        if re.match(r"^<[A-Z_]+_TOKEN_\d+>$", e_value) and full_query:
+            extracted_from_query = extract_entities_from_text(full_query)
+            matched_candidate = next((c["value"] for c in extracted_from_query if c.get("type") == e_type), None)
+            if not matched_candidate and extracted_from_query:
+                matched_candidate = extracted_from_query[0]["value"]
+            if matched_candidate:
+                logger.info(f"[EntityResolver Boundary Recovery] Restored token '{e_value}' to internal entity value '{matched_candidate}'.")
+                e_value = matched_candidate
 
         if not e_value or is_reserved_business_term(e_value):
             logger.info(f"[EntityResolver] Skipped reserved business term or empty value: '{e_value}'")
@@ -1001,6 +1028,17 @@ async def resolve_entity(
         )
 
     clean_input = input_value.strip()
+
+    if (entity_type and str(entity_type).lower() in TEMPORAL_ENTITY_TYPES) or clean_input.lower() in TEMPORAL_ENTITY_TYPES or "→" in clean_input:
+        logger.info(f"[ENTITY_RESOLVER] Bypassing CRM entity resolution for temporal input '{clean_input}' (type='{entity_type}')")
+        return EntityResolutionResult(
+            status=ResolutionStatus.RESOLVED,
+            entity_type="temporal",
+            input_value=clean_input,
+            resolved_name=clean_input,
+            confidence=1.0
+        )
+
     extracted_candidates = extract_entities_from_text(clean_input)
     search_input = clean_input
     if extracted_candidates:
@@ -1191,29 +1229,32 @@ def extract_entities_from_text(query: str) -> List[Dict[str, str]]:
     cust_match = re.search(r'(?:for|customer|project)\s+([A-Za-z0-9\s\.\-_&]+)', query, re.IGNORECASE)
     if cust_match:
         val = cust_match.group(1).strip()
-        val = re.sub(r'\s+(?:in|for|fy\d+|20\d{2}|what|how|show|get|run|status|got\s+it|please|download|give|button|thanks|ok|okay).*', '', val, flags=re.IGNORECASE).strip()
+        val = re.sub(r'\s+(?:is|are|was|were|performing|doing|having|in|for|fy\d+|20\d{2}|what|how|show|get|run|status|got\s+it|please|download|give|button|thanks|ok|okay).*', '', val, flags=re.IGNORECASE).strip()
         clean_val = re.sub(r'[^a-zA-Z0-9\s]', '', val).strip()
         if clean_val and len(clean_val) > 1 and clean_val.lower() not in ["customer", "projects", "proposals", "revenue", "receivables", "all", "the"]:
-            val = clean_val
+            biz_suffixes = ["ltd", "inc", "corp", "solutions", "group", "holdings", "services", "co", "llc", "wll", "w.l.l"]
+            is_company = any(s in val.lower() for s in biz_suffixes) or any(s in clean_val.lower() for s in biz_suffixes)
+            val_to_use = val if is_company else clean_val
             sl_terms = ["audit", "udit", "tax", "bps", "brs", "growth", "legal", "tech", "audit gp", "audit sme", "audit support"]
-            if val.lower() in sl_terms:
-                entities.append({"type": "service_line", "value": val})
+            if val_to_use.lower() in sl_terms:
+                entities.append({"type": "service_line", "value": val_to_use})
             else:
-                # If 2 words with no company suffixes, candidate could be an employee or customer
-                biz_suffixes = ["ltd", "inc", "corp", "solutions", "group", "holdings", "services", "co", "llc", "wll", "w.l.l"]
-                is_company = any(s in val.lower() for s in biz_suffixes)
-                words = val.split()
-                if not is_company and len(words) == 2 and not any(e["value"].lower() == val.lower() for e in entities if e["type"] == "employee"):
-                    entities.append({"type": "employee", "value": val})
-                elif not any(e["value"].lower() == val.lower() for e in entities if e["type"] == "customer"):
-                    entities.append({"type": "customer", "value": val})
+                words = clean_val.split()
+                if not is_company and len(words) == 2 and not any(e["value"].lower() == val_to_use.lower() for e in entities if e["type"] == "employee"):
+                    entities.append({"type": "employee", "value": val_to_use})
+                elif not any(e["value"].lower() == val_to_use.lower() for e in entities if e["type"] == "customer"):
+                    entities.append({"type": "customer", "value": val_to_use})
 
     # 2. Prompt Prefix Entity Pattern (e.g. "DOO Technology Solutions - Audit 2025 what is the status of tis project")
-    prefix_match = re.search(r'^([A-Za-z0-9\s\.\-_&]+?)(?:\s*(?:what|how|show|get|run|status|is the|which|where|\?))', query, re.IGNORECASE)
-    if prefix_match:
-        val = prefix_match.group(1).strip()
-        if val and len(val) >= 3 and val.lower() not in ["customer", "projects", "proposals", "revenue", "receivables", "all", "the", "show", "get", "what"]:
-            entities.append({"type": "project", "value": val})
+    question_starters = ("who", "what", "where", "why", "when", "how", "is", "are", "can", "could", "would", "please", "which", "show", "get", "run", "tell")
+    q_words = query.strip().lower().split()
+    if q_words and q_words[0] not in question_starters:
+        prefix_match = re.search(r'^([A-Za-z0-9\s\.\-_&]+?)(?:\s*[-:]\s*|\s+(?:what|how|show|get|run|status|which|where))', query, re.IGNORECASE)
+        if prefix_match:
+            val = prefix_match.group(1).strip()
+            stopwords = {"customer", "projects", "proposals", "revenue", "receivables", "all", "the", "show", "get", "what", "who", "why", "how", "when", "where", "which"}
+            if val and len(val) >= 3 and val.lower() not in stopwords:
+                entities.append({"type": "project", "value": val})
 
     # 3. Financial Year pattern (e.g. FY25, FY24)
     fy_match = re.search(r'\b(FY\d{2}|FY\d{4}|20\d{2})\b', query, re.IGNORECASE)

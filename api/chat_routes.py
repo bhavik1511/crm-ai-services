@@ -438,6 +438,9 @@ async def chat(
                     f"missing_fields={_clar_state.get('missing_fields') if _clar_state else None}"
                 )
 
+                from memory.session_manager import get_session_memory
+                _sess_mem = await get_session_memory(session_id) or {}
+
                 clar_history = history
                 if _clar_state:
                     _plan = _clar_state.get("execution_plan") or {}
@@ -454,6 +457,11 @@ async def chat(
                     logger.info(f"[PLAN_RESTORED] capability='{_restored_cap}'")
                     # Clarification Fast-Path: Omit full history to eliminate token overhead on clarification follow-ups
                     clar_history = []
+                elif _sess_mem.get("latest_execution_plan"):
+                    user_context["previous_execution_plan"] = _sess_mem["latest_execution_plan"]
+                    if _sess_mem.get("latest_tool_results"):
+                        user_context["previous_tool_results"] = _sess_mem["latest_tool_results"]
+                    logger.info(f"[SESSION_CONTEXT] Restored latest_execution_plan into user_context for session {session_id}")
                 else:
                     from agent.executive_classifier import handle_executive_classification
                     _is_conv, _conv_reply = await handle_executive_classification(question, history, user_context)
@@ -963,7 +971,7 @@ async def chat_stream(
                             f"missing_fields={_clar_state.get('missing_fields') if _clar_state else None}"
                         )
 
-                        if _clar_state or _has_active_followups:
+                        if _clar_state or _has_active_followups or _sess_mem.get("latest_execution_plan"):
                             if _clar_state:
                                 _plan = _clar_state.get("execution_plan") or {}
                                 if isinstance(_plan, dict) and _clar_state.get("original_question"):
@@ -977,6 +985,11 @@ async def chat_stream(
                                 logger.info(f"[CLARIFICATION] pending=true | missing_fields={_clar_state.get('missing_fields')}")
                                 logger.info(f"[CLARIFICATION_RESOLUTION] input='{question[:60]}'")
                                 logger.info(f"[PLAN_RESTORED] capability='{_restored_cap}'")
+                            elif _sess_mem.get("latest_execution_plan"):
+                                user_context["previous_execution_plan"] = _sess_mem["latest_execution_plan"]
+                                if _sess_mem.get("latest_tool_results"):
+                                    user_context["previous_tool_results"] = _sess_mem["latest_tool_results"]
+                                logger.info(f"[SESSION_CONTEXT Stream] Restored latest_execution_plan into user_context for session {session_id}")
                         else:
                             from agent.executive_classifier import handle_executive_classification
                             from config.llm_factory import clean_think_tags

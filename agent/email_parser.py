@@ -7,7 +7,10 @@ from typing import Any, Dict, List, Optional
 try:
     import fitz  # PyMuPDF
 except ImportError:
-    fitz = None
+    try:
+        import pymupdf as fitz
+    except ImportError:
+        fitz = None
 import base64
 
 
@@ -144,19 +147,46 @@ def parse_forwarded_email(subject: str, body: str, outer_from: str, outer_to: st
 def extract_text_from_pdf_base64(base64_data: str) -> str:
     try:
         import base64
-        import fitz
+        import io
         pdf_bytes = base64.b64decode(base64_data)
-        doc = fitz.open("pdf", pdf_bytes)
-        text = ""
-        for page in doc:
-            text += page.get_text()
+        
+        # Primary: PyMuPDF (fitz)
+        current_fitz = fitz
+        if current_fitz is None:
+            try:
+                import fitz as current_fitz
+            except ImportError:
+                try:
+                    import pymupdf as current_fitz
+                except ImportError:
+                    current_fitz = None
+                    
+        if current_fitz is not None:
+            doc = current_fitz.open("pdf", pdf_bytes)
+            text = ""
+            for page in doc:
+                text += page.get_text()
+        else:
+            # Fallback: PyPDF2
+            try:
+                import PyPDF2
+                reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
+                text = ""
+                for page in reader.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text += page_text + "\n"
+            except Exception as pe:
+                with open("pdf_debug.log", "a", encoding="utf-8") as f:
+                    f.write(f"Neither PyMuPDF nor PyPDF2 succeeded: {pe}\n")
+                return ""
             
-        with open("pdf_debug.log", "a") as f:
+        with open("pdf_debug.log", "a", encoding="utf-8") as f:
             f.write(f"SUCCESS: Extracted {len(text)} chars from PDF.\n")
             
         return text[:4000] # truncate to avoid blowing up context window
     except Exception as e:
-        with open("pdf_debug.log", "a") as f:
+        with open("pdf_debug.log", "a", encoding="utf-8") as f:
             f.write(f"PDF extraction error: {e}\n")
         print(f"PDF extraction error: {e}")
         return ""
@@ -1717,60 +1747,6 @@ def build_general_query_mapping(parsed: dict) -> dict:
     raw_sub_name = parsed.get("gq_subject")
     raw_query_name = parsed.get("gq_query")
 
-<<<<<<< HEAD
-    if "leave" in intent or "vacation" in intent or "day off" in intent or "leave" in desc_lower or "leave" in title_lower:
-        req_type_name = "HR"
-        subject_name = "Leave Request"
-        query = "Leave Request"
-    elif "hr" in intent or "payslip" in desc_lower or "salary" in desc_lower or "hr query" in title_lower:
-        req_type_name = "HR"
-        subject_name = "HR Query"
-        query = "HR Query"
-    elif "proposal" in intent or "service lead" in intent or "lead" in intent or "service" in intent or "proposal" in desc_lower or "proposal" in title_lower or "pitch" in desc_lower or "lead" in desc_lower or "opportunity" in desc_lower:
-        req_type_name = "Marketing & Business Development"
-        subject_name = "Proposal Request"
-        query = "New Proposal"
-    elif "engagement letter" in intent or "engagement" in intent or "el request" in intent or "el" in desc_lower or "engagement letter" in desc_lower:
-        req_type_name = "Marketing & Business Development"
-        subject_name = "EL Request"
-        query = "Copy of EL" if "copy of el" in desc_lower or "copy" in desc_lower else "EL"
-    elif "marketing" in intent or "marketing" in desc_lower:
-        req_type_name = "Marketing & Business Development"
-        subject_name = "Marketing"
-        query = "Others"
-    elif "invoice" in intent or "billing" in intent or "payable" in desc_lower or "payment" in desc_lower or "invoice" in desc_lower:
-        req_type_name = "Finance"
-        if "receivable" in desc_lower or "collection" in desc_lower:
-            subject_name = "Receivables Management"
-            query = "Others"
-        else:
-            subject_name = "Payable Management"
-            if "reimbursement" in desc_lower:
-                query = "Reimbursement"
-            elif "tender" in desc_lower:
-                query = "Tender Bond"
-            elif "confirmation" in desc_lower:
-                query = "Payment Confirmation Copy"
-            else:
-                query = "Others"
-    elif "it" in intent or "password" in desc_lower or "access" in desc_lower or "software" in desc_lower or "hardware" in desc_lower:
-        req_type_name = "IT Support"
-        subject_name = "General Query"
-        query = "Others"
-    elif "crm" in intent or "system issue" in desc_lower or "excel" in desc_lower or "display" in desc_lower or "record" in desc_lower or "export" in desc_lower:
-        req_type_name = "CRM Issues"
-        subject_name = "General Query"
-        if "excel" in desc_lower or "export" in desc_lower:
-            query = "Not able to export to excel"
-        elif "save" in desc_lower:
-            query = "Not able to save the records"
-        elif "wrong" in desc_lower or "data" in desc_lower:
-            query = "Data is wrong"
-        elif "display" in desc_lower or "record" in desc_lower:
-            query = "Issues with records not getting displayed properly"
-        else:
-            query = "Others"
-=======
     # 2b. Semantic Intent Disambiguation Fallback if raw hints are missing or invalid
     req_clean_test = str(raw_req_name or "").strip().lower()
     valid_req_names = ["marketing & business development", "it support", "crm issues", "finance", "client support", "hr"]
@@ -1841,7 +1817,6 @@ def build_general_query_mapping(parsed: dict) -> dict:
         reasons.append("Request Type could not be matched against CRM master data.")
     elif field_conf_req < CONFIDENCE_THRESHOLD and field_conf_req < MEDIUM_THRESHOLD:
         reasons.append(f"Request Type classification confidence ({int(field_conf_req*100)}%) is below threshold.")
->>>>>>> origin/main
     else:
         req_type_id = verified_req["id"]
         req_type_name = verified_req["name"]
@@ -1992,9 +1967,7 @@ def build_general_query_mapping(parsed: dict) -> dict:
         "manual_review_required": manual_review_required,
         "manual_review_reasons": unique_reasons
     }
-<<<<<<< HEAD
-    
-    intent_clean = intent.lower()
+    intent_clean = str(parsed.get("intent") or "").lower()
     if any(k in intent_clean for k in ["service lead", "lead", "proposal", "pitch", "estimation"]):
         target_route = "/proposal/add-proposal"
         target_name = "New Proposal"
@@ -2005,22 +1978,17 @@ def build_general_query_mapping(parsed: dict) -> dict:
         target_route = "/self-services/general-queries/add"
         target_name = "General Query"
 
+    prompt_message = parsed.get("manual_review_notice") if manual_review_required else f"Do you want to redirect to {target_name} for this task?"
+    if not prompt_message and manual_review_required:
+        prompt_message = mapping.get("insufficient_message") or f"Do you want to redirect to {target_name} for this task?"
+
     redirection_prompt = {
-        "message": manual_review_notice if requires_manual_review else f"Do you want to redirect to {target_name} for this task?",
+        "message": prompt_message,
         "target_name": target_name,
         "options": {
             "yes": {
                 "label": "Yes",
                 "redirect_to": target_route,
-=======
-
-    redirection_prompt = {
-        "message": mapping["insufficient_message"] if manual_review_required else "Do you want to redirect to General Query for this task?",
-        "options": {
-            "yes": {
-                "label": "Yes",
-                "redirect_to": "/self-services/general-queries/add",
->>>>>>> origin/main
                 "auto_fill_filters": True,
                 "description": f"Redirects to {target_name} page with pre-filled AI details."
             },

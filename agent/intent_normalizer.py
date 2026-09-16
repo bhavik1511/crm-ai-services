@@ -15,6 +15,7 @@ Architectural Rule:
   5. Providing structured observability logs ([INTENT_NORMALIZED], [INTENT_MERGE]).
 """
 
+import re
 import logging
 from typing import Dict, Any, List, Optional, Tuple
 from pydantic import BaseModel, Field
@@ -53,7 +54,7 @@ class TemporalSpec(BaseModel):
 class CanonicalIntent(BaseModel):
     raw_query: str = Field(description="Original natural-language query string.")
     capability: Optional[str] = Field(None, description="Primary business capability ID.")
-    operation: str = Field("summary", description="Operation: 'summary', 'ranking', 'comparison', 'trend', 'count', 'aggregate', 'ageing', 'detail', 'search'.")
+    operation: str = Field("summary", description="Operation: 'summary', 'ranking', 'comparison', 'trend', 'count', 'aggregate', 'ageing', 'detail', 'search', 'analyze'.")
     metric: Optional[str] = Field(None, description="Primary metric, e.g. 'revenue', 'gross_profit', 'receivables', 'proposals'.")
     dimension: Optional[str] = Field(None, description="Grouping/ranking dimension, e.g. 'customer', 'department', 'service_line', 'employee', 'project', 'office'.")
     ranking: Optional[RankingSpec] = Field(None, description="Ranking parameters when operation == 'ranking'.")
@@ -85,8 +86,16 @@ def to_canonical_intent(plan_data: Dict[str, Any], raw_query: str) -> CanonicalI
 
     raw_op = (primary_cap.get("operation") or primary_cap.get("intent") or cap_ctx.get("operation") or plan_data.get("operation") or "summary")
     operation = str(raw_op).lower().strip()
+    if operation == "analysis":
+        operation = "analyze"
 
     metric = primary_cap.get("metric") or cap_ctx.get("metric") or plan_data.get("metric")
+    if not metric:
+        q_low = raw_query.lower()
+        if "revenue" in q_low or "billing" in q_low:
+            metric = "revenue"
+        elif "receivable" in q_low or "invoice" in q_low:
+            metric = "receivables"
     dimension = (
         primary_cap.get("dimension") or primary_cap.get("entity") or primary_cap.get("group_by") or
         cap_ctx.get("dimension") or cap_ctx.get("group_by") or cap_ctx.get("entity") or plan_data.get("dimension")
@@ -99,24 +108,50 @@ def to_canonical_intent(plan_data: Dict[str, Any], raw_query: str) -> CanonicalI
                     ent_str = str(ent.get("type") or ent.get("entity_type") or ent.get("value") or "").lower().strip()
                 else:
                     ent_str = str(ent).lower().strip()
-                if ent_str in ("department", "service_line", "customer", "employee", "project"):
-                    dimension = ent_str
+                if ent_str in ("department", "service_line", "customer", "employee", "project", "month", "months"):
+                    dimension = "month" if ent_str in ("month", "months") else ent_str
                     break
 
     if not dimension:
-        goal_str = str(plan_data.get("business_goal") or "").lower()
-        query_str = str(raw_query or "").lower()
-        if "customer" in goal_str or "customer" in query_str or "client" in query_str:
-            dimension = "customer"
-        elif "department" in goal_str or "department" in query_str or "dept" in query_str:
-            dimension = "department"
-        elif "service_line" in goal_str or "service line" in query_str:
+        q_lower = raw_query.lower()
+        if any(w in q_lower for w in ["service line", "service_line", "serviceline", "service lines"]):
             dimension = "service_line"
-        elif "employee" in goal_str or "employee" in query_str or "staff" in query_str:
+        elif any(w in q_lower for w in ["customer", "client", "customers", "clients"]):
+            dimension = "customer"
+        elif any(w in q_lower for w in ["department", "departments", "dept"]):
+            dimension = "department"
+        elif any(w in q_lower for w in ["employee", "staff", "employees"]):
             dimension = "employee"
+        elif any(w in q_lower for w in ["month", "months", "monthly"]):
+            dimension = "month"
 
-    # Check if a specific target entity is present in plan_data or entities
+    if not dimension and cap_id:
+        from registry.capability_catalog import get_capability_default_dimension
+        dimension = get_capability_default_dimension(cap_id)
+
+    # Check if a specific target entity filter is present in plan_data or entities (role="filter")
     raw_entities_check = plan_data.get("resolved_entities") or plan_data.get("entities") or []
+    if not raw_entities_check:
+        from agent.entity_resolver import extract_entities_from_text
+        raw_entities_check = extract_entities_from_text(raw_query) or []
+
+    if not dimension and raw_entities_check:
+        for ent in raw_entities_check:
+            if isinstance(ent, dict):
+                e_type = str(ent.get("type") or ent.get("entity_type") or "").lower().strip()
+                if e_type in ("customer", "client"):
+                    dimension = "customer"
+                    break
+                elif e_type in ("service_line", "serviceline"):
+                    dimension = "service_line"
+                    break
+                elif e_type in ("department", "dept"):
+                    dimension = "department"
+                    break
+                elif e_type in ("employee", "staff"):
+                    dimension = "employee"
+                    break
+
     has_specific_entity = False
     from agent.entity_resolver import is_reserved_business_term
     if isinstance(raw_entities_check, list):
@@ -124,54 +159,131 @@ def to_canonical_intent(plan_data: Dict[str, Any], raw_query: str) -> CanonicalI
             if isinstance(ent, dict):
                 ent_name = str(ent.get("name") or ent.get("entity_name") or ent.get("value") or "").strip()
                 ent_type = str(ent.get("type") or ent.get("entity_type") or "").strip()
+                ent_role = str(ent.get("role") or "filter").strip().lower()
             else:
                 ent_name = str(ent).strip()
                 ent_type = ""
-            if ent_name and not is_reserved_business_term(ent_name) and ent_name.lower() not in (ent_type.lower(), "customer", "department", "service_line", "service line", "employee", "project"):
+                ent_role = "filter"
+            if ent_role == "filter" and ent_name and not is_reserved_business_term(ent_name) and ent_name.lower() not in (ent_type.lower(), "customer", "department", "service_line", "service line", "employee", "project"):
                 has_specific_entity = True
                 break
+
+    # Dynamic Capability Alignment for customer/employee dimensions
+    q_low = raw_query.lower()
+    has_customer_entity = (
+        dimension == "customer"
+        or any(str(e.get("type") or e.get("entity_type") or "").lower() in ("customer", "client") for e in raw_entities_check if isinstance(e, dict))
+        or (has_specific_entity and cap_id in ("customer_resolution", "entity_discovery") and not any(str(e.get("type") or e.get("entity_type") or "").lower() in ("employee", "service_line", "department", "project") for e in raw_entities_check if isinstance(e, dict)))
+    )
+
+    if (has_customer_entity or "revenue" in q_low or "billing" in q_low or metric == "revenue") and cap_id in (None, "gp_performance", "customer_resolution", "entity_discovery"):
+        if "receivable" in q_low or "invoice" in q_low:
+            cap_id = "receivables_analysis"
+            if operation in ("entity_discovery", "lookup", "search"):
+                operation = "summary"
+            dimension = dimension or "customer"
+        elif "proposal" in q_low:
+            cap_id = "proposal_search"
+            if operation in ("entity_discovery", "lookup", "search"):
+                operation = "summary"
+            dimension = dimension or "customer"
+        elif "profile" in q_low or "contact" in q_low or "bank" in q_low:
+            cap_id = "customer_360_profile"
+            dimension = dimension or "customer"
+        elif "revenue" in q_low or "billing" in q_low or metric == "revenue":
+            cap_id = "revenue_analysis"
+            metric = "revenue"
+            if operation in ("entity_discovery", "lookup", "search"):
+                operation = "summary"
+            dimension = dimension or "customer"
+        elif cap_id not in ("customer_resolution", "entity_discovery"):
+            cap_id = "revenue_analysis"
+            dimension = dimension or "customer"
+    elif (dimension == "employee" or any(str(e.get("type") or e.get("entity_type") or "").lower() in ("employee", "staff") for e in raw_entities_check if isinstance(e, dict))) and cap_id in (None, "gp_performance"):
+        if "billing" in q_low or "timesheet" in q_low or "chargeable" in q_low:
+            cap_id = "staff_billing_report"
+        else:
+            cap_id = "kpi_summary"
+
+    q_low = raw_query.lower()
+    if re.search(r'\b(gp|gross\s+profit)\b', q_low) and cap_id in (None, "kpi_summary", "entity_discovery", "staff_billing_report"):
+        cap_id = "gp_performance"
+        if not metric or metric == "kpi":
+            if "variance" in q_low:
+                metric = "variance"
+            else:
+                metric = "actual_gp"
+
+    if cap_id == "gp_performance" and not metric:
+        if "variance" in q_low:
+            metric = "variance"
+        elif any(k in q_low for k in ("target", "budget")):
+            metric = "target_gp"
+        elif "percent" in q_low or "%" in q_low:
+            metric = "gp_percent"
+        else:
+            metric = "actual_gp"
+
+    # Check if query has explanatory/analytical intent
+    expected_result_type = plan_data.get("expected_result_type") or primary_cap.get("expected_result_type")
+    exp_res_type = str(expected_result_type or "").lower().strip()
+    bg_lower = str(plan_data.get("business_goal", "")).lower().strip()
+    rq_lower = str(raw_query).lower().strip()
+    is_explanatory = (
+        exp_res_type in ("explanation", "insight") or
+        operation in ("analyze", "analysis", "explanation") or
+        any(k in bg_lower for k in ["explain", "why", "reason", "cause"]) or
+        any(k in rq_lower for k in ["why", "explain", "reason for", "cause of"])
+    )
+    has_explicit_ranking_kw = any(k in rq_lower for k in ["top ", "top 3", "top 5", "top 10", "highest", "best", "worst", "lowest", "rank", "ranking", "ranked", "bottom", "least", "most"])
 
     # Force operation == 'ranking' if explicit ranking or limit params are present for analytical queries
     has_ranking_param = bool(
         primary_cap.get("ranking") or primary_cap.get("limit") or cap_ctx.get("limit") or cap_ctx.get("ranking") or
         plan_data.get("ranking") or plan_data.get("limit")
     )
-    is_explicit_kpi_ranking = cap_id == "kpi_summary" and has_ranking_param and any(k in raw_query.lower() for k in ["top", "ranking", "highest", "best", "worst", "lowest"])
-    is_explicit_gp_ranking = cap_id == "gp_performance" and (has_ranking_param or any(k in raw_query.lower() for k in ["top", "ranking", "highest", "best", "worst", "lowest"]))
+    is_explicit_kpi_ranking = cap_id == "kpi_summary" and (has_ranking_param or has_explicit_ranking_kw) and has_explicit_ranking_kw
+    is_explicit_gp_ranking = cap_id == "gp_performance" and (has_ranking_param or has_explicit_ranking_kw) and has_explicit_ranking_kw
 
-    if cap_id == "kpi_summary" and not is_explicit_kpi_ranking:
+    if is_explanatory and not has_explicit_ranking_kw:
+        operation = "analyze"
+        expected_result_type = "explanation"
+        pres_mode = "EXPLANATION"
+    elif cap_id == "kpi_summary" and not is_explicit_kpi_ranking:
         operation = "summary"
+        expected_result_type = "summary"
+        pres_mode = plan_data.get("presentation_mode") or "REPORT"
     elif cap_id == "gp_performance" and not is_explicit_gp_ranking:
         operation = "summary"
-    elif has_ranking_param or (operation == "ranking" and not has_specific_entity and cap_id not in ("kpi_summary", "gp_performance")) or primary_cap.get("intent") == "ranking":
+        expected_result_type = "summary"
+        pres_mode = plan_data.get("presentation_mode") or "REPORT"
+    elif (has_ranking_param or operation == "ranking" or primary_cap.get("intent") == "ranking") and has_explicit_ranking_kw and not has_specific_entity:
         operation = "ranking"
-        if not dimension:
-            dimension = "customer"
-    elif dimension and dimension in ("customer", "department", "service_line", "employee") and operation in ("summary", "generate_report", "analyze", "analytical_query") and not has_specific_entity and cap_id not in ("kpi_summary", "gp_performance"):
+        if not dimension and cap_id:
+            from registry.capability_catalog import get_capability_default_dimension
+            dimension = get_capability_default_dimension(cap_id)
+        pres_mode = plan_data.get("presentation_mode") or "REPORT"
+    elif dimension and has_explicit_ranking_kw and not has_specific_entity:
         operation = "ranking"
+        pres_mode = plan_data.get("presentation_mode") or "REPORT"
 
     # Comparison normalization
     raw_comp = primary_cap.get("comparison") or cap_ctx.get("comparison") or plan_data.get("comparison") or primary_cap.get("comparison_periods") or cap_ctx.get("comparison_periods")
     if operation == "comparison" or raw_comp or primary_cap.get("intent") == "comparison":
         operation = "comparison"
 
-    expected_result_type = primary_cap.get("expected_result_type") or plan_data.get("expected_result_type") or operation
-    if cap_id == "kpi_summary" and not is_explicit_kpi_ranking:
-        expected_result_type = "summary"
-    elif cap_id == "gp_performance" and not is_explicit_gp_ranking:
-        expected_result_type = "summary"
-    elif operation in ("ranking", "comparison") and expected_result_type in ("summary", "generate_report"):
-        expected_result_type = operation
+    if not expected_result_type:
+        expected_result_type = primary_cap.get("expected_result_type") or plan_data.get("expected_result_type") or operation
 
     # Ranking normalization
     ranking_spec = None
-    if (operation == "ranking" or (has_ranking_param and cap_id != "kpi_summary")) and (cap_id != "kpi_summary" or is_explicit_kpi_ranking):
+    if has_explicit_ranking_kw and (operation == "ranking" or has_ranking_param) and not (is_explanatory and not has_explicit_ranking_kw):
         raw_sort = str(primary_cap.get("sort_order") or primary_cap.get("ranking") or cap_ctx.get("sort_order") or plan_data.get("ranking") or "desc").lower()
-        sort_dir = "asc" if raw_sort == "asc" else "desc"
+        sort_dir = "asc" if (raw_sort == "asc" or any(w in rq_lower for w in ("worst", "lowest", "bottom", "least"))) else "desc"
         limit_val = primary_cap.get("limit") or cap_ctx.get("limit") or plan_data.get("limit") or 1
         ranking_spec = RankingSpec(direction=sort_dir, limit=limit_val)
         if not metric:
-            metric = "revenue"
+            metric = primary_cap.get("primary_metric") or primary_cap.get("default_ranking_field")
 
     # Comparison normalization with multi-period extraction
     comparison_spec = None
@@ -220,6 +332,9 @@ def to_canonical_intent(plan_data: Dict[str, Any], raw_query: str) -> CanonicalI
     )
 
     raw_entities = plan_data.get("resolved_entities") or plan_data.get("entities") or []
+    if not raw_entities:
+        from agent.entity_resolver import extract_entities_from_text
+        raw_entities = extract_entities_from_text(raw_query) or []
     from agent.entity_resolver import is_reserved_business_term
     sanitized_entities = []
     for ent in raw_entities:
@@ -232,13 +347,91 @@ def to_canonical_intent(plan_data: Dict[str, Any], raw_query: str) -> CanonicalI
         sanitized_entities.append(ent)
 
     filters = primary_cap.get("filters") or plan_data.get("filters") or {}
+    if not isinstance(filters, dict):
+        filters = {}
+
+    # Extract explicit column projection if user specifies "with <col1> and <col2>" or "only <col1>"
+    req_cols = filters.get("requested_columns") or cap_ctx.get("requested_columns")
+    if not req_cols:
+        q_lower = raw_query.lower()
+        if any(w in q_lower for w in [" with ", " only ", " columns ", " fields ", " including "]):
+            col_patterns = [
+                ("project_name", ["project name", "project names", "project"]),
+                ("customer_name", ["customer name", "client name", "customer names", "client names", "customer", "client"]),
+                ("service_line", ["service line", "service lines", "serviceline"]),
+                ("approved_fees", ["approved fees", "approved fee", "fees", "fee"]),
+                ("actual_recoverability", ["actual recoverability", "actual recoverability percentage", "actual recoverability pct"]),
+                ("project_status", ["project status", "status"]),
+                ("estimated_recoverability", ["estimated recoverability", "proposal recoverability", "est recoverability"]),
+                ("performing_gp", ["performing gp", "actual gp", "gross profit"]),
+                ("target_gp", ["target gp", "gp target"]),
+                ("variance", ["variance", "gap", "shortfall"]),
+            ]
+            trigger_match = re.search(r'\b(?:with|only|including|showing|show)\s+(.+)$', q_lower)
+            target_str = trigger_match.group(1) if trigger_match else q_lower
+            matched_cols = []
+            for col_key, phrases in col_patterns:
+                if any(p in target_str for p in phrases):
+                    if col_key not in matched_cols:
+                        matched_cols.append(col_key)
+            if len(matched_cols) >= 1:
+                req_cols = matched_cols
+                filters["requested_columns"] = matched_cols
+                if isinstance(cap_ctx, dict):
+                    cap_ctx["requested_columns"] = matched_cols
+
     missing_info = list(plan_data.get("missing_information") or [])
-    if not is_explicit and "temporal_scope" not in missing_info:
-        missing_info.append("temporal_scope")
+    TEMPORAL_MISSING_TERMS = {
+        "date_range", "financial_year", "start_date", "end_date",
+        "temporal_scope", "period", "time_filter", "dates", "timeframe", "time_period",
+        "month", "months", "specific months", "specific_months"
+    }
+    if temporal_spec and temporal_spec.start_date and temporal_spec.end_date:
+        missing_info = [
+            m for m in missing_info
+            if m.lower().strip() not in TEMPORAL_MISSING_TERMS
+        ]
+
+    if metric:
+        missing_info = [m for m in missing_info if m.lower().strip() not in ("metric", "metrics")]
+    if cap_id:
+        missing_info = [m for m in missing_info if m.lower().strip() not in ("capability", "report", "intent")]
+    if dimension:
+        missing_info = [m for m in missing_info if m.lower().strip() not in ("dimension", "group_by")]
+    if operation == "analyze":
+        missing_info = [
+            m for m in missing_info
+            if m.lower().strip() not in (
+                "field", "fields", "field context", "field_context",
+                "context", "dimension", "dimensions", "reason", "cause",
+                "explanation", "variance"
+            )
+        ]
 
     confidence = float(plan_data.get("confidence_score", 1.0))
+    if not missing_info and confidence < 1.0 and not plan_data.get("entity_errors"):
+        confidence = 1.0
+
     business_goal = plan_data.get("business_goal", "")
-    pres_mode = plan_data.get("presentation_mode") or primary_cap.get("presentation_mode") or "REPORT"
+    exp_res_type = str(expected_result_type or "").lower().strip()
+    bg_lower = str(business_goal).lower().strip()
+    rq_lower = str(raw_query).lower().strip()
+
+    is_explanatory = (
+        exp_res_type in ("explanation", "insight") or
+        operation in ("analyze", "analysis", "explanation") or
+        any(k in bg_lower for k in ["explain", "why", "reason", "cause"]) or
+        any(k in rq_lower for k in ["why", "explain", "reason for", "cause of"])
+    )
+
+    if is_explanatory and not has_explicit_ranking_kw:
+        operation = "analyze"
+        pres_mode = "EXPLANATION"
+        if not expected_result_type or expected_result_type == "summary":
+            expected_result_type = "explanation"
+        ranking_spec = None
+    else:
+        pres_mode = plan_data.get("presentation_mode") or primary_cap.get("presentation_mode") or "REPORT"
 
     canonical = CanonicalIntent(
         raw_query=raw_query,

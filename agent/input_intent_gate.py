@@ -102,39 +102,69 @@ async def evaluate_input_intent(
 
         resp = await llm.ainvoke([{"role": "user", "content": prompt}])
         gate_token_usage = extract_token_usage(resp)
-        raw_text = clean_think_tags(resp.content.strip())
+        raw_text = clean_think_tags(resp.content.strip()) if hasattr(resp, "content") and resp.content else ""
 
+        # Extract JSON safely from LLM output (handle markdown fences and empty responses)
+        clean_text = re.sub(r'^```(?:json)?\s*', '', raw_text.strip(), flags=re.MULTILINE)
+        clean_text = re.sub(r'\s*```$', '', clean_text.strip(), flags=re.MULTILINE)
 
-        # Extract JSON from LLM output
-        json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+        json_match = re.search(r'\{.*\}', clean_text, re.DOTALL)
+        data = None
         if json_match:
-            json_str = json_match.group(0)
+            try:
+                data = json.loads(json_match.group(0))
+            except Exception:
+                data = None
+
+        if not data and clean_text.strip():
+            try:
+                data = json.loads(clean_text)
+            except Exception:
+                data = None
+
+        if data and isinstance(data, dict):
+            raw_type = str(data.get("input_type", "BUSINESS_QUERY")).upper().strip()
+            confidence = float(data.get("confidence", 0.9))
+            reason = str(data.get("reason", ""))
+
+            if raw_type not in InputType.__members__:
+                raw_type = "BUSINESS_QUERY"
+
+            input_type = InputType(raw_type)
+            requires_planner = input_type in (InputType.BUSINESS_QUERY, InputType.ENTITY_ONLY, InputType.CLARIFICATION)
+
+            result = InputIntentResult(
+                input_type=input_type,
+                confidence=confidence,
+                requires_planner=requires_planner,
+                reason=reason
+            )
+
+            logger.info(
+                f"[INPUT_INTENT_GATE] input_type={result.input_type.value} confidence={result.confidence} "
+                f"requires_planner={result.requires_planner} reason='{result.reason}'"
+            )
+            return result
         else:
-            json_str = raw_text
+            # Safe structured fallback when LLM produces empty or non-JSON output
+            logger.info("[INPUT_INTENT_GATE] Non-JSON or empty LLM output; evaluating context-aware fallback")
+            q_strip = question.strip()
+            if (q_strip.startswith("{") and q_strip.endswith("}")) or (q_strip.startswith("[") and q_strip.endswith("]")):
+                return InputIntentResult(
+                    input_type=InputType.TECHNICAL_PASTE,
+                    confidence=0.95,
+                    requires_planner=False,
+                    reason="Raw JSON structure detected"
+                )
 
-        data = json.loads(json_str)
-        raw_type = str(data.get("input_type", "BUSINESS_QUERY")).upper().strip()
-        confidence = float(data.get("confidence", 0.9))
-        reason = str(data.get("reason", ""))
-
-        if raw_type not in InputType.__members__:
-            raw_type = "BUSINESS_QUERY"
-
-        input_type = InputType(raw_type)
-        requires_planner = input_type in (InputType.BUSINESS_QUERY, InputType.ENTITY_ONLY, InputType.CLARIFICATION)
-
-        result = InputIntentResult(
-            input_type=input_type,
-            confidence=confidence,
-            requires_planner=requires_planner,
-            reason=reason
-        )
-
-        logger.info(
-            f"[INPUT_INTENT_GATE] input_type={result.input_type.value} confidence={result.confidence} "
-            f"requires_planner={result.requires_planner} reason='{result.reason}'"
-        )
-        return result
+            # Preserve conversational follow-up context if present
+            prev_plan = (user_context or {}).get("previous_execution_plan")
+            return InputIntentResult(
+                input_type=InputType.BUSINESS_QUERY,
+                confidence=0.85 if prev_plan else 0.7,
+                requires_planner=True,
+                reason="Safe fallback to BUSINESS_QUERY on empty/non-JSON LLM response"
+            )
 
     except Exception as e:
         logger.warning(f"[INPUT_INTENT_GATE] LLM evaluation error: {e}; evaluating fallback")
@@ -147,9 +177,11 @@ async def evaluate_input_intent(
                 reason="Raw JSON structure detected"
             )
 
+        prev_plan = (user_context or {}).get("previous_execution_plan")
         return InputIntentResult(
             input_type=InputType.BUSINESS_QUERY,
-            confidence=0.5,
+            confidence=0.8 if prev_plan else 0.5,
             requires_planner=True,
             reason=f"Fallback due to evaluation error: {e}"
         )
+

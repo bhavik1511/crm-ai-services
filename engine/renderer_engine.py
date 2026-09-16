@@ -20,14 +20,89 @@ from registry.metadata_registry import get_registry, register_renderer
 logger = logging.getLogger(__name__)
 
 IGNORED_KEYS = {
-    "operation", "dimension", "metric", "aggregation", 
+    "operation", "dimension", "metric", "ranking_field", "result_type", "aggregation", 
     "query_operation", "execution_contract", "status_filter", 
     "temporal_scope", "status", "rejection_reasons", "full_capability_spec",
     "capability", "capability_id", "intent", "confidence", "source",
     "implementation_type", "priority", "function_call", "execution_time_ms",
     "http_status", "error", "endpoint", "backend_endpoint", "authoritative",
-    "requested_metric", "returned_metric"
+    "requested_metric", "returned_metric", "missing_information", "financial_year"
 }
+
+TECHNICAL_OMIT_KEYS = {
+    "created_by", "createdBy", "created_at", "createdAt", "updated_at", "updatedAt",
+    "id", "service_line_id", "serviceLineId", "sl_id", "department_id", "departmentId",
+    "customer_id", "customerId", "client_id", "clientId", "projectId", "project_id",
+    "employee_id", "employeeId", "status_id", "statusId", "proposal_id", "proposalId",
+    "short_name", "short_code", "chargeable_hours", "sort_order", "order", "month_order"
+}
+
+
+def flatten_nested_record(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Generically flattens nested business entity dicts into clean, top-level business fields.
+    Extracts human-readable names and authoritative metrics while suppressing technical IDs and raw JSON objects.
+    """
+    if not isinstance(row, dict):
+        return row
+
+    flat = {}
+    
+    # 1. Copy top-level scalar keys
+    for k, v in row.items():
+        if not isinstance(v, (dict, list)):
+            flat[k] = v
+
+    # 2. Extract meaningful fields from nested dicts
+    for k, v in row.items():
+        if isinstance(v, dict):
+            name_val = v.get("name") or v.get("customer_name") or v.get("employee_name") or v.get("title") or v.get("label")
+            if name_val is not None:
+                if k in ("clientDetail", "client", "customer"):
+                    flat.setdefault("customer_name", name_val)
+                elif k in ("serviceLine", "service_line"):
+                    flat.setdefault("service_line", name_val)
+                elif k in ("projectStatus", "status"):
+                    flat.setdefault("project_status", name_val)
+                elif k in ("serviceType", "service_type"):
+                    flat.setdefault("service_type", name_val)
+                elif k in ("clientRelation", "client_relation"):
+                    flat.setdefault("client_relation", name_val)
+                elif k in ("managerEmployee", "manager"):
+                    flat.setdefault("manager", name_val)
+                elif k in ("partnerInventory", "partner"):
+                    flat.setdefault("partner", name_val)
+                elif k in ("custGroup", "customer_group"):
+                    flat.setdefault("customer_group", name_val)
+                else:
+                    clean_k = re.sub(r'(?<!^)(?=[A-Z])', '_', k).lower()
+                    flat.setdefault(clean_k, name_val)
+
+            if k in ("proposal", "jobEstimation", "job_estimation"):
+                for prop_metric in ("approved_fees", "agreed_fees", "proposed_fees", "total_costs", "actual_recoverability"):
+                    if v.get(prop_metric) is not None:
+                        flat.setdefault(prop_metric, v[prop_metric])
+                if v.get("recoverability") is not None:
+                    flat.setdefault("estimated_recoverability", v["recoverability"])
+                if isinstance(v.get("jobEstimation"), dict):
+                    je = v["jobEstimation"]
+                    for je_metric in ("actual_recoverability", "total_actual_cost", "total_costs"):
+                        if je.get(je_metric) is not None:
+                            flat.setdefault(je_metric, je[je_metric])
+                    if je.get("recoverability") is not None:
+                        flat.setdefault("estimated_recoverability", je["recoverability"])
+
+    # 3. Standardize common business field aliases
+    if "project_name" not in flat and "name" in flat:
+        flat["project_name"] = flat["name"]
+    if "customer_name" not in flat and "customer" in flat:
+        flat["customer_name"] = flat["customer"]
+    if flat.get("actual_recoverability") is None:
+        rec = flat.get("actualRecoverability") or flat.get("actual_recoverability_percentage")
+        if rec is not None:
+            flat["actual_recoverability"] = rec
+
+    return flat
 
 def _format_date_val(val: Any) -> str:
     """Helper to convert ISO timestamps to clean human-readable dates."""
@@ -76,8 +151,9 @@ def _format_cell_val(val: Any, col_name: str = "") -> str:
     is_currency_col = any(k in col_lower for k in [
         "amount", "receivables", "revenue", "fee", "cost", "budget", 
         "net", "gross", "billing", "metric_val", "price", "due", "paid",
-        "balance_to_achieve", "performing", "target", "secured_business", "secured"
-    ]) and not any(k in col_lower for k in ["count", "records", "id", "projects", "proposals"])
+        "balance_to_achieve", "performing", "target", "secured_business", "secured",
+        "variance", "actual_gp", "target_gp"
+    ]) and not any(k in col_lower for k in ["count", "records", "id", "projects", "proposals", "pct", "percent"])
 
     if isinstance(val, (int, float)):
         if is_currency_col or (isinstance(val, float) and val > 100):
@@ -201,7 +277,7 @@ def _render_single_entity_kpi(row: Dict[str, Any], title: str) -> str:
             if isinstance(v, (int, float)):
                 target_val = v
                 target_key = k
-        elif trend_val is None and any(p in k_lower for p in ["trend", "variance", "growth", "change_pct", "pct"]):
+        elif trend_val is None and any(p in k_lower for p in ["trend", "growth_pct", "change_pct", "pct"]):
             trend_val = v
             trend_key = k
 
@@ -251,7 +327,7 @@ def _render_single_entity_kpi(row: Dict[str, Any], title: str) -> str:
         if k.startswith("_") or k_lower in IGNORED_KEYS or k in keys_to_skip or k_lower in keys_to_skip:
             continue
 
-        if any(p in k_lower for p in ["trend", "pct", "percentage", "variance", "growth", "rate"]):
+        if any(p in k_lower for p in ["trend", "pct", "percentage", "growth_pct", "rate_pct"]):
             formatted_val = _format_trend_val(v)
         else:
             formatted_val = _format_cell_val(v, k)
@@ -324,62 +400,68 @@ def render_deterministic_response(
 
     lines = [f"### 📊 {title}\n"]
 
+    def _render_table_rows(raw_items: List[Any], tbl_title: str) -> str:
+        flat_rows = [flatten_nested_record(r) if isinstance(r, dict) else r for r in raw_items]
+        if not flat_rows:
+            return f"### 📊 {tbl_title}\n\nNo records found."
+        if len(flat_rows) == 1 and isinstance(flat_rows[0], dict):
+            return _render_single_entity_kpi(flat_rows[0], tbl_title)
+
+        first_row = flat_rows[0]
+        if not isinstance(first_row, dict):
+            t_lines = [f"### 📊 {tbl_title}\n"]
+            for item in flat_rows[:10]:
+                t_lines.append(f"- {_format_cell_val(item)}")
+            return "\n".join(t_lines)
+
+        contract = capability_metadata.get("response_contract") or {}
+        default_cols = contract.get("default_columns") or capability_metadata.get("default_columns")
+        requested_cols = (
+            capability_metadata.get("requested_columns")
+            or contract.get("requested_columns")
+            or (capability_metadata.get("context", {}).get("requested_columns") if isinstance(capability_metadata.get("context"), dict) else None)
+            or (capability_metadata.get("filters", {}).get("requested_columns") if isinstance(capability_metadata.get("filters"), dict) else None)
+        )
+
+        omit_keys = set(IGNORED_KEYS) | set(TECHNICAL_OMIT_KEYS)
+        if requested_cols and any(c in first_row for c in requested_cols):
+            headers = [c for c in requested_cols if c in first_row or any(c in r for r in flat_rows if isinstance(r, dict))]
+        elif default_cols and any(c in first_row for c in default_cols):
+            headers = [c for c in default_cols if c in first_row or any(c in r for r in flat_rows if isinstance(r, dict))]
+        else:
+            headers = [k for k in first_row.keys() if not k.startswith("_") and k.lower() not in omit_keys and not isinstance(first_row.get(k), (dict, list))]
+
+        t_lines = [f"### 📊 {tbl_title}\n"]
+        t_lines.append("| " + " | ".join(h.replace("_", " ").title() for h in headers) + " |")
+        t_lines.append("| " + " | ".join("---" for _ in headers) + " |")
+        for row in flat_rows[:15]:
+            if not isinstance(row, dict):
+                continue
+            row_vals = []
+            for h in headers:
+                val = row.get(h, "")
+                if any(p in h.lower() for p in ["trend", "growth_pct", "rate_pct"]):
+                    row_vals.append(_format_trend_val(val))
+                else:
+                    row_vals.append(_format_cell_val(val, h))
+            t_lines.append("| " + " | ".join(row_vals) + " |")
+
+        if len(flat_rows) > 15:
+            t_lines.append(f"\n_*Showing top 15 of {len(flat_rows)} records.*_")
+        return "\n".join(t_lines)
+
     # 1. Handle List Payload Shape
     if isinstance(payload, list):
-        if not payload:
-            return f"### 📊 {title}\n\nNo records found."
-
-        # Single Entity List (1 row) -> Executive KPI Card Presentation
-        if len(payload) == 1 and isinstance(payload[0], dict):
-            return _render_single_entity_kpi(payload[0], title)
-
-        # Multi-Entity List (2+ rows) -> Comparison Table Presentation
-        first_row = payload[0]
-        if isinstance(first_row, dict):
-            has_name = any(k in first_row for k in ["service_line_name", "department_name", "customer_name", "project_name", "employee_name", "name"])
-            omit_keys = set(IGNORED_KEYS)
-            if has_name:
-                omit_keys.update({"service_line_id", "serviceLineId", "sl_id", "department_id", "departmentId", "customer_id", "projectId", "project_id", "employee_id", "id", "short_name", "short_code"})
-
-            headers = [k for k in first_row.keys() if not k.startswith("_") and k.lower() not in omit_keys]
-            lines.append("| " + " | ".join(h.replace("_", " ").title() for h in headers) + " |")
-            lines.append("| " + " | ".join("---" for _ in headers) + " |")
-            for row in payload[:15]:
-                row_vals = []
-                for h in headers:
-                    val = row.get(h, "")
-                    if any(p in h.lower() for p in ["trend", "variance", "pct", "percentage", "growth", "rate"]):
-                        row_vals.append(_format_trend_val(val))
-                    else:
-                        row_vals.append(_format_cell_val(val, h))
-                lines.append("| " + " | ".join(row_vals) + " |")
-
-            if len(payload) > 15:
-                lines.append(f"\n_*Showing top 15 of {len(payload)} records.*_")
-        else:
-            for item in payload[:10]:
-                lines.append(f"- {_format_cell_val(item)}")
-
-        return "\n".join(lines)
+        return _render_table_rows(payload, title)
 
     # 2. Handle Dict Payload Shape
     if isinstance(payload, dict):
         # 2a. Dedicated Ranking Table Renderer
-        if payload.get("result_type") == "ranking_table" or "ranking_data" in payload:
-            dim_title = str(payload.get("dimension") or "Category").replace("_", " ").title()
-            metric_title = str(payload.get("metric_label") or payload.get("metric") or "Revenue").replace("_", " ").title()
-            ranking_data = payload.get("ranking_data") or []
-            limit_val = payload.get("limit") or len(ranking_data)
-
-            lines = [f"### 📊 Top {limit_val} {dim_title}s by {metric_title}\n"]
-            lines.append(f"| Rank | {dim_title} | {metric_title} |")
-            lines.append("| --- | --- | --- |")
-            for item in ranking_data:
-                rank = item.get("rank", "-")
-                name = item.get("entity_name", "-")
-                amt_str = item.get("formatted_amount") or _format_cell_val(item.get("amount"), "amount")
-                lines.append(f"| {rank} | {name} | {amt_str} |")
-            return "\n".join(lines)
+        if payload.get("result_type") in ("ranking_table", "ranking_data") or "ranking_data" in payload or payload.get("operation") == "ranking":
+            from agent.synthesizer import render_generic_ranking_presentation
+            ranking_card = render_generic_ranking_presentation(payload_envelope if payload_envelope else payload)
+            if ranking_card:
+                return ranking_card
 
         # 2b. Dedicated Comparison Table Renderer
         if payload.get("result_type") == "comparison_table" or "comparison_periods" in payload:
@@ -407,33 +489,7 @@ def render_deterministic_response(
         # Check for nested list of rows/records/data/items
         rows_list = payload.get("rows") or payload.get("records") or payload.get("data") or payload.get("items") or payload.get("projects") or payload.get("proposals")
         if isinstance(rows_list, list):
-            if len(rows_list) == 1 and isinstance(rows_list[0], dict):
-                return _render_single_entity_kpi(rows_list[0], title)
-            elif len(rows_list) > 1:
-                first_row = rows_list[0]
-                if isinstance(first_row, dict):
-                    has_name = any(k in first_row for k in ["service_line_name", "department_name", "customer_name", "project_name", "employee_name", "name"])
-                    omit_keys = set(IGNORED_KEYS)
-                    if has_name:
-                        omit_keys.update({"service_line_id", "serviceLineId", "sl_id", "department_id", "departmentId", "customer_id", "projectId", "project_id", "employee_id", "id", "short_name", "short_code"})
-
-                    headers = [k for k in first_row.keys() if not k.startswith("_") and k.lower() not in omit_keys]
-                    lines = [f"### 📊 {title}\n"]
-                    lines.append("| " + " | ".join(h.replace("_", " ").title() for h in headers) + " |")
-                    lines.append("| " + " | ".join("---" for _ in headers) + " |")
-                    for row in rows_list[:15]:
-                        row_vals = []
-                        for h in headers:
-                            val = row.get(h, "")
-                            if any(p in h.lower() for p in ["trend", "variance", "pct", "percentage", "growth", "rate"]):
-                                row_vals.append(_format_trend_val(val))
-                            else:
-                                row_vals.append(_format_cell_val(val, h))
-                        lines.append("| " + " | ".join(row_vals) + " |")
-
-                    if len(rows_list) > 15:
-                        lines.append(f"\n_*Showing top 15 of {len(rows_list)} records.*_")
-                    return "\n".join(lines)
+            return _render_table_rows(rows_list, title)
 
         # Check if dict itself is a single-entity record with metric fields
         has_metric_keys = any(k.lower() in ["performing", "target", "revenue", "trend", "actual", "secured_business", "balance_to_achieve"] for k in payload.keys())
@@ -459,7 +515,7 @@ def render_deterministic_response(
         if scalar_fields:
             for field_name, val in scalar_fields:
                 formatted_name = field_name.replace("_", " ").title()
-                if any(p in field_name.lower() for p in ["trend", "variance", "pct", "percentage", "growth", "rate"]):
+                if any(p in field_name.lower() for p in ["trend", "pct", "percentage", "growth_pct", "rate_pct"]):
                     formatted_val = _format_trend_val(val)
                 else:
                     formatted_val = _format_cell_val(val, field_name)
@@ -478,7 +534,7 @@ def render_deterministic_response(
                     row_vals = []
                     for h in headers:
                         val = r.get(h, "")
-                        if any(p in h.lower() for p in ["trend", "variance", "pct", "percentage", "growth", "rate"]):
+                        if any(p in h.lower() for p in ["trend", "pct", "percentage", "growth_pct", "rate_pct"]):
                             row_vals.append(_format_trend_val(val))
                         else:
                             row_vals.append(_format_cell_val(val, h))

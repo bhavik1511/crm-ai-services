@@ -9,8 +9,8 @@ import re
 import json
 import logging
 import asyncio
-from typing import Dict, Any, List, Optional
-from pydantic import BaseModel, Field
+from typing import Dict, Any, List, Optional, Union
+from pydantic import BaseModel, Field, field_validator
 from dataclasses import dataclass
 
 # LangChain imports for dynamic structured output
@@ -45,8 +45,9 @@ class RequestContext:
 # Structured Execution Plan Schema (Single Source of Truth)
 # ---------------------------------------------------------------------------
 class EntityInfo(BaseModel):
-    type: str = Field(description="The type of entity, e.g., 'customer', 'project', 'employee'.")
-    value: Optional[str] = Field(default="", description="The name or code of the entity to search for.")
+    type: str = Field(description="The type of entity, e.g., 'customer', 'project', 'employee', 'service_line', 'department'.")
+    value: Optional[str] = Field(default="", description="The specific name or identifier of the entity to filter by (e.g. 'John', 'Acme Corp', 'Tax'). Leave empty if asking for a general ranking, group-by, or list.")
+    role: str = Field(default="filter", description="Role of entity: 'filter' (specific target entity to filter by) or 'dimension' (grouping/ranking dimension).")
 
 class CapabilityCallInfo(BaseModel):
     id: str = Field(description="The exact ID of the business capability from the catalog.")
@@ -75,18 +76,32 @@ class CapabilityCallInfo(BaseModel):
     analysis_depth: Optional[str] = Field(None, description="Analysis depth: summary, detailed, executive_briefing.")
 
 class BusinessExecutionPlan(BaseModel):
-    business_goal: str = Field(description="A short summary of the user's business objective.")
-    confidence_score: float = Field(description="Confidence score between 0.0 and 1.0 that this plan perfectly addresses the user's intent.")
+    business_goal: str = Field(default="", description="A short summary of the user's business objective.")
+    confidence_score: float = Field(default=1.0, description="Confidence score between 0.0 and 1.0 that this plan perfectly addresses the user's intent.")
     reasoning_summary: Optional[str] = Field(None, description="Brief explanation of why this plan was selected.")
     ambiguity_detected: bool = Field(False, description="True if the user's intent is ambiguous and clarification would improve accuracy.")
-    entities: list[EntityInfo] = Field(description="ONLY genuine, specific business entities (e.g., 'Phoenix Project', 'ABC Ltd'). DO NOT include broad scopes, metrics, or temporal expressions (e.g., 'January', 'Q1') here.")
-    scope: list[str] = Field(description="Broad intent modifiers or query scopes (e.g., 'All Projects', 'All Customers', 'Company Wide').")
-    business_capabilities: list[CapabilityCallInfo] = Field(description="The abstract business capabilities required to satisfy the goal.")
-    missing_information: list[str] = Field(description="Any critical business context missing from the user's query (e.g., 'Financial Year').")
-    entity_errors: list[str] = Field(description="Populated internally if entity resolution fails.")
+    entities: list[EntityInfo] = Field(default_factory=list, description="ONLY genuine, specific business entities (e.g., 'Phoenix Project', 'ABC Ltd'). DO NOT include broad scopes, metrics, or temporal expressions (e.g., 'January', 'Q1') here.")
+    scope: list[str] = Field(default_factory=list, description="Broad intent modifiers or query scopes (e.g., 'All Projects', 'All Customers', 'Company Wide').")
+    business_capabilities: list[CapabilityCallInfo] = Field(default_factory=list, description="The abstract business capabilities required to satisfy the goal.")
+    missing_information: list[str] = Field(default_factory=list, description="Any critical business context missing from the user's query (e.g., 'Financial Year').")
+    entity_errors: list[str] = Field(default_factory=list, description="Populated internally if entity resolution fails.")
     # Phase 3.1.10 — Plan-level presentation intent
     presentation_mode: Optional[str] = Field(None, description="Overall presentation mode for the response: REPORT, INSIGHT, REPORT_AND_INSIGHT, KPI_CARD, TABLE, COMPARISON, EXECUTIVE_BRIEF.")
     analysis_depth: Optional[str] = Field(None, description="Overall analysis depth: summary, detailed, executive_briefing.")
+
+    @field_validator("scope", mode="before")
+    @classmethod
+    def normalize_scope(cls, v):
+        if isinstance(v, str):
+            return [v]
+        return v or []
+
+    @field_validator("missing_information", "entity_errors", mode="before")
+    @classmethod
+    def normalize_list_fields(cls, v):
+        if isinstance(v, str):
+            return [v]
+        return v or []
 
 
 def _filter_tool_results_by_entity_scope(tool_results: List[Dict[str, Any]], shared_ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -317,7 +332,28 @@ class EnterprisePlanner:
 
         # 0. Structured Input Intent Gate Evaluation
         from .input_intent_gate import evaluate_input_intent, InputType
+        from .conversation_manager import conversation_manager
+        from memory.session_manager import get_session_memory
+
+        session_memory = await get_session_memory(context.session_id) or {}
         previous_plan = context.user_context.get("previous_execution_plan")
+        if not previous_plan and session_memory.get("latest_execution_plan"):
+            previous_plan = session_memory.get("latest_execution_plan")
+            context.user_context["previous_execution_plan"] = previous_plan
+            if session_memory.get("latest_tool_results") and "previous_tool_results" not in context.user_context:
+                context.user_context["previous_tool_results"] = session_memory.get("latest_tool_results")
+
+        # Handle standalone why/trend question without previous execution context
+        if not previous_plan and conversation_manager.is_standalone_why_without_context(context.question):
+            logger.info(f"[ANALYTICAL_FOLLOW_UP] Detected standalone why/trend question without previous execution context. Asking clarification.")
+            return {
+                "type": "done",
+                "content": "I would be glad to help analyze this. Could you please clarify which metric or report you would like me to analyze (such as GP variance by month, Revenue by service line, or Receivables)?",
+                "is_clarification": True,
+                "input_type": "AMBIGUOUS",
+                "token_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            }
+
         has_pending_clar = bool(previous_plan and (previous_plan.get("missing_information") or previous_plan.get("is_clarification")))
         
         ctx_user = dict(context.user_context or {})
@@ -339,7 +375,8 @@ class EnterprisePlanner:
                 "input_type": "TECHNICAL_PASTE"
             }
 
-        if gate_res.input_type == InputType.AMBIGUOUS and not has_pending_clar:
+        is_analytical_followup_query = bool(previous_plan and conversation_manager.is_analytical_followup(context.question, previous_plan))
+        if gate_res.input_type == InputType.AMBIGUOUS and not has_pending_clar and not is_analytical_followup_query:
             logger.info(f"[INPUT_INTENT_GATE] Short-circuiting execution for AMBIGUOUS input.")
             return {
                 "type": "done",
@@ -360,6 +397,8 @@ class EnterprisePlanner:
 
         execution_plan = None
         is_resumed_turn = False
+        is_analytical_followup = False
+        is_new = True
         
         if previous_plan:
             logger.info(f"[Req: {tracker.request_id}] Found previous execution plan in context.")
@@ -367,22 +406,24 @@ class EnterprisePlanner:
             missing_info = previous_plan.get("missing_information", [])
             has_pending_clarification = bool(missing_info or previous_plan.get("is_clarification"))
             
-            is_new = True
             if has_pending_clarification and not is_internal:
-                # If there's an active clarification, run Intent Gate
                 is_new = self._is_new_request(context.question, previous_plan)
-                
-            if not is_new and has_pending_clarification:
-                # RESUME branch
-                is_resumed_turn = True
-                logger.info(f"[Req: {tracker.request_id}] RESUME BRANCH ENTERED — Resuming previous execution plan for pending clarification.")
-                logger.info(f"[REQUEST_CLASSIFICATION] request_type=CLARIFICATION previous_state_used=true")
-                from .intent_normalizer import merge_clarification_intent
-                execution_plan = merge_clarification_intent(previous_plan, context.question, context.user_context)
+                if not is_new:
+                    # RESUME branch for clarification
+                    is_resumed_turn = True
+                    is_analytical_followup = False
+                    is_new = False
+                    logger.info(f"[Req: {tracker.request_id}] RESUME BRANCH ENTERED — Resuming previous execution plan for pending clarification.")
+                    logger.info(f"[REQUEST_CLASSIFICATION] request_type=CLARIFICATION previous_state_used=true")
+                    from .intent_normalizer import merge_clarification_intent
+                    execution_plan = merge_clarification_intent(previous_plan, context.question, context.user_context)
+                    tracker.record_planner_output(execution_plan)
+                else:
+                    logger.info(f"[Req: {tracker.request_id}] NEW PLANNING BRANCH ENTERED — Pending clarification superseded by new request.")
+                    logger.info(f"[REQUEST_CLASSIFICATION] request_type=NEW_REQUEST previous_state_used=false")
+                    context.user_context.pop("previous_execution_plan", None)
             else:
-                logger.info(f"[Req: {tracker.request_id}] NEW PLANNING BRANCH ENTERED — Discarding previous state.")
-                logger.info(f"[REQUEST_CLASSIFICATION] request_type=NEW_REQUEST previous_state_used=false")
-                context.user_context.pop("previous_execution_plan", None)
+                logger.info(f"[Req: {tracker.request_id}] Previous plan available in context — Will evaluate compatibility after intent extraction.")
         else:
             logger.info(f"[Req: {tracker.request_id}] NEW PLANNING BRANCH ENTERED — No previous_execution_plan in user_context.")
             logger.info(f"[REQUEST_CLASSIFICATION] request_type=NEW_REQUEST previous_state_used=false")
@@ -595,6 +636,14 @@ class EnterprisePlanner:
                     "total_tokens": 0,
                     "model_name": "lightweight_router_fast_path"
                 }
+                if previous_plan:
+                    compat = conversation_manager.check_context_compatibility(execution_plan, previous_plan, context.question)
+                    if compat == "INCOMPATIBLE":
+                        context.user_context.pop("previous_execution_plan", None)
+                        context.user_context.pop("previous_tool_results", None)
+                is_analytical_followup = False
+                is_resumed_turn = False
+                is_new = True
                 tracker.record_planner_output(execution_plan)
                 logger.info(f"[Req: {tracker.request_id}] Lightweight Router bypassed Planner LLM (0 tokens used).")
             else:
@@ -618,18 +667,65 @@ class EnterprisePlanner:
                     execution_plan["metric"] = canonical_intent.metric
                     execution_plan["dimension"] = canonical_intent.dimension
                     execution_plan["expected_result_type"] = canonical_intent.expected_result_type
+                    execution_plan["presentation_mode"] = canonical_intent.presentation_mode
+                    if canonical_intent.capability:
+                        caps = execution_plan.setdefault("business_capabilities", [])
+                        if caps and isinstance(caps[0], dict):
+                            caps[0]["id"] = canonical_intent.capability
+                            c_ctx = caps[0].setdefault("context", {})
+                            c_ctx["metric"] = canonical_intent.metric
+                            c_ctx["dimension"] = canonical_intent.dimension
+                            c_ctx["operation"] = canonical_intent.operation
+                        elif not caps:
+                            caps.append({"id": canonical_intent.capability, "context": {"metric": canonical_intent.metric, "dimension": canonical_intent.dimension, "operation": canonical_intent.operation}})
+                    if canonical_intent.filters:
+                        execution_plan.setdefault("filters", {}).update(canonical_intent.filters)
+                        if "requested_columns" in canonical_intent.filters:
+                            execution_plan["requested_columns"] = canonical_intent.filters["requested_columns"]
+                            for cap_item in execution_plan.get("business_capabilities", []):
+                                if isinstance(cap_item, dict):
+                                    c_ctx = cap_item.setdefault("context", {})
+                                    c_ctx["requested_columns"] = canonical_intent.filters["requested_columns"]
                     if canonical_intent.ranking:
                         execution_plan["limit"] = canonical_intent.ranking.limit
                         execution_plan["sort_order"] = canonical_intent.ranking.direction
                         execution_plan["ranking"] = canonical_intent.ranking.model_dump()
+                    else:
+                        execution_plan["limit"] = None
+                        execution_plan["sort_order"] = None
+                        execution_plan["ranking"] = None
+                        for cap_item in execution_plan.get("business_capabilities", []):
+                            if isinstance(cap_item, dict):
+                                cap_item.pop("ranking", None)
+                                cap_item.pop("limit", None)
+                                c_ctx = cap_item.get("context")
+                                if isinstance(c_ctx, dict):
+                                    c_ctx.pop("ranking", None)
+                                    c_ctx.pop("limit", None)
+
+                    if hasattr(canonical_intent, "entities"):
+                        execution_plan["entities"] = [
+                            e.model_dump() if hasattr(e, "model_dump") else e 
+                            for e in (canonical_intent.entities or [])
+                        ]
                     if canonical_intent.temporal:
                         execution_plan["start_date"] = canonical_intent.temporal.start_date
                         execution_plan["end_date"] = canonical_intent.temporal.end_date
                         execution_plan["financial_year"] = canonical_intent.temporal.financial_year
                         execution_plan["temporal_scope"] = canonical_intent.temporal.type
                         execution_plan["is_explicit"] = canonical_intent.temporal.is_explicit
+                    execution_plan["missing_information"] = canonical_intent.missing_information
+                    execution_plan["ambiguity_detected"] = bool(canonical_intent.missing_information)
+                    if canonical_intent.operation == "analyze":
+                        execution_plan["ambiguity_detected"] = False
+                        execution_plan["missing_information"] = []
+                        execution_plan["confidence_score"] = 1.0
+                        execution_plan["ranking"] = None
+                        execution_plan["limit"] = None
+                        execution_plan["sort_order"] = None
+                    elif not canonical_intent.missing_information and execution_plan.get("confidence_score", 0.0) < 1.0:
+                        execution_plan["confidence_score"] = 1.0
                     if canonical_intent.missing_information:
-                        execution_plan["missing_information"] = canonical_intent.missing_information
                         logger.info(
                             f"[INTENT_PENDING] capability={canonical_intent.capability} | operation={canonical_intent.operation} | "
                             f"metric={canonical_intent.metric} | dimension={canonical_intent.dimension} | "
@@ -637,6 +733,44 @@ class EnterprisePlanner:
                             f"expected_result_type={canonical_intent.expected_result_type} | "
                             f"missing_fields={canonical_intent.missing_information}"
                         )
+
+                    # Context Compatibility Gate (Decides whether previous execution context may be inherited)
+                    if previous_plan:
+                        compat = conversation_manager.check_context_compatibility(execution_plan, previous_plan, context.question)
+                        logger.info(f"[Req: {tracker.request_id}] CONTEXT COMPATIBILITY GATE: result={compat}")
+                        if compat == "COMPATIBLE":
+                            is_analytical_followup = True
+                            is_resumed_turn = True
+                            is_new = False
+                            logger.info(f"[Req: {tracker.request_id}] ANALYTICAL FOLLOW-UP — Inheriting previous execution context.")
+                            logger.info(f"[REQUEST_CLASSIFICATION] request_type=FOLLOW_UP previous_state_used=true")
+                            execution_plan = conversation_manager.build_inherited_analytical_plan(previous_plan, context.question, context.user_context)
+                            inh_cap = execution_plan.get("business_capabilities", [{}])[0].get("id")
+                            logger.info(
+                                f"[ANALYTICAL_FOLLOW_UP] inherited_cap={inh_cap} "
+                                f"dimension={execution_plan.get('dimension')} metric={execution_plan.get('metric')} "
+                                f"operation={execution_plan.get('operation')} presentation_mode={execution_plan.get('presentation_mode')}"
+                            )
+                        elif compat == "INCOMPATIBLE":
+                            is_analytical_followup = False
+                            is_resumed_turn = False
+                            is_new = True
+                            logger.info(f"[Req: {tracker.request_id}] NEW PLANNING — Previous context incompatible; clearing stale execution context for this turn.")
+                            logger.info(f"[REQUEST_CLASSIFICATION] request_type=NEW_REQUEST previous_state_used=false")
+                            context.user_context.pop("previous_execution_plan", None)
+                            context.user_context.pop("previous_tool_results", None)
+                        elif compat == "AMBIGUOUS":
+                            is_analytical_followup = False
+                            is_resumed_turn = False
+                            is_new = True
+                            execution_plan["ambiguity_detected"] = True
+                            logger.info(f"[Req: {tracker.request_id}] AMBIGUOUS CONTEXT — Triggering clarification guard.")
+                    else:
+                        is_analytical_followup = False
+                        is_resumed_turn = False
+                        is_new = True
+                        logger.info(f"[REQUEST_CLASSIFICATION] request_type=NEW_REQUEST previous_state_used=false")
+
                     tracker.record_planner_output(execution_plan)
                 except Exception as e:
                     err_str = str(e)
@@ -804,6 +938,12 @@ class EnterprisePlanner:
         )
 
         extracted_entities = execution_plan.get("entities", [])
+        if not extracted_entities:
+            from .entity_resolver import extract_entities_from_text
+            text_ents = extract_entities_from_text(context.question)
+            if text_ents:
+                extracted_entities = text_ents
+                execution_plan["entities"] = extracted_entities
 
         # Guarantee fresh entity extraction for NEW queries
         is_resumed_turn = bool(previous_plan and not is_new)
@@ -827,78 +967,62 @@ class EnterprisePlanner:
                         logger.info(f"[Planner Entity Isolation] Purged stale session entity '{entity_type}' from user_context for fresh query.")
                         context.user_context.pop(entity_type, None)
 
-        # Filter extracted entities against reserved vocabulary and capability requirements
-        clean_extracted_entities = []
+        # Filter extracted entities against reserved vocabulary, temporal terms, and entity roles (filter vs dimension)
+        from agent.entity_resolver import TEMPORAL_ENTITY_TYPES, is_reserved_business_term
+        filter_entities = []
         for e in extracted_entities:
-            e_val = str(e.get("value", "")).strip()
-            e_type = str(e.get("type", "")).lower()
+            if isinstance(e, dict):
+                e_val = str(e.get("value") or e.get("entity_name") or "").strip()
+                e_type = str(e.get("type") or e.get("entity_type") or "").strip().lower()
+                e_role = str(e.get("role") or "filter").strip().lower()
+            else:
+                e_val = str(e).strip()
+                e_type = ""
+                e_role = "filter"
+
+            # 1. Grouping dimensions (role="dimension") or empty/placeholder values are NOT filter entities
+            if not e_val or e_role == "dimension" or e_val.lower() in (e_type, "all", "none", "customer", "department", "dept", "service_line", "service line", "serviceline", "employee", "project"):
+                logger.info(f"[Planner Entity Separation] Ignored grouping dimension/placeholder '{e_val}' of type '{e_type}' (role={e_role}).")
+                continue
+
+            # 2. Temporal entities are routed to TemporalResolver, NOT EntityResolver
+            if e_type in TEMPORAL_ENTITY_TYPES or any(t in e_val.lower() for t in ["this week", "last week", "this month", "last month", "this year", "last year", "today", "yesterday"]) or "→" in e_val:
+                logger.info(f"[Planner Temporal Separation] Extracted entity '{e_val}' of type '{e_type}' routed to TemporalResolver.")
+                from agent.temporal_resolver import resolve_temporal_scope
+                t_res = resolve_temporal_scope(e_val)
+                if t_res.get("start_date") and t_res.get("end_date"):
+                    execution_plan.setdefault("context", {})["start_date"] = t_res["start_date"]
+                    execution_plan.setdefault("context", {})["end_date"] = t_res["end_date"]
+                    if t_res.get("financial_year"):
+                        execution_plan.setdefault("context", {})["financial_year"] = t_res["financial_year"]
+                continue
+
+            # 3. Valid concrete entity filters
+            VALID_CRM_ENTITY_TYPES = {"customer", "employee", "project", "service_line", "serviceline", "department"}
             if e_val and not is_reserved_business_term(e_val):
-                if not allowed_entity_types or e_type in allowed_entity_types or e_type in ("customer", "employee", "project", "service_line", "serviceline", "department"):
-                    clean_extracted_entities.append(e)
+                if e_type in VALID_CRM_ENTITY_TYPES or not e_type:
+                    if not allowed_entity_types or e_type in allowed_entity_types or not e_type:
+                        filter_entities.append({"type": e_type or "entity", "value": e_val, "role": "filter"})
                 else:
-                    logger.info(f"[Pipeline Instrumentation] Ignored entity '{e_val}' of type '{e_type}' (Not required by capability)")
+                    logger.info(f"[Pipeline Instrumentation] Ignored non-CRM entity '{e_val}' of type '{e_type}'")
             else:
                 logger.info(f"[Pipeline Instrumentation] Filtered reserved vocabulary term or empty value '{e_val}' from entity resolution.")
 
-        extracted_entities = clean_extracted_entities
-        
-        # Candidate Entity Recovery: Extract potential candidate entity when extracted_entities is empty
-        if not extracted_entities:
-            q_lower = context.question.lower()
-            has_emp_trig = has_employee_trigger(context.question)
-            
-            cand_phrase = None
-            for prep in [" for ", " by "]:
-                if prep in q_lower:
-                    cand_phrase = context.question[q_lower.find(prep) + len(prep):].strip()
-                    break
-            
-            if cand_phrase:
-                for suffix in ["service line", "department", "team"]:
-                    if cand_phrase.lower().endswith(" " + suffix):
-                        cand_phrase = cand_phrase[:-len(" " + suffix)].strip()
+        extracted_entities = filter_entities
 
-            cand_target = cand_phrase
-            if not cand_target and not is_reserved_business_term(context.question):
-                cand_target = context.question
-
-            if cand_target:
-                cand_target = re.sub(r'^(?:now\s+)?(?:show|get|generate|view|run)\s+', '', cand_target, flags=re.IGNORECASE).strip()
-                cand_target = re.sub(r'\s+(?:revenue|performance|report|metrics|gp)$', '', cand_target, flags=re.IGNORECASE).strip()
-
-            target_entity_type = None
-            if cand_target and not is_reserved_business_term(cand_target):
-                primary_cap = requested_capabilities[0].get("id") if requested_capabilities else ""
-
-                if primary_cap == "gp_performance":
-                    if has_emp_trig and any(kw in q_lower for kw in ["employee", "staff", "consultant", "resource"]):
-                        target_entity_type = "employee"
-                    else:
-                        target_entity_type = "service_line"
-                elif has_emp_trig or ("employee" in allowed_entity_types):
-                    target_entity_type = "employee"
-                    for prefix in [
-                        "generate the kpi report for", "get the kpi report for", "show kpi report for",
-                        "generate kpi report for", "kpi report for", "kpi summary for", "kpi for", "report for", "generate report for"
-                    ]:
-                        if prefix in cand_target.lower():
-                            cand_target = cand_target[cand_target.lower().find(prefix) + len(prefix):].strip()
+        # Candidate Entity Recovery: ONLY triggers if capability metadata strictly requires a filter entity
+        # and no explicit filter entity was extracted upstream.
+        if not extracted_entities and requires_entities_flag:
+            for cap in requested_capabilities:
+                cap_id = cap.get("id")
+                cap_req_entities, cap_req_types = get_capability_entity_requirements(cap_id)
+                if cap_req_entities and cap_req_types:
+                    for req_t in cap_req_types:
+                        ctx_val = context.user_context.get(f"{req_t}_name") or context.user_context.get(req_t)
+                        if ctx_val and isinstance(ctx_val, str) and len(ctx_val.strip()) >= 2:
+                            extracted_entities.append({"type": req_t, "value": ctx_val.strip(), "role": "filter"})
+                            logger.info(f"[Planner Entity Recovery] Recovered required filter entity '{ctx_val}' of type '{req_t}' from context.")
                             break
-                elif "service_line" in allowed_entity_types or "serviceline" in allowed_entity_types:
-                    target_entity_type = "service_line"
-                elif "department" in allowed_entity_types:
-                    target_entity_type = "department"
-                elif "customer" in allowed_entity_types:
-                    target_entity_type = "customer"
-
-            logger.info(f"[CANDIDATE_RECOVERY_DECISION] capability={primary_cap or 'none'} candidate='{cand_target}' target_entity_type={target_entity_type or 'none'} reason=candidate_extraction")
-
-            if target_entity_type and cand_target and not is_reserved_business_term(cand_target) and len(cand_target) >= 2:
-                extracted_entities = [{"type": target_entity_type, "value": cand_target}]
-                requires_entities_flag = True
-                logger.info(f"[Planner Entity Recovery] Extracted candidate {target_entity_type} entity '{cand_target}' from query.")
-                if primary_cap == "gp_performance":
-                    logger.info(f'[GP_ENTITY_RECOVERY] candidate="{cand_target}" entity_type={target_entity_type}')
 
         resolved_entities = execution_plan.get("resolved_entities", [])
         entity_errors = []
@@ -1082,28 +1206,53 @@ class EnterprisePlanner:
             if execution_plan.get(field) and field not in shared_ctx:
                 shared_ctx[field] = execution_plan[field]
 
+        if execution_plan.get("context") and isinstance(execution_plan["context"], dict):
+            for k, v in execution_plan["context"].items():
+                if v and k not in shared_ctx:
+                    shared_ctx[k] = v
+
+        execution_plan["context"] = shared_ctx
+
         if not execution_plan.get("business_capabilities"):
             q_lower = context.question.lower()
             recovered_cap_id = None
             if any(e.get("entity_type") in ("Employee", "employee") for e in (resolved_entities or [])) or "kpi" in q_lower:
                 recovered_cap_id = "kpi_summary"
-            elif "gp" in q_lower or "gross profit" in q_lower:
+            elif any(e.get("entity_type") in ("Customer", "customer") for e in (resolved_entities or [])) or "customer" in q_lower or "client" in q_lower:
+                recovered_cap_id = "revenue_analysis"
+            elif "gp" in q_lower or "gross profit" in q_lower or ("performance" in q_lower and "revenue" not in q_lower):
                 recovered_cap_id = "gp_performance"
             elif "revenue" in q_lower:
                 recovered_cap_id = "revenue_analysis"
             elif "receivable" in q_lower:
-                recovered_cap_id = "receivables_summary"
+                recovered_cap_id = "receivables_analysis"
+            elif "proposal" in q_lower:
+                recovered_cap_id = "proposal_search"
+            elif "project" in q_lower:
+                recovered_cap_id = "project_search"
+            elif "billing" in q_lower:
+                recovered_cap_id = "staff_billing_report"
             else:
-                recovered_cap_id = "kpi_summary"
+                recovered_cap_id = None
 
-            logger.info(f"[Planner] Recovered missing business capability '{recovered_cap_id}' for query '{context.question}'")
-            execution_plan["business_capabilities"] = [{
-                "id": recovered_cap_id,
-                "scope": "organization" if not resolved_entities else "filtered",
-                "intent": execution_plan.get("operation") or "summary",
-                "operation": execution_plan.get("operation") or "summary",
-                "context": shared_ctx
-            }]
+            if recovered_cap_id:
+                logger.info(f"[Planner] Recovered missing business capability '{recovered_cap_id}' for query '{context.question}'")
+                execution_plan["business_capabilities"] = [{
+                    "id": recovered_cap_id,
+                    "scope": "organization" if not resolved_entities else "filtered",
+                    "intent": execution_plan.get("operation") or "summary",
+                    "operation": execution_plan.get("operation") or "summary",
+                    "context": shared_ctx
+                }]
+            else:
+                execution_plan["ambiguity_detected"] = True
+                execution_plan["confidence_score"] = 0.5
+                execution_plan["missing_information"] = ["capability"]
+
+        for cap in execution_plan.get("business_capabilities", []):
+            if cap.get("id") == "gp_performance" and (shared_ctx.get("customer_id") or any(e.get("entity_type") in ("Customer", "customer") for e in (resolved_entities or []))):
+                logger.info(f"[Planner] Re-aligning capability 'gp_performance' to 'revenue_analysis' for customer-scoped query.")
+                cap["id"] = "revenue_analysis"
 
         for cap in execution_plan.get("business_capabilities", []):
             cap_ctx = cap.setdefault("context", {})
@@ -1201,6 +1350,16 @@ class EnterprisePlanner:
             logger.info(f"[Req: {tracker.request_id}] Returning cached response via Entity Cache key='{cache_key}' (0 LLM/Backend calls).")
             cached_response["was_cached"] = True
             cached_response["cache_tier"] = "entity_cache"
+            
+            # Persist session memory so subsequent conversational follow-ups can inherit context
+            try:
+                from memory.session_manager import update_session_memory
+                c_plan = cached_response.get("execution_plan") or execution_plan
+                c_tools = cached_response.get("tool_results") or []
+                await update_session_memory(context.session_id, c_plan, c_tools)
+            except Exception as _c_mem_err:
+                logger.warning(f"[Planner Cache] update_session_memory failed: {_c_mem_err}")
+
             tracker.dump_trace()
             return cached_response
 
@@ -1218,22 +1377,63 @@ class EnterprisePlanner:
         )
         tracker.record_registry_selection(execution_graph)
         
-        logger.info(f"[Req: {tracker.request_id}] Executing resolved implementations...")
-        with tracker.track_time("tool_execution_ms"):
-            tool_results = await tool_registry.execute_resolved_implementations(
-                execution_graph, 
-                resolved_entities, 
-                context.jwt_token, 
-                context.user_context,
-                context.question
+        # Check whether previous authoritative tool result contains sufficient data
+        prev_tool_results = context.user_context.get("previous_tool_results") or []
+        has_sufficient_data = False
+        if is_analytical_followup and prev_tool_results:
+            has_sufficient_data = conversation_manager.has_sufficient_analytical_data(
+                prev_tool_results, execution_plan, context.question
             )
-            
-        tracker.record_tool_execution(tool_results)
-        
-        # Pre-Tool Execution Revenue Scope Validation (Fail Closed)
+
+        if has_sufficient_data:
+            logger.info(f"[ANALYTICAL_FOLLOW_UP] Previous authoritative tool results contain sufficient data ({len(prev_tool_results)} results). Reasoning directly over previous authoritative data.")
+            tool_results = prev_tool_results
+            tracker.timings["tool_execution_ms"] = 0.0
+            tracker.record_tool_execution(tool_results)
+        else:
+            logger.info(f"[Req: {tracker.request_id}] Executing resolved implementations...")
+            with tracker.track_time("tool_execution_ms"):
+                tool_results = await tool_registry.execute_resolved_implementations(
+                    execution_graph, 
+                    resolved_entities, 
+                    context.jwt_token, 
+                    context.user_context,
+                    context.question
+                )
+            tracker.record_tool_execution(tool_results)
+
+        # Generic Post-Tool Execution Contract Validation
+        from engine.result_validator import get_result_validator
+        res_validator = get_result_validator()
+        for tr_item in (tool_results or []):
+            tr_cap = (tr_item.get("capability") if isinstance(tr_item, dict) else None) or primary_cap
+            if isinstance(tr_item, dict):
+                if "result" in tr_item and isinstance(tr_item["result"], dict):
+                    tr_res = tr_item["result"]
+                elif "data" in tr_item and isinstance(tr_item["data"], dict):
+                    tr_res = tr_item["data"]
+                else:
+                    tr_res = tr_item
+            else:
+                tr_res = tr_item
+            is_valid_res, res_errs = res_validator.validate_result(tr_cap, tr_res, shared_ctx)
+            if not is_valid_res:
+                logger.error(f"[EXECUTION_CONTRACT_VALIDATION] capability={tr_cap} errors={res_errs} status=FAIL")
+                tracker.dump_trace()
+                return {
+                    "type": "done",
+                    "content": f"Execution validation failed: {res_errs[0]}",
+                    "is_clarification": True,
+                    "execution_plan": execution_plan,
+                    "token_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+                }
+
+        # Pre-Tool Execution Revenue Scope Validation (Fail Closed for concrete entity filters)
         is_revenue_analysis = any(c.get("id") == "revenue_analysis" for c in execution_plan.get("business_capabilities", []))
-        has_sl_entity_in_query = any(str(e.get("type", "")).lower() in ("service_line", "serviceline") for e in (extracted_entities or [])) or "service_line" in shared_ctx
-        if is_revenue_analysis and has_sl_entity_in_query and not shared_ctx.get("service_line_id"):
+        req_sl_filter = shared_ctx.get("service_line")
+        is_concrete_sl_filter = bool(req_sl_filter and str(req_sl_filter).strip().lower() not in ("all", "none", "") and shared_ctx.get("dimension") != "service_line")
+        has_sl_entity_in_query = any(str(e.get("type", "")).lower() in ("service_line", "serviceline") and str(e.get("value", "")).lower() not in ("all", "none", "") for e in (extracted_entities or []))
+        if is_revenue_analysis and (is_concrete_sl_filter or has_sl_entity_in_query) and not shared_ctx.get("service_line_id"):
             logger.error("[REVENUE_SCOPE_VALIDATION] requested=service_line status=FAIL reason=missing_service_line_id")
             tracker.dump_trace()
             return {
@@ -1328,11 +1528,13 @@ class EnterprisePlanner:
         pres_mode = str(execution_plan.get("presentation_mode") or "").upper()
         is_explicit_table_query = any(phrase in q_clean for phrase in ["show table", "list all", "table format", "raw records", "export table"])
 
+        logger.info(f"[TRACE_EXECUTION] planner presentation_mode='{pres_mode}' | execution operation='{execution_plan.get('operation')}' | capability='{primary_cap}'")
+
         if pres_mode == "TABLE" and is_explicit_table_query:
             logger.info(f"[Req: {tracker.request_id}] Executing DATA MODE Direct Formatter for explicit table query.")
             tracker.timings["synthesizer_ms"] = 0.0
-            final_response = format_data_response(context.question, tool_results)
-        elif is_kpi_summary and (execution_plan.get("operation") or "summary") == "summary":
+            final_response = format_data_response(context.question, tool_results, execution_plan=execution_plan)
+        elif is_kpi_summary and (execution_plan.get("operation") or "summary") == "summary" and pres_mode != "EXPLANATION" and (execution_plan.get("expected_result_type") != "explanation"):
             logger.info(f"[Req: {tracker.request_id}] Executing Deterministic KPI Summary Rendering (0 LLM Tokens).")
             tracker.timings["synthesizer_ms"] = 0.0
             try:
@@ -1432,7 +1634,7 @@ class EnterprisePlanner:
                 traceback.print_exc()
                 with tracker.track_time("synthesizer_ms"):
                     final_response = await synthesize_response(context.question, tool_results, self.llm, execution_plan=execution_plan)
-        elif is_gp_performance:
+        elif is_gp_performance and pres_mode != "EXPLANATION" and (execution_plan.get("expected_result_type") != "explanation"):
             logger.info(f"[Req: {tracker.request_id}] Executing Deterministic GP Performance Rendering (0 LLM Tokens).")
             logger.info("[PRESENTATION_MODE] capability=gp_performance mode=DETERMINISTIC")
             tracker.timings["synthesizer_ms"] = 0.0
@@ -1509,7 +1711,7 @@ class EnterprisePlanner:
                 logger.info("[PRESENTATION_MODE] capability=gp_performance mode=LLM")
                 with tracker.track_time("synthesizer_ms"):
                     final_response = await synthesize_response(context.question, tool_results, self.llm, execution_plan=execution_plan)
-        elif is_revenue_analysis and (execution_plan.get("operation") or "summary") in ("summary", "aggregate", "report"):
+        elif is_revenue_analysis and (execution_plan.get("operation") or "summary") in ("summary", "aggregate", "report") and pres_mode != "EXPLANATION" and (execution_plan.get("expected_result_type") != "explanation"):
             logger.info(f"[Req: {tracker.request_id}] Executing Deterministic Revenue Analysis Rendering (0 LLM Tokens).")
             logger.info("[PRESENTATION_MODE] capability=revenue_analysis mode=DETERMINISTIC")
             tracker.timings["synthesizer_ms"] = 0.0
@@ -1566,46 +1768,46 @@ class EnterprisePlanner:
             with tracker.track_time("synthesizer_ms"):
                 final_response = await synthesize_response(context.question, tool_results, self.llm, execution_plan=execution_plan)
             
-            # Pass token usage up and attach execution plan, tool results, and telemetry
-            if isinstance(final_response, dict):
-                planner_toks_dict = context.request_metadata.get("token_usage") or {}
-                synth_toks_dict = final_response.get("token_usage") or {}
-                
-                planner_in = planner_toks_dict.get("input_tokens", 0)
-                planner_out = planner_toks_dict.get("output_tokens", 0)
-                planner_tot = planner_toks_dict.get("total_tokens", 0)
+        # Pass token usage up and attach execution plan, tool results, and telemetry
+        if isinstance(final_response, dict):
+            planner_toks_dict = context.request_metadata.get("token_usage") or {}
+            synth_toks_dict = final_response.get("token_usage") or {}
+            
+            planner_in = planner_toks_dict.get("input_tokens", 0)
+            planner_out = planner_toks_dict.get("output_tokens", 0)
+            planner_tot = planner_toks_dict.get("total_tokens", 0)
 
-                synth_in = synth_toks_dict.get("input_tokens", 0)
-                synth_out = synth_toks_dict.get("output_tokens", 0)
-                synth_tot = synth_toks_dict.get("total_tokens", 0)
+            synth_in = synth_toks_dict.get("input_tokens", 0)
+            synth_out = synth_toks_dict.get("output_tokens", 0)
+            synth_tot = synth_toks_dict.get("total_tokens", 0)
 
-                tot_in = planner_in + synth_in
-                tot_out = planner_out + synth_out
-                tot_all = planner_tot + synth_tot
-                active_model = synth_toks_dict.get("model_name") or planner_toks_dict.get("model_name") or os.getenv("LLM_MODEL") or "openai/gpt-oss-20b"
+            tot_in = planner_in + synth_in
+            tot_out = planner_out + synth_out
+            tot_all = planner_tot + synth_tot
+            active_model = synth_toks_dict.get("model_name") or planner_toks_dict.get("model_name") or os.getenv("LLM_MODEL") or "openai/gpt-oss-20b"
 
-                final_response["token_usage"] = {
-                    "model_name": active_model,
-                    "input_tokens": tot_in,
-                    "output_tokens": tot_out,
-                    "total_tokens": tot_all
-                }
+            final_response.setdefault("token_usage", {
+                "model_name": active_model,
+                "input_tokens": tot_in,
+                "output_tokens": tot_out,
+                "total_tokens": tot_all
+            })
 
-                final_response["telemetry"] = {
-                    "fast_path": True if synth_tot == 0 else False,
-                    "execution_path": "DETERMINISTIC_0_TOKEN" if synth_tot == 0 else ("PLANNER_LLM" if planner_tot > 0 else "SYNTHESIZER_ONLY"),
-                    "capability_id": primary_cap or "general_query",
-                    "model": active_model,
-                    "input_tokens": tot_in,
-                    "output_tokens": tot_out,
-                    "total_tokens": tot_all,
-                    "planner_tokens": planner_tot,
-                    "synthesizer_tokens": synth_tot,
-                    "backend_ms": tracker.timings.get("tool_execution_ms", 0),
-                    "execution_ms": tracker.timings.get("total_ms", 0)
-                }
-                final_response["execution_plan"] = execution_plan
-                final_response["tool_results"] = tool_results
+            final_response["telemetry"] = {
+                "fast_path": True if synth_tot == 0 else False,
+                "execution_path": "DETERMINISTIC_0_TOKEN" if synth_tot == 0 else ("PLANNER_LLM" if planner_tot > 0 else "SYNTHESIZER_ONLY"),
+                "capability_id": primary_cap or "general_query",
+                "model": active_model,
+                "input_tokens": tot_in,
+                "output_tokens": tot_out,
+                "total_tokens": tot_all,
+                "planner_tokens": planner_tot,
+                "synthesizer_tokens": synth_tot,
+                "backend_ms": tracker.timings.get("tool_execution_ms", 0),
+                "execution_ms": tracker.timings.get("total_ms", 0)
+            }
+            final_response["execution_plan"] = execution_plan
+            final_response["tool_results"] = tool_results
 
 
             # Save to Entity Cache only if response is valid (no Unknown Customer sentinels)
@@ -1700,17 +1902,17 @@ class EnterprisePlanner:
              "Map user query to abstract Business Capabilities.\n\n"
              "AVAILABLE BUSINESS CAPABILITIES:\n{capabilities}\n\n"
              "RULES:\n"
-             "1. INTENT & OPERATION: Map phrasing to intent & operation: 'ranking' (for top/best/highest/biggest/lowest/worst/limit/grouping questions), 'comparison' (for vs/compare/multi-period questions), 'summary' (for totals/overviews), 'generate_report'.\n"
+             "1. INTENT & OPERATION: Map phrasing to intent & operation: 'analyze' (for why/explain/reason/cause analytical questions), 'ranking' (for explicit top/best/highest/biggest/lowest/worst ranking questions with limits), 'comparison' (for vs/compare/multi-period questions), 'summary' (for totals/overviews/breakdowns), 'generate_report'. For 'analyze' (why/explain), set operation: 'analyze', presentation_mode: 'EXPLANATION', confidence_score: 1.0, ambiguity_detected: false, missing_information: [], ranking: null, limit: null.\n"
              "2. DIMENSION FOR RANKING: For ranking questions, set 'dimension' explicitly whenever requested grouping is identifiable:\n"
              "   - 'five biggest customers' -> dimension: 'customer', operation: 'ranking', metric: 'revenue', limit: 5\n"
              "   - 'highest revenue department' -> dimension: 'department', operation: 'ranking', metric: 'revenue', limit: 1\n"
-             "   - 'best performing service line' -> dimension: 'service_line', operation: 'ranking', metric: 'revenue', limit: 1\n"
+             "   - 'best performing service line' -> capability: 'gp_performance', dimension: 'service_line', operation: 'ranking', metric: 'actual_gp', limit: 1\n"
              "   - 'top 5 employees by billing' -> dimension: 'employee', operation: 'ranking', metric: 'revenue', limit: 5\n"
-             "3. CAPABILITIES: Map terms: Revenue->'revenue_analysis', GP Performance/Gross Profit/GP->'gp_performance', Recoverability->'recoverability_analysis', Receivables->'receivables_analysis', Proposals/Win Rate->'pipeline_analysis', KPI->'kpi_summary', Billing->'staff_billing_report', Projects->'active_projects', Ranking->'analytical_query'. For multi-reports, include all matching capabilities.\n"
-             "4. ENTITIES: Extract 'service_line', 'customer', 'department', 'project', 'employee', 'financial_year', 'date_range' into 'entities' array.\n"
+             "3. CAPABILITIES: Map terms: Revenue->'revenue_analysis', GP Performance/Gross Profit/GP/Performance->'gp_performance', Recoverability->'recoverability_analysis', Receivables->'receivables_analysis', Proposals/Win Rate->'pipeline_analysis', KPI->'kpi_summary', Billing->'staff_billing_report', Projects->'active_projects', Ranking->'analytical_query'. For multi-reports, include all matching capabilities. Customer performance queries map to 'revenue_analysis'. For department/service line, generic 'performance' maps to 'gp_performance'.\n"
+             "4. ENTITIES: Extract 'service_line', 'customer', 'department', 'project', 'employee', 'financial_year', 'date_range' into 'entities' array. Grouping placeholders (e.g. 'all the service line') are NOT filter entities.\n"
              "5. SCOPE: 'organization' for company-wide summaries, 'entity' for specific named entity, 'filtered' for service line/dept filters.\n"
              "6. MISSING INFO: For organization queries, set missing_information=[].\n"
-             "7. PRESENTATION: Set presentation_action ('VIEW', 'EXPORT', 'GENERATE') and presentation_mode ('REPORT', 'INSIGHT', 'KPI_CARD', 'TABLE', 'COMPARISON', 'EXECUTIVE_BRIEF') on plan and capability.\n"
+             "7. PRESENTATION: Set presentation_action ('VIEW', 'EXPORT', 'GENERATE') and presentation_mode ('REPORT', 'INSIGHT', 'KPI_CARD', 'TABLE', 'COMPARISON', 'EXECUTIVE_BRIEF', 'EXPLANATION' for why/explain queries) on plan and capability.\n"
              "8. CRITICAL: Do NOT output <think> tags, 'Thinking Process:', or reasoning text. Respond IMMEDIATELY with raw JSON starting with '{{' on line 1.\n\n"
              "OUTPUT: Raw JSON object matching this schema ONLY:\n{json_schema}\n"
             ),
@@ -1749,6 +1951,7 @@ class EnterprisePlanner:
         chain = prompt | self.llm
         req_id = getattr(self, "current_request_id", None) or "unknown"
         
+        active_llm = self.llm
         # Attempt 1
         attempt = 1
         try:
@@ -1757,12 +1960,13 @@ class EnterprisePlanner:
                 raw_msg = await chain.ainvoke({"capabilities": capability_schemas, "json_schema": json_schema_str, "query": query})
             except Exception as primary_err:
                 err_str = str(primary_err)
+                logger.warning(f"[Planner Primary Error] {primary_err}")
                 if "429" in err_str or "rate_limit" in err_str.lower() or "quota" in err_str.lower():
                     fallback_model = os.getenv("FALLBACK_MODEL") or os.getenv("FAST_MODEL") or os.getenv("LLM_MODEL")
                     logger.warning(f"[Planner] Primary model rate-limited (429). Triggering fallback to {fallback_model}...")
                     from config.llm_factory import get_llm
-                    fallback_llm = get_llm(model_name=fallback_model, temperature=0.0, stage="planner_retry")
-                    fallback_chain = prompt | fallback_llm
+                    active_llm = get_llm(model_name=fallback_model, temperature=0.0, stage="planner_retry", max_tokens=800)
+                    fallback_chain = prompt | active_llm
                     logger.info(f"[LLM_CALL] stage=planner_retry request_id={req_id}")
                     raw_msg = await fallback_chain.ainvoke({"capabilities": capability_schemas, "json_schema": json_schema_str, "query": query})
                 else:
@@ -1781,10 +1985,11 @@ class EnterprisePlanner:
             
             # Attempt 2: Bounded retry with compact schema correction prompt
             attempt = 2
+            clean_err1 = err1_reason[:200].replace("{", " ").replace("}", " ")
             correction_prompt = ChatPromptTemplate.from_messages([
                 ("system",
                  f"You are the Enterprise Business Analyst for a CRM system.\n"
-                 f"Your previous output failed JSON schema validation with error: {err1_reason[:200]}\n"
+                 f"Your previous output failed JSON schema validation with error: {clean_err1}\n"
                  "CRITICAL SCHEMA CORRECTION REQUIREMENT:\n"
                  "- 'entities' MUST be an array of objects with keys 'type' (e.g. 'service_line', 'customer', 'employee') and 'value' (e.g. 'Audit').\n"
                  "- Do NOT use 'name' instead of 'type'. Use ONLY 'type' and 'value'.\n"
@@ -1793,7 +1998,7 @@ class EnterprisePlanner:
                 ("user", "{query}")
             ])
             try:
-                retry_chain = correction_prompt | self.llm
+                retry_chain = correction_prompt | active_llm
                 logger.info(f"[LLM_CALL] stage=planner_retry request_id={req_id}")
                 raw_msg_2 = await retry_chain.ainvoke({"query": query})
                 content_2 = raw_msg_2.content.strip()

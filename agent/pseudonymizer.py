@@ -370,9 +370,10 @@ class LocalPseudonymizer:
 
             # 3. Labeled & Contextual Entity Patterns
             # 3a. Corporate Suffixes (B.S.C CLOSED, W.L.L, S.P.C, LLC, Ltd, Inc, Corp)
-            corp_suffix_matches = re.findall(r'\b([A-Z0-9][A-Za-z0-9\s&._-]{2,60}\s+(?:B\.?S\.?C\.?\s*(?:CLOSED|PUBLIC)?|W\.?L\.?L\.?|S\.?P\.?C\.?|LLC|LTD|LIMITED|INC|CORP))\b', masked_text, re.IGNORECASE)
+            corp_suffix_matches = re.findall(r'\b((?:[A-Za-z0-9&._-]+\s+){1,5}(?:B\.?S\.?C\.?\s*(?:CLOSED|PUBLIC)?|W\.?L\.?L\.?|S\.?P\.?C\.?|LLC|LTD\.?|LIMITED|INC\.?|CORP\.?))', masked_text, re.IGNORECASE)
             for val in set(corp_suffix_matches):
                 val_clean = val.strip()
+                val_clean = re.sub(r'^(?:why\s+is\s+|is\s+|the\s+|about\s+|customer\s+|client\s+|company\s+|for\s+)+', '', val_clean, flags=re.IGNORECASE).strip()
                 if len(val_clean) >= 3 and not val_clean.startswith('<'):
                     token = get_or_create_token(val_clean, "CUSTOMER_TOKEN", "CUSTOMER")
                     masked_text = re.sub(re.escape(val_clean), token, masked_text)
@@ -563,6 +564,12 @@ class LocalPseudonymizer:
                 return {k: _recursive_unmask(v) for k, v in val.items()}
             elif isinstance(val, list):
                 return [_recursive_unmask(item) for item in val]
+            elif hasattr(val, "content") and isinstance(val.content, (str, dict, list)):
+                val.content = _recursive_unmask(val.content)
+                return val
+            elif hasattr(val, "text") and isinstance(val.text, (str, dict, list)):
+                val.text = _recursive_unmask(val.text)
+                return val
             return val
 
         return _recursive_unmask(data)

@@ -140,7 +140,7 @@ BUSINESS_CAPABILITIES = [
                 "supported_operations": [
                     "count", "sum", "average", "group_by",
                     "ranking", "comparison", "trend", "filter",
-                    "sort_order", "limit", "aggregation"
+                    "sort_order", "limit", "aggregation", "analyze"
                 ]
             }
         ]
@@ -326,12 +326,12 @@ BUSINESS_CAPABILITIES = [
         "id": "revenue_analysis",
         "business_domain": "finance",
         "fast_path_eligible": True,
-        "intent_keywords": ['revenue', 'revenue summary', 'monthly revenue', 'total revenue', 'top 5 customers', 'top customers by revenue', 'revenue by service line', 'highest revenue', 'gp performance', 'gp performance by service line', 'gross profit', 'gp', 'gp breakdown', 'monthly revenue trend', 'revenue trend', 'revenue comparison', 'revenue comparison with previous fy', 'previous fy', 'revenue analysis', 'show revenue', 'revenue by office'],
+        "intent_keywords": ['revenue', 'revenue summary', 'monthly revenue', 'total revenue', 'top 5 customers', 'top customers by revenue', 'revenue by service line', 'highest revenue', 'monthly revenue trend', 'revenue trend', 'revenue comparison', 'revenue comparison with previous fy', 'previous fy', 'revenue analysis', 'show revenue', 'revenue by office'],
         "description": (
             "Gets overall revenue totals, revenue by month, customer revenue rankings, revenue by service line, or team billing for a specific fiscal year or date range."
         ),
-        "supported_metrics": ["total_revenue_ytd", "revenue_by_month", "gp_performance", "team_billing", "revenue", "count", "net_amount"],
-        "supported_operations": ["aggregate", "ranking", "breakdown", "comparison", "trend", "filter", "sum", "count", "avg"],
+        "supported_metrics": ["total_revenue_ytd", "revenue_by_month", "team_billing", "revenue", "count", "net_amount"],
+        "supported_operations": ["aggregate", "ranking", "breakdown", "comparison", "trend", "filter", "sum", "count", "avg", "analyze"],
         "supported_dimensions": ["customer", "service_line", "office", "month", "year", "employee"],
         "supported_aggregations": ["SUM", "COUNT", "AVG", "MIN", "MAX"],
         "priority": PRIORITY_EXISTING_REPORT,
@@ -412,15 +412,28 @@ BUSINESS_CAPABILITIES = [
                 "function_call": "get_revenue_metrics",
                 "needs_confirmation": False,
                 "required_entities": [],
-                "required_parameters": []
+                "required_parameters": [],
+                "supported_dimensions": ["month"],
+                "supported_operations": ["summary", "report", "filter", "aggregate", "comparison"]
             },
             {
                 "priority": PRIORITY_EXISTING_REPORT,
+                "type": "wrapper",
+                "function_call": "call_authoritative_ranking_query",
+                "needs_confirmation": False,
+                "required_entities": [],
+                "required_parameters": [],
+                "supported_dimensions": ["service_line", "customer", "department", "employee"],
+                "supported_operations": ["ranking"]
+            },
+            {
+                "priority": PRIORITY_SEMANTIC_WRAPPER,
                 "type": "report",
                 "endpoint": "GET /api/v1/reports/revenue-billing-report",
                 "needs_confirmation": False,
                 "required_entities": [],
-                "required_parameters": []
+                "required_parameters": [],
+                "supported_dimensions": ["service_line", "customer", "department", "employee"]
             },
             {
                 "priority": PRIORITY_EXISTING_REPORT,
@@ -428,7 +441,8 @@ BUSINESS_CAPABILITIES = [
                 "endpoint": "GET /api/v1/reports/revenue-billing-report?searchQuery={\"client_id\":{customer_id}}",
                 "needs_confirmation": False,
                 "required_entities": ["customer"],
-                "required_parameters": []
+                "required_parameters": [],
+                "supported_dimensions": ["customer"]
             },
             {
                 "priority": PRIORITY_EXISTING_REPORT,
@@ -612,11 +626,11 @@ BUSINESS_CAPABILITIES = [
         "id": "gp_performance",
         "business_domain": "finance",
         "fast_path_eligible": True,
-        "intent_keywords": ['gp performance', 'gross profit', 'gp', 'gp breakdown', 'gp performance by service line', 'gp performance by department'],
+        "intent_keywords": ['gp performance', 'gross profit', 'gp', 'gp breakdown', 'gp performance by service line', 'gp performance by department', 'performance', 'performance by service line', 'service line performance', 'all service line performance', 'service line gp', 'department performance'],
         "description": "Retrieves Gross Profit (GP) performance breakdown by department or service line, including target GP, actual GP, GP percentage, and variance.",
-        "supported_metrics": ["gp_performance", "actual_gp", "target_gp", "gp_percent", "variance"],
-        "supported_dimensions": ["department", "service_line"],
-        "supported_operations": ["summary", "ranking", "filter", "sort_order", "limit", "aggregate", "comparison"],
+        "supported_metrics": ["gp_performance", "actual_gp", "target_gp", "gp_percent", "variance", "gp_variance", "variance_gp", "gp"],
+        "supported_dimensions": ["department", "service_line", "month"],
+        "supported_operations": ["summary", "ranking", "filter", "sort_order", "limit", "aggregate", "comparison", "analyze"],
         "priority": PRIORITY_EXISTING_REPORT,
         "authoritative_endpoint": "GET /api/v1/dashboard/gp-performance",
         "dependencies": [],
@@ -662,7 +676,21 @@ BUSINESS_CAPABILITIES = [
                 "endpoint": "GET /api/v1/dashboard/gp-performance",
                 "needs_confirmation": False,
                 "required_entities": [],
-                "required_parameters": []
+                "required_parameters": [],
+                "supported_dimensions": ["service_line", "department"],
+                "supported_operations": ["summary", "filter", "aggregate", "comparison", "analyze"],
+                "supported_metrics": ["gp_performance", "actual_gp", "target_gp", "gp_percent", "gp"]
+            },
+            {
+                "priority": PRIORITY_EXISTING_REPORT,
+                "type": "wrapper",
+                "function_call": "call_authoritative_ranking_query",
+                "needs_confirmation": False,
+                "required_entities": [],
+                "required_parameters": [],
+                "supported_dimensions": ["service_line", "customer", "department", "employee"],
+                "supported_operations": ["ranking", "limit", "sort_order"],
+                "supported_metrics": ["gp_performance", "actual_gp", "target_gp", "gp"]
             },
             {
                 "priority": PRIORITY_SEMANTIC_WRAPPER,
@@ -670,7 +698,10 @@ BUSINESS_CAPABILITIES = [
                 "function_call": "call_gp_performance_metrics",
                 "needs_confirmation": False,
                 "required_entities": [],
-                "required_parameters": []
+                "required_parameters": [],
+                "supported_dimensions": ["service_line", "department", "month"],
+                "supported_operations": ["summary", "filter", "aggregate", "comparison", "analyze"],
+                "supported_metrics": ["gp_performance", "actual_gp", "target_gp", "gp_percent", "variance", "gp_variance", "variance_gp", "gp"]
             }
         ]
     },
@@ -800,7 +831,15 @@ BUSINESS_CAPABILITIES = [
             "supports_followup": True,
             "supports_comparison": True,
             "supports_drilldown": True,
-            "default_presentation": "REPORT"
+            "default_presentation": "REPORT",
+            "default_columns": [
+                "project_name",
+                "customer_name",
+                "service_line",
+                "approved_fees",
+                "actual_recoverability",
+                "project_status"
+            ]
         },
         "primary_metric": "actual_recoverability_pct",
         "response_schema": {
@@ -1103,11 +1142,123 @@ BUSINESS_CAPABILITIES = [
                 "required_parameters": ["target_dashboard"]
             }
         ]
+    },
+    {
+        "id": "ai_chatbot_usage",
+        "business_domain": "ai_analytics",
+        "fast_path_eligible": False,
+        "intent_keywords": ['chatbot usage', 'ai chatbot', 'who used chatbot', 'top chatbot users', 'chatbot sessions', 'most chatbot tokens', 'chatbot tokens'],
+        "description": "Reports AI chatbot usage statistics, token consumption, total cost, top token consumers, top spending users, and usage breakdown by employee/model/path. Use this for queries about who used the chatbot, chatbot usage reports, top chatbot users, chatbot token consumption, and query counts. Target dimension for users/staff is ALWAYS 'employee'.",
+        "supported_metrics": ["total_tokens", "total_queries", "total_sessions", "total_cost_usd", "top_token_user", "top_spending_user"],
+        "supported_operations": ["summary", "report", "ranking", "filter", "group_by"],
+        "default_dimension": "employee",
+        "priority": PRIORITY_EXISTING_REPORT,
+        "dependencies": [],
+        "response_contract": {
+            "supports_report": True,
+            "supports_summary": True,
+            "supports_analysis": True,
+            "supports_chart": True,
+            "supports_export": True,
+            "supports_filters": True,
+            "supports_followup": True,
+            "supports_comparison": True,
+            "supports_drilldown": True,
+            "default_presentation": "REPORT"
+        },
+        "primary_metric": "total_tokens",
+        "response_schema": {
+            "total_tokens": "number",
+            "total_queries": "number",
+            "total_sessions": "number",
+            "total_cost_usd": "number",
+            "rows": "array",
+            "data": "object"
+        },
+        "default_ranking_field": "total_tokens",
+        "default_sort_order": "desc",
+        "default_error_message": "Could not generate AI Chatbot Usage report.",
+        "required_context": [],
+        "clarifiable_context": [],
+        "inheritable_context": ["start_date", "end_date", "employee_id"],
+        "defaultable_context": [],
+        "required_business_context": {},
+        "parameter_metadata": {},
+        "implementations": [
+            {
+                "priority": PRIORITY_SEMANTIC_WRAPPER,
+                "type": "wrapper",
+                "function_call": "call_generic_report",
+                "route_function": "api.reports_routes.get_ai_chatbot_usage_report",
+                "endpoint": "GET /api/v1/reports/ai-chatbot-usage-report",
+                "needs_confirmation": False,
+                "required_entities": [],
+                "required_parameters": []
+            }
+        ]
+    },
+    {
+        "id": "ai_email_usage",
+        "business_domain": "ai_analytics",
+        "fast_path_eligible": False,
+        "intent_keywords": ['email parsing', 'parsed email', 'who parsed email', 'who parsed the most email', 'email tasks created'],
+        "description": "Reports AI email parsing usage statistics, total emails parsed, tasks created, token usage, top user parsed, and email parsing breakdown by employee. Use this for queries about who parsed emails, email parsing reports, and email parsing performance. Target dimension for users/staff is ALWAYS 'employee'.",
+        "supported_metrics": ["total_emails_parsed", "total_tasks_created", "total_tokens", "total_cost_usd", "top_user_parsed"],
+        "supported_operations": ["summary", "report", "ranking", "filter", "group_by"],
+        "default_dimension": "employee",
+        "priority": PRIORITY_EXISTING_REPORT,
+        "dependencies": [],
+        "response_contract": {
+            "supports_report": True,
+            "supports_summary": True,
+            "supports_analysis": True,
+            "supports_chart": True,
+            "supports_export": True,
+            "supports_filters": True,
+            "supports_followup": True,
+            "supports_comparison": True,
+            "supports_drilldown": True,
+            "default_presentation": "REPORT"
+        },
+        "primary_metric": "total_emails_parsed",
+        "response_schema": {
+            "total_emails_parsed": "number",
+            "total_tasks_created": "number",
+            "total_tokens": "number",
+            "total_cost_usd": "number",
+            "rows": "array",
+            "data": "object"
+        },
+        "default_error_message": "Could not generate AI Email Usage report.",
+        "required_context": [],
+        "clarifiable_context": [],
+        "inheritable_context": ["start_date", "end_date", "employee_id"],
+        "defaultable_context": [],
+        "required_business_context": {},
+        "parameter_metadata": {},
+        "implementations": [
+            {
+                "priority": PRIORITY_SEMANTIC_WRAPPER,
+                "type": "wrapper",
+                "function_call": "call_generic_report",
+                "route_function": "api.reports_routes.get_ai_email_usage_report",
+                "endpoint": "GET /api/v1/reports/ai-email-usage-report",
+                "needs_confirmation": False,
+                "required_entities": [],
+                "required_parameters": []
+            }
+        ]
     }
 ]
 
 # Capability Alias Mapping for robust matching
 CAPABILITY_ALIASES = {
+    "ai_chatbot_usage": "ai_chatbot_usage",
+    "chatbot_usage": "ai_chatbot_usage",
+    "chatbot": "ai_chatbot_usage",
+    "ai_email_usage": "ai_email_usage",
+    "email_usage": "ai_email_usage",
+    "email_parsing": "ai_email_usage",
     "gp_performance": "gp_performance",
     "gross_profit": "gp_performance",
     "gp": "gp_performance",
@@ -1195,6 +1346,16 @@ def get_capability_entity_requirements(capability_id: str) -> tuple:
         required_types = list(depends_on)
 
     return bool(requires_entities), list(required_types)
+
+
+def get_capability_default_dimension(capability_id: str) -> str:
+    """
+    Returns the default grouping/ranking dimension (e.g. 'employee', 'service_line') for a capability.
+    """
+    meta = get_capability_metadata(capability_id)
+    if not meta:
+        return ""
+    return str(meta.get("default_dimension") or "").strip()
 
 
 # ---------------------------------------------------------------------------

@@ -116,7 +116,7 @@ def build_presentation_actions(
     actions = []
 
     if presentation_intent == "EXPORT":
-        if supports_export or export_available:
+        if export_available and supports_export:
             actions.append({
                 "label": "Download Excel Report",
                 "type": "EXPORT",
@@ -134,7 +134,7 @@ def build_presentation_actions(
         })
 
     elif presentation_intent == "GENERATE":
-        if supports_export or export_available:
+        if export_available and supports_export:
             actions.append({
                 "label": "Export to Excel",
                 "type": "EXPORT",

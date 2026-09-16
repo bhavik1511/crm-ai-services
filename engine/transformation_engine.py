@@ -25,8 +25,8 @@ def _parse_numeric(val: Any) -> float:
     if isinstance(val, (int, float)):
         return float(val)
     if isinstance(val, str):
-        # Remove currency symbols, commas, spaces
-        cleaned = str(val).replace(",", "").replace("$", "").replace("BHD", "").strip()
+        # Remove currency symbols, commas, percent, spaces
+        cleaned = str(val).replace(",", "").replace("$", "").replace("BHD", "").replace("%", "").strip()
         try:
             return float(cleaned)
         except ValueError:
@@ -48,7 +48,7 @@ class ResultTransformationEngine:
         keys_lower = {k.lower(): k for k in keys}
 
         if requested_dim:
-            dim = requested_dim.lower()
+            dim = requested_dim.lower().strip()
             # Direct or pattern match
             patterns = {
                 "customer": ["customer_name", "client_name", "customer", "client", "customer_code", "company_name"],
@@ -71,7 +71,11 @@ class ResultTransformationEngine:
                 if dim in k.lower():
                     return k
 
-        # Fallback: return first string key that is not an ID
+            # Unsafe fallback removed: If an explicit dimension was requested but is not in the row, do not invent/relabel
+            logger.warning(f"[TransformationEngine] Requested dimension '{requested_dim}' not found in sample row keys: {keys}")
+            return None
+
+        # Fallback only when no dimension was requested: return first string key that is not an ID
         for k, v in sample_row.items():
             if isinstance(v, str) and not k.lower().endswith("id") and not k.startswith("_"):
                 return k
@@ -91,13 +95,19 @@ class ResultTransformationEngine:
             patterns = {
                 "actual_cost": ["actual_cost", "actual_costs", "cost", "costs", "expense"],
                 "budget": ["budget", "total_budget", "proposed_fee", "approved_fee"],
-                "recoverability": ["recoverability", "realization", "recoverability_rate", "rate", "percentage"],
+                "actual_recoverability": ["actual_recoverability", "actual_recoverability_pct", "actual_recoverability_percentage", "actualrecoverability"],
+                "estimated_recoverability": ["estimated_recoverability", "proposal_recoverability", "recoverability"],
+                "recoverability": ["actual_recoverability", "actual_recoverability_pct", "actual_recoverability_percentage", "actualrecoverability"],
                 "proposals": ["count", "total_proposals", "open_proposals", "won_proposals"],
                 "revenue": ["total_net_amount", "net_amount", "amount", "revenue", "billing", "billed_amount", "total_fee", "fee"],
                 "count": ["count", "quantity", "total_count", "total_projects"],
                 "actual_gp": ["performing", "actual_gp", "gp_actual", "gp", "performing_gp", "actual"],
                 "target_gp": ["target", "target_gp", "gp_target"],
-                "gp_percent": ["trend", "gp_percent", "gp_pct", "variance"]
+                "gp_percent": ["gp_percent", "gp_pct", "gp_percentage", "budget_vs_actual_gp_percent", "gp_margin_pct"],
+                "variance": ["variance", "variance_amount", "gp_variance", "variance_gp", "rev_variance"],
+                "gp_variance": ["variance", "variance_amount", "gp_variance", "variance_gp"],
+                "variance_gp": ["variance", "variance_amount", "gp_variance", "variance_gp"],
+                "trend": ["trend", "growth_pct", "change_pct", "pct"]
             }
 
             matched_patterns = patterns.get(m, [m])
@@ -109,7 +119,11 @@ class ResultTransformationEngine:
                 if m in k.lower() or k.lower() in m:
                     return k
 
-        # Fallback: return first numeric key that is not an ID
+            # Unsafe fallback removed: If an explicit metric was requested but not found in the row, do not invent/relabel
+            logger.warning(f"[TransformationEngine] Requested metric '{requested_metric}' not found in sample row keys: {keys}")
+            return None
+
+        # Fallback only when no metric was requested: return first numeric key that is not an ID
         for k, v in sample_row.items():
             if isinstance(v, (int, float)) and not k.lower().endswith("id") and not k.startswith("_"):
                 return k
@@ -152,8 +166,15 @@ class ResultTransformationEngine:
 
         logger.debug(f"[TransformationEngine] Resolved dim_key='{dim_key}', metric_key='{metric_key}' for op={query_op.operation}")
 
-        # If dimension is required for ranking/breakdown but no dim_key found, return raw
-        if query_op.operation in ["ranking", "breakdown", "trend", "comparison"] and not dim_key:
+        # If dimension was explicitly requested or required for breakdown/trend/ranking but no dim_key found, return raw
+        if (query_op.dimension and not dim_key) or (query_op.operation in ["ranking", "breakdown", "trend", "comparison"] and not dim_key):
+            logger.warning(f"[TransformationEngine] Explicit dimension '{query_op.dimension}' requested but missing from rows; preserving original payload without relabeling.")
+            payload_envelope["query_operation"] = query_op.to_dict()
+            return payload_envelope
+
+        # Preserve original report rows without grouping into single 'Total' row for general report requests
+        cap_id = capability_metadata.get("id") if isinstance(capability_metadata, dict) else str(capability_metadata)
+        if (query_op.operation in ["generate_report", "report", "list", "detail"] or cap_id in ["recoverability_analysis", "project_recoverability_report"]) and not query_op.dimension and not query_op.ranking and not query_op.limit:
             payload_envelope["query_operation"] = query_op.to_dict()
             return payload_envelope
 

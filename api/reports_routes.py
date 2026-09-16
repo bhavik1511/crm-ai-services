@@ -4,10 +4,10 @@ Provides endpoints for AI Email Parsing Usage and AI Chatbot Usage metrics.
 """
 
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, date
 
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, HTTPException, Depends, Query, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import text as sql_text
 
@@ -33,11 +33,94 @@ def _parse_date(d_str: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def _build_base_report_filter(
+    request: Request,
+    table_alias: str,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    employee_id: Optional[int] = None,
+    search: Optional[str] = None,
+    search_columns: Optional[List[str]] = None,
+) -> Tuple[List[str], Dict[str, Any], Dict[str, str]]:
+    """
+    Centralized extractor for date ranges, employee scoping, searchQuery JSON,
+    and global search conditions across report endpoints.
+    """
+    conditions = ["1=1"]
+    params: Dict[str, Any] = {}
+    query_params = dict(request.query_params)
+
+    # 1. Date Range Handling
+    df_val = date_from or start_date or query_params.get("start_date") or query_params.get("dateFrom") or query_params.get("date_from")
+    dt_val = date_to or end_date or query_params.get("end_date") or query_params.get("dateTo") or query_params.get("date_to")
+    parsed_from = _parse_date(df_val)
+    if parsed_from:
+        conditions.append(f"{table_alias}.created_at >= :df")
+        params["df"] = parsed_from
+
+    parsed_to = _parse_date(dt_val)
+    if parsed_to:
+        if len(str(dt_val).strip()) <= 10:
+            parsed_to = parsed_to.replace(hour=23, minute=59, second=59)
+        conditions.append(f"{table_alias}.created_at <= :dt")
+        params["dt"] = parsed_to
+
+    # 2. Employee Scope
+    emp_id_val = employee_id or query_params.get("employee_id") or query_params.get("employeeId")
+    if emp_id_val:
+        try:
+            emp_int = int(emp_id_val)
+            if emp_int > 0:
+                conditions.append(f"{table_alias}.employee_id = :emp_id")
+                params["emp_id"] = emp_int
+        except Exception:
+            pass
+
+    # 3. Frontend SearchQuery JSON & Query Params
+    field_filters: Dict[str, str] = {}
+    sq_raw = query_params.get("searchQuery")
+    if sq_raw and str(sq_raw).strip().startswith("{"):
+        try:
+            import json
+            sq_json = json.loads(sq_raw)
+            if isinstance(sq_json, dict):
+                for k, v in sq_json.items():
+                    if v and str(v).strip():
+                        field_filters[k] = str(v).strip()
+        except Exception:
+            pass
+
+    for k, v in query_params.items():
+        if v and str(v).strip() and k not in field_filters:
+            field_filters[k] = str(v).strip()
+
+    # 4. Common Employee Name Filter
+    if "employee_name" in field_filters:
+        val = field_filters["employee_name"]
+        conditions.append(f"LOWER(COALESCE(e.employee_name, CASE WHEN {table_alias}.employee_id > 0 THEN CONCAT('Employee #', {table_alias}.employee_id) ELSE 'System' END)) LIKE :flt_emp_name")
+        params["flt_emp_name"] = f"%{val.lower()}%"
+
+    # 5. Global Search
+    if search and str(search).strip():
+        s_pat = f"%{str(search).strip().lower()}%"
+        search_clauses = [f"LOWER(COALESCE({col}, '')) LIKE :g_search" for col in (search_columns or [])]
+        search_clauses.append(f"LOWER(COALESCE(e.employee_name, CASE WHEN {table_alias}.employee_id > 0 THEN CONCAT('Employee #', {table_alias}.employee_id) ELSE 'System' END)) LIKE :g_search")
+        conditions.append(f"({' OR '.join(search_clauses)})")
+        params["g_search"] = s_pat
+
+    return conditions, params, field_filters
+
+
 @router.get("/ai-email-usage")
 async def get_ai_email_usage_report(
+    request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(security),
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
     employee_id: Optional[int] = Query(None),
     search: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
@@ -54,36 +137,27 @@ async def get_ai_email_usage_report(
         engine = get_db_engine()
         with engine.connect() as conn:
             # Build WHERE conditions
-            conditions = ["1=1"]
-            params: Dict[str, Any] = {}
+            conditions, params, field_filters = _build_base_report_filter(
+                request=request,
+                table_alias="p",
+                date_from=date_from,
+                date_to=date_to,
+                start_date=start_date,
+                end_date=end_date,
+                employee_id=employee_id,
+                search=search,
+                search_columns=["p.document_type", "p.processing_status"],
+            )
 
-            parsed_from = _parse_date(date_from)
-            if parsed_from:
-                conditions.append("p.created_at >= :df")
-                params["df"] = parsed_from
+            if "document_type" in field_filters:
+                val = field_filters["document_type"]
+                conditions.append("LOWER(COALESCE(p.document_type, '')) LIKE :flt_doc_type")
+                params["flt_doc_type"] = f"%{val.lower()}%"
 
-            parsed_to = _parse_date(date_to)
-            if parsed_to:
-                # Add end-of-day time if date only
-                if len(date_to.strip()) <= 10:
-                    parsed_to = parsed_to.replace(hour=23, minute=59, second=59)
-                conditions.append("p.created_at <= :dt")
-                params["dt"] = parsed_to
-
-            if employee_id and employee_id > 0:
-                conditions.append("p.employee_id = :emp_id")
-                params["emp_id"] = employee_id
-
-            if search and search.strip():
-                s_pat = f"%{search.strip().lower()}%"
-                conditions.append("""(
-                    LOWER(COALESCE(p.reference_id, '')) LIKE :search 
-                    OR LOWER(COALESCE(p.document_type, '')) LIKE :search 
-                    OR LOWER(COALESCE(p.model_name, '')) LIKE :search 
-                    OR LOWER(COALESCE(p.processing_status, '')) LIKE :search 
-                    OR LOWER(COALESCE(e.employee_name, CASE WHEN p.employee_id > 0 THEN CONCAT('Employee #', p.employee_id) ELSE 'System' END)) LIKE :search
-                )""")
-                params["search"] = s_pat
+            if "processing_status" in field_filters or "status" in field_filters:
+                val = field_filters.get("processing_status") or field_filters.get("status")
+                conditions.append("LOWER(COALESCE(p.processing_status, '')) LIKE :flt_status")
+                params["flt_status"] = f"%{val.lower()}%"
 
             where_clause = " AND ".join(conditions)
 
@@ -91,7 +165,7 @@ async def get_ai_email_usage_report(
             kpi_sql = f"""
                 SELECT 
                     COUNT(*) AS total_emails_parsed,
-                    SUM(CASE WHEN p.document_type = 'email_task' AND COALESCE(p.processing_status, '') IN ('CONVERTED', 'SUCCESS', 'COMPLETED') THEN 1 ELSE 0 END) AS total_tasks_created,
+                    SUM(CASE WHEN p.document_type = 'email_task' AND COALESCE(p.processing_status, '') IN ('CONVERTED', 'COMPLETED') THEN 1 ELSE 0 END) AS total_tasks_created,
                     COALESCE(SUM(p.total_tokens), 0) AS total_tokens,
                     COALESCE(SUM(p.total_cost_usd), 0.0) AS total_cost_usd,
                     COALESCE(AVG(p.confidence_score), 0) AS avg_confidence_score
@@ -125,7 +199,7 @@ async def get_ai_email_usage_report(
                 SELECT p.employee_id, COALESCE(e.employee_name, CONCAT('Employee #', p.employee_id)) AS name, COUNT(*) AS count
                 FROM ai_email_parsing p
                 LEFT JOIN employees e ON p.employee_id = e.id
-                WHERE {where_clause} AND p.document_type = 'email_task' AND COALESCE(p.processing_status, '') IN ('CONVERTED', 'SUCCESS', 'COMPLETED') AND p.employee_id IS NOT NULL AND p.employee_id > 0
+                WHERE {where_clause} AND p.document_type = 'email_task' AND COALESCE(p.processing_status, '') IN ('CONVERTED', 'COMPLETED') AND p.employee_id IS NOT NULL AND p.employee_id > 0
                 GROUP BY p.employee_id, e.employee_name
                 ORDER BY count DESC LIMIT 1
             """
@@ -160,7 +234,9 @@ async def get_ai_email_usage_report(
                     p.employee_id,
                     COALESCE(e.employee_name, CASE WHEN p.employee_id > 0 THEN CONCAT('Employee #', p.employee_id) ELSE 'System/Automation' END) AS employee_name,
                     COUNT(*) AS emails_parsed,
-                    SUM(CASE WHEN p.document_type = 'email_task' AND COALESCE(p.processing_status, '') IN ('CONVERTED', 'SUCCESS', 'COMPLETED') THEN 1 ELSE 0 END) AS tasks_created,
+                    SUM(CASE WHEN p.document_type = 'email_task' AND COALESCE(p.processing_status, '') IN ('CONVERTED', 'COMPLETED') THEN 1 ELSE 0 END) AS tasks_created,
+                    COALESCE(SUM(p.input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(p.output_tokens), 0) AS output_tokens,
                     COALESCE(SUM(p.total_tokens), 0) AS total_tokens,
                     COALESCE(SUM(p.total_cost_usd), 0.0) AS total_cost_usd
                 FROM ai_email_parsing p
@@ -187,8 +263,6 @@ async def get_ai_email_usage_report(
                     p.employee_id,
                     COALESCE(e.employee_name, CASE WHEN p.employee_id > 0 THEN CONCAT('Employee #', p.employee_id) ELSE 'System' END) AS employee_name,
                     p.document_type,
-                    p.reference_id,
-                    p.model_name,
                     p.has_attachment,
                     p.file_extension,
                     p.input_tokens,
@@ -236,10 +310,14 @@ async def get_ai_email_usage_report(
 
 @router.get("/ai-chatbot-usage")
 async def get_ai_chatbot_usage_report(
+    request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(security),
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
     employee_id: Optional[int] = Query(None),
+    metric: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=500),
@@ -254,37 +332,57 @@ async def get_ai_chatbot_usage_report(
     try:
         engine = get_db_engine()
         with engine.connect() as conn:
-            conditions = ["1=1"]
-            params: Dict[str, Any] = {}
+            # Build WHERE conditions
+            conditions, params, field_filters = _build_base_report_filter(
+                request=request,
+                table_alias="c",
+                date_from=date_from,
+                date_to=date_to,
+                start_date=start_date,
+                end_date=end_date,
+                employee_id=employee_id,
+                search=search,
+                search_columns=[
+                    "c.session_id",
+                    "c.model_name",
+                    "c.execution_path",
+                    "c.capability_id",
+                    "c.operation",
+                    "c.status",
+                ],
+            )
 
-            parsed_from = _parse_date(date_from)
-            if parsed_from:
-                conditions.append("c.created_at >= :df")
-                params["df"] = parsed_from
+            if "session_id" in field_filters:
+                val = field_filters["session_id"]
+                conditions.append("LOWER(COALESCE(c.session_id, '')) LIKE :flt_sess")
+                params["flt_sess"] = f"%{val.lower()}%"
 
-            parsed_to = _parse_date(date_to)
-            if parsed_to:
-                if len(date_to.strip()) <= 10:
-                    parsed_to = parsed_to.replace(hour=23, minute=59, second=59)
-                conditions.append("c.created_at <= :dt")
-                params["dt"] = parsed_to
+            if "model_name" in field_filters:
+                val = field_filters["model_name"]
+                conditions.append("LOWER(COALESCE(c.model_name, '')) LIKE :flt_model")
+                params["flt_model"] = f"%{val.lower()}%"
 
-            if employee_id and employee_id > 0:
-                conditions.append("c.employee_id = :emp_id")
-                params["emp_id"] = employee_id
+            if "execution_path" in field_filters:
+                val = field_filters["execution_path"]
+                conditions.append("LOWER(COALESCE(c.execution_path, '')) LIKE :flt_path")
+                params["flt_path"] = f"%{val.lower()}%"
 
-            if search and search.strip():
-                s_pat = f"%{search.strip().lower()}%"
-                conditions.append("""(
-                    LOWER(COALESCE(c.session_id, '')) LIKE :search 
-                    OR LOWER(COALESCE(c.model_name, '')) LIKE :search 
-                    OR LOWER(COALESCE(c.execution_path, '')) LIKE :search 
-                    OR LOWER(COALESCE(c.capability_id, '')) LIKE :search 
-                    OR LOWER(COALESCE(c.operation, '')) LIKE :search 
-                    OR LOWER(COALESCE(c.status, '')) LIKE :search 
-                    OR LOWER(COALESCE(e.employee_name, CASE WHEN c.employee_id > 0 THEN CONCAT('Employee #', c.employee_id) ELSE 'System' END)) LIKE :search
-                )""")
-                params["search"] = s_pat
+            if "capability_id" in field_filters:
+                val = field_filters["capability_id"]
+                if val.lower() not in ("ai_chatbot_usage", "ai-chatbot-usage-report", "ai_email_usage", "ai-email-usage-report"):
+                    conditions.append("LOWER(COALESCE(c.capability_id, '')) LIKE :flt_cap")
+                    params["flt_cap"] = f"%{val.lower()}%"
+
+            if "operation" in field_filters:
+                val = field_filters["operation"]
+                if val.lower() not in ("ranking", "summary", "report", "group_by", "filter", "comparison", "analytics"):
+                    conditions.append("LOWER(COALESCE(c.operation, '')) LIKE :flt_op")
+                    params["flt_op"] = f"%{val.lower()}%"
+
+            if "status" in field_filters:
+                val = field_filters["status"]
+                conditions.append("LOWER(COALESCE(c.status, '')) LIKE :flt_status")
+                params["flt_status"] = f"%{val.lower()}%"
 
             where_clause = " AND ".join(conditions)
 
@@ -339,6 +437,7 @@ async def get_ai_chatbot_usage_report(
             top_model_sql = f"""
                 SELECT c.model_name AS name, COUNT(*) AS count
                 FROM ai_chatbot_usage c
+                LEFT JOIN employees e ON c.employee_id = e.id
                 WHERE {where_clause} AND c.model_name IS NOT NULL
                 GROUP BY c.model_name
                 ORDER BY count DESC LIMIT 1
@@ -397,7 +496,18 @@ async def get_ai_chatbot_usage_report(
                 p_item["total_cost_usd"] = float(p_item.get("total_cost_usd") or 0.0)
                 execution_path_breakdown.append(p_item)
 
-            # 5. User Leaderboard
+            # 5. User Leaderboard (Ordered by requested metric, defaulting to total_tokens DESC)
+            req_metric = str(metric or field_filters.get("metric") or field_filters.get("sort_by") or request.query_params.get("metric") or request.query_params.get("sort_by") or "").lower().strip()
+            if req_metric in ("total_queries", "queries", "query_count", "count"):
+                order_clause = "total_queries DESC, total_tokens DESC"
+                sort_field = "total_queries"
+            elif req_metric in ("total_cost", "total_cost_usd", "cost", "amount", "revenue"):
+                order_clause = "total_cost_usd DESC, total_tokens DESC"
+                sort_field = "total_cost_usd"
+            else:
+                order_clause = "total_tokens DESC, total_queries DESC"
+                sort_field = "total_tokens"
+
             leaderboard_sql = f"""
                 SELECT 
                     c.employee_id,
@@ -412,7 +522,7 @@ async def get_ai_chatbot_usage_report(
                 LEFT JOIN employees e ON c.employee_id = e.id
                 WHERE {where_clause}
                 GROUP BY c.employee_id, e.employee_name
-                ORDER BY total_cost_usd DESC, total_tokens DESC
+                ORDER BY {order_clause}
             """
             lb_rows = conn.execute(sql_text(leaderboard_sql), params).mappings().all()
             leaderboard = []
@@ -465,6 +575,8 @@ async def get_ai_chatbot_usage_report(
                 "model_breakdown": model_breakdown,
                 "execution_path_breakdown": execution_path_breakdown,
                 "leaderboard": leaderboard,
+                "metric": sort_field,
+                "ranking_field": sort_field,
                 "pagination": {
                     "total": total_logs_count,
                     "page": page,

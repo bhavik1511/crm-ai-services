@@ -32,6 +32,42 @@ def _sanitize_log_dict(d: Dict[str, Any]) -> Dict[str, Any]:
             sanit[sensitive_key] = "[REDACTED]"
     return sanit
 
+def _normalize_payload_records(payload: Any, capability_id: str = "") -> Any:
+    """
+    Normalizes backend record fields to match canonical response_schema metric contracts
+    by reusing TransformationEngine.resolve_metric_key and _parse_numeric.
+    """
+    from engine.transformation_engine import get_transformation_engine, _parse_numeric
+    tf_engine = get_transformation_engine()
+    cap_meta = get_capability_metadata(capability_id) or {}
+    schema = cap_meta.get("response_schema", {})
+    schema_metrics = [k for k, v in schema.items() if v in ("number", "float", "integer", "string") and not k.endswith("_id") and not k.endswith("_name")]
+
+    def _normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(row, dict):
+            return row
+        norm_row = dict(row)
+        for target_metric in schema_metrics:
+            if target_metric not in norm_row:
+                matched_key = tf_engine.resolve_metric_key(norm_row, target_metric)
+                if matched_key and matched_key in norm_row:
+                    val = norm_row[matched_key]
+                    if schema.get(target_metric) == "number":
+                        norm_row[target_metric] = _parse_numeric(val)
+                    else:
+                        norm_row[target_metric] = val
+        return norm_row
+
+    if isinstance(payload, list):
+        return [_normalize_row(r) if isinstance(r, dict) else r for r in payload]
+    elif isinstance(payload, dict):
+        norm_payload = dict(payload)
+        for key in ["rows", "data", "records", "results", "items"]:
+            if key in norm_payload and isinstance(norm_payload[key], list):
+                norm_payload[key] = [_normalize_row(r) if isinstance(r, dict) else r for r in norm_payload[key]]
+        return _normalize_row(norm_payload)
+    return payload
+
 def format_capability_envelope(capability_id: str, result_data: Any, error_err: Any = None) -> Dict[str, Any]:
     cap_meta = get_capability_metadata(capability_id) or {}
     default_msg = cap_meta.get("default_error_message", "The requested information is currently unavailable. Please try again later.")
@@ -50,8 +86,27 @@ def format_capability_envelope(capability_id: str, result_data: Any, error_err: 
             }
         }
 
-    # Extract payload if already wrapped or raw dict
-    payload = result_data
+    # Extract payload if already wrapped or raw list/dict
+    if isinstance(result_data, list):
+        normalized_list = _normalize_payload_records(result_data, capability_id)
+        payload = {"rows": normalized_list, "data": normalized_list}
+    elif isinstance(result_data, dict):
+        payload = _normalize_payload_records(result_data, capability_id)
+    else:
+        payload = result_data
+    if isinstance(result_data, dict):
+        resp_cap = result_data.get("capability") or (result_data.get("payload", {}).get("capability") if isinstance(result_data.get("payload"), dict) else None)
+        resp_status = result_data.get("status") or (result_data.get("payload", {}).get("status") if isinstance(result_data.get("payload"), dict) else None)
+
+        if resp_cap == "unknown_capability" or resp_status in ("error", "EXCEPTION", "failure"):
+            logger.error(f"[Capability Envelope Validation Failure] cap_id={capability_id} returned invalid envelope: cap='{resp_cap}' status='{resp_status}'")
+            return {
+                "status": "error",
+                "confidence": "unavailable",
+                "source": capability_id,
+                "payload": {"error_message": default_msg}
+            }
+
     if isinstance(result_data, dict) and "payload" in result_data and "status" in result_data:
         status_val = result_data.get("status", "success")
         if status_val != "success":
@@ -240,9 +295,15 @@ class ToolRegistry:
             invariant_pass = True
             if expected_endpoint:
                 if impl_type in ["report", "api"]:
-                    clean_sel = selected_ep_str.split()[-1] if " " in selected_ep_str else selected_ep_str
-                    clean_exp = expected_endpoint.split()[-1] if " " in expected_endpoint else expected_endpoint
-                    if clean_sel.lower() != clean_exp.lower():
+                    clean_sel = selected_ep_str.split("?")[0].split()[-1] if " " in selected_ep_str else selected_ep_str.split("?")[0]
+                    clean_exp = expected_endpoint.split("?")[0].split()[-1] if " " in expected_endpoint else expected_endpoint.split("?")[0]
+                    registered_paths = {clean_exp.lower()}
+                    for registered_impl in available_impls:
+                        ep = registered_impl.get("endpoint")
+                        if ep:
+                            clean_reg = ep.split("?")[0].split()[-1] if " " in ep else ep.split("?")[0]
+                            registered_paths.add(clean_reg.lower())
+                    if clean_sel.lower() not in registered_paths:
                         invariant_pass = False
 
             if not invariant_pass:
@@ -268,7 +329,8 @@ class ToolRegistry:
                 "implementation_type": impl_type,
                 "priority": best_impl.get("priority"),
                 "score": best_score,
-                "full_capability_spec": cap
+                "full_capability_spec": cap,
+                "supported_dimensions": best_impl.get("supported_dimensions") or metadata.get("supported_dimensions", [])
             }
             execution_graph.append(executable_node)
 
@@ -338,7 +400,10 @@ class ToolRegistry:
 
             op_val = context.get("operation")
             if op_val and str(op_val).lower() not in ["none", "null", "false", ""]:
-                requested_ops.add(str(op_val).lower())
+                norm_op = str(op_val).lower()
+                if norm_op == "analysis":
+                    norm_op = "analyze"
+                requested_ops.add(norm_op)
 
             supported_ops = set(impl.get("supported_operations", ["filter", "summary", "generate", "generate_report", "report", "analyze", "ranking", "comparison", "group_by", "trend", "count", "sum", "average", "sort_order", "limit"]))
             # Map canonical report operations if candidate supports report generation or summary
@@ -354,6 +419,19 @@ class ToolRegistry:
                 rejection_reasons.append(reason)
                 logger.info(f"[ToolRegistry Filter] Disqualified '{impl_name}' -> {reason}")
                 continue
+            # 1.6. HARD GATE: Explicit Supported Dimensions Check
+            requested_dim = context.get("dimension") or context.get("group_by")
+            if requested_dim and str(requested_dim).lower() not in ["none", "null", "false", ""]:
+                req_dim_clean = str(requested_dim).lower().strip()
+                supp_dims = impl.get("supported_dimensions")
+                if supp_dims is not None:
+                    supp_dims_clean = [str(d).lower().strip() for d in supp_dims]
+                    if req_dim_clean not in supp_dims_clean:
+                        reason = f"Candidate '{impl_name}': Requested dimension '{req_dim_clean}' not in supported dimensions {supp_dims_clean}"
+                        rejection_reasons.append(reason)
+                        logger.info(f"[ToolRegistry Filter] Disqualified '{impl_name}' -> {reason}")
+                        continue
+
 
             # 2. SCORE CALCULATION
             entity_score = len(req_entities)
@@ -429,7 +507,12 @@ class ToolRegistry:
                 return {"capability": node.get("capability_id", "Unknown"), "error": node["error"]}
                 
             ctx = dict(node.get("context") or {})
-            for k in ["operation", "metric", "dimension", "ranking", "limit", "sort_order", "comparison", "comparison_periods"]:
+            for k in [
+                "operation", "metric", "dimension", "ranking", "limit", "sort_order",
+                "comparison", "comparison_periods", "start_date", "end_date", "financial_year",
+                "temporal_scope", "is_explicit", "employee_id", "customer_id", "project_id",
+                "service_line", "department", "search", "page", "time_filter", "period", "date_range"
+            ]:
                 if k not in ctx and node.get(k) is not None:
                     ctx[k] = node.get(k)
 
@@ -437,6 +520,8 @@ class ToolRegistry:
                 ctx["jwt_token"] = jwt_token
             cap_id = node.get("capability_id") or node.get("capability") or node.get("id") or "unknown_capability"
             target_cap_id = CAPABILITY_ALIASES.get(cap_id, cap_id)
+            ctx["capability_id"] = target_cap_id
+            ctx["capability"] = target_cap_id
             node_intent = node.get("intent")
             
             # 1. Dynamically inject ALL resolved entities into context
@@ -527,32 +612,17 @@ class ToolRegistry:
             exception_obj = None
             is_rest_attempt = (impl_type in ["api", "report"])
 
-            # Route 0: Authoritative Operation Overrides for Ranking & Multi-Period Comparison
+            # Route 0: Multi-Period Comparison Dispatch (if multi-period comparison context present)
             op_intent = str(ctx.get("operation") or "").lower()
             comp_periods = ctx.get("comparison_periods") or []
 
-            if op_intent == "ranking" and target_cap_id in ["revenue_analysis", "ranking_query", "analytical_query"]:
-                logger.info(f"[TOOL_REGISTRY_DISPATCH] Operation 'ranking' detected for capability '{target_cap_id}'. Dispatching to call_authoritative_ranking_query.")
-                func_name = "call_authoritative_ranking_query"
-                impl_type = "wrapper"
-                wrapper_func = SEMANTIC_TOOL_MAP.get(func_name)
-                try:
-                    raw_backend_response = await wrapper_func(ctx)
-                except Exception as exc:
-                    exception_obj = exc
-                    logger.error(f"[ToolRegistry Wrapper Exception] Cap: {target_cap_id} | Func: {func_name} | Exception: {exc}")
-            elif op_intent == "comparison" or len(comp_periods) >= 2:
-                logger.info(f"[TOOL_REGISTRY_DISPATCH] Operation 'comparison' detected for capability '{target_cap_id}'. Dispatching to call_authoritative_comparison_query.")
+            if (op_intent == "comparison" or len(comp_periods) >= 2) and len(comp_periods) >= 2 and func_name != "call_authoritative_comparison_query":
+                logger.info(f"[TOOL_REGISTRY_DISPATCH] Multi-period comparison detected for capability '{target_cap_id}'. Dispatching to call_authoritative_comparison_query.")
                 func_name = "call_authoritative_comparison_query"
                 impl_type = "wrapper"
-                wrapper_func = SEMANTIC_TOOL_MAP.get(func_name)
-                try:
-                    raw_backend_response = await wrapper_func(ctx)
-                except Exception as exc:
-                    exception_obj = exc
-                    logger.error(f"[ToolRegistry Wrapper Exception] Cap: {target_cap_id} | Func: {func_name} | Exception: {exc}")
+
             # Route 1: Python Semantic Wrapper
-            elif impl_type == "wrapper":
+            if impl_type == "wrapper":
                 wrapper_func = SEMANTIC_TOOL_MAP.get(func_name)
                 
                 if wrapper_func:

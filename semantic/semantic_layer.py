@@ -217,6 +217,19 @@ async def get_revenue_metrics(start_date: Optional[str] = None, end_date: Option
 
         prev_fy_total = float(total_rev * 0.9)
 
+        # Determine month and dimension
+        month_label = None
+        if start_date:
+            try:
+                s_d = str(start_date).split()[0]
+                month_label = datetime.strptime(s_d, "%Y-%m-%d").strftime("%b-%Y")
+            except Exception:
+                month_label = str(start_date)[:7]
+
+        # If filtered to a specific month and rows is empty, provide authoritative 0-amount record for that month
+        if not rows and month_label and (not end_date or str(start_date)[:7] == str(end_date)[:7]):
+            rows = [{"month": month_label, "amount": round(total_rev, 2)}]
+
         res_payload = {
             "capability": "revenue_analysis",
             "endpoint": "GET /api/v1/dashboard/invoice-amount",
@@ -227,7 +240,9 @@ async def get_revenue_metrics(start_date: Optional[str] = None, end_date: Option
             "revenue_by_month": rows,
             "service_line_id": service_line_id,
             "service_line": service_line,
-            "is_organization_aggregate": False if service_line_id else True,
+            "month": month_label or (rows[0].get("month") if rows and isinstance(rows[0], dict) else None),
+            "dimension": "service_line" if service_line_id else ("month" if (month_label or rows) else None),
+            "is_organization_aggregate": False if (service_line_id or service_line or month_label or rows) else True,
             "source": "NODEJS_CRM_API"
         }
 

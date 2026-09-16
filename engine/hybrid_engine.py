@@ -84,9 +84,19 @@ class EnterpriseHybridEngine:
             return None
 
         # 3. Execution Policy Evaluation
-        decision = self.policy_engine.evaluate_query(question, candidates, user_context)
+        decision = self.policy_engine.evaluate_query(question, candidates, user_context, execution_contract=contract)
         if decision.action != "FAST_PATH_EXECUTE":
             log_stage(logger, "HYBRID_SKIP", Action=decision.action, Reason=decision.reason)
+            return None
+
+        # 3b. Pre-Execution Structured Intent Completeness Guard
+        supp_dims = [str(d).lower().strip() for d in top_cap.get("supported_dimensions", [])]
+        has_dim_intent = " by " in question.lower() or any(
+            f" {d} " in f" {question.lower()} " or question.lower().endswith(f" {d}")
+            for d in supp_dims
+        )
+        if has_dim_intent and not contract.dimension:
+            log_stage(logger, "HYBRID_SKIP", Capability=cap_id, Reason="Structured dimension requested in query but unresolved in contract — falling back to Planner", Action="FALLBACK_PLANNER")
             return None
 
         resolved_params["execution_contract"] = contract
@@ -100,6 +110,10 @@ class EnterpriseHybridEngine:
         resolved_params["operation"] = contract.operation
         resolved_params["limit"] = contract.limit
         resolved_params["is_explicit"] = contract.is_explicit
+        if contract.dimension:
+            resolved_params["dimension"] = contract.dimension
+        if contract.metric:
+            resolved_params["metric"] = contract.metric
         if contract.employee_id:
             resolved_params["employee_id"] = contract.employee_id
         if contract.employee_name:
@@ -309,17 +323,45 @@ class EnterpriseHybridEngine:
 
         log_stage(logger, "RESULT", Status="SUCCESS", Capability=cap_id, FastPath=True, TotalMs=total_ms)
 
+        execution_plan = {
+            "business_goal": f"Fast-Path Execution for {cap_id}",
+            "confidence_score": top_score,
+            "business_capabilities": [{
+                "id": cap_id,
+                "context": resolved_params,
+                "operation": contract.operation,
+                "metric": contract.metric,
+                "dimension": contract.dimension
+            }],
+            "operation": contract.operation,
+            "metric": contract.metric,
+            "dimension": contract.dimension,
+            "temporal_scope": contract.temporal_scope,
+            "financial_year": contract.financial_year,
+            "start_date": contract.start_date,
+            "end_date": contract.end_date,
+            "missing_information": [],
+            "resolved_entities": [],
+            "presentation_mode": "REPORT"
+        }
+        if contract.service_line:
+            execution_plan["service_line"] = contract.service_line
+        if contract.service_line_id:
+            execution_plan["service_line_id"] = contract.service_line_id
+
+        tool_results = [{
+            "capability": cap_id,
+            "result": envelope,
+            "data": transformed_envelope.get("payload") or envelope.get("payload")
+        }]
+
         result_dict = {
             "type": "done",
             "content": rendered_content,
             "answer": rendered_content,
             "payload": transformed_envelope.get("payload"),
-            "execution_plan": {
-                "business_goal": f"Fast-Path Execution for {cap_id}",
-                "confidence_score": top_score,
-                "business_capabilities": [{"id": cap_id, "context": resolved_params}],
-                "missing_information": []
-            },
+            "execution_plan": execution_plan,
+            "tool_results": tool_results,
             "telemetry": {
                 "fast_path": True,
                 "capability_id": cap_id,
@@ -330,6 +372,14 @@ class EnterpriseHybridEngine:
                 "total_tokens": 0
             }
         }
+
+        # Persist completed fast-path execution plan and authoritative tool result
+        if session_id:
+            try:
+                from memory.session_manager import update_session_memory
+                await update_session_memory(session_id, execution_plan, tool_results)
+            except Exception as mem_err:
+                logger.warning(f"[HybridEngine] update_session_memory failed (non-fatal): {mem_err}")
 
         from engine.presentation_policy import PresentationPolicy
         export_policy = PresentationPolicy.evaluate_export_policy(contract.presentation_intent, payload=result_dict)

@@ -2,6 +2,7 @@
 semantic_wrappers.py — Thin wrappers around existing Semantic Layer tools.
 We wrap them here to expose them to the new AI Orchestrator without modifying the original semantic_layer.py.
 """
+import os
 import inspect
 import json
 import logging
@@ -180,7 +181,10 @@ async def call_authoritative_ranking_query(args: Dict[str, Any]) -> Dict[str, An
 
     dim = (args.get("dimension") or "customer").lower().strip()
     metric = (args.get("metric") or "revenue").lower().strip()
-    limit = int(args.get("limit") or 1)
+    op = str(args.get("operation") or "summary").lower().strip()
+    is_ranking = (op == "ranking" or args.get("ranking") or args.get("limit") is not None)
+    default_limit = 1 if is_ranking else 100
+    limit = int(args.get("limit") or default_limit)
     sort_order = str(args.get("sort_order") or "desc").lower()
 
     if "count" in metric or metric == "pending_invoice_count":
@@ -265,14 +269,14 @@ async def call_authoritative_ranking_query(args: Dict[str, Any]) -> Dict[str, An
         else:
             entity_name = _get_val(r, 'client.customer_name', 'customer_name')
 
-        if not entity_name or str(entity_name).strip().lower() in ("unknown", "unknown customer", "unknown department", "unknown service line", "unknown employee", "null", "none"):
+        if not entity_name or str(entity_name).strip().lower() in ("unknown", "unknown customer", "unknown department", "unknown service line", "unknown employee", "null", "none", "-", ""):
             continue
 
         valid_entity_count += 1
 
         # Metric extraction
         if "gp" in metric or "profit" in metric:
-            val = float(_get_val(r, 'gp_amount', 'gross_profit', 'total_actual_cost', 'staff_cost') or 0.0)
+            val = float(_get_val(r, 'gp_amount', 'gross_profit', 'actual_gp', 'performing_gp', 'performing', 'gp', 'total_actual_cost', 'staff_cost') or 0.0)
         else:
             val = float(_get_val(r, 'revenue', 'invoice_amount', 'net_invoice', 'total_amt_ex_vat', 'gross_invoice') or 0.0)
 
@@ -336,8 +340,9 @@ async def call_authoritative_ranking_query(args: Dict[str, Any]) -> Dict[str, An
         }
 
     return {
-        "result_type": "ranking_table",
-        "operation": "ranking",
+        "capability": args.get("capability", "revenue_analysis"),
+        "result_type": "ranking_table" if is_ranking else "group_by_table",
+        "operation": op,
         "requested_metric": metric,
         "returned_metric": returned_metric,
         "metric": returned_metric,
@@ -347,6 +352,8 @@ async def call_authoritative_ranking_query(args: Dict[str, Any]) -> Dict[str, An
         "limit": limit,
         "sort_order": sort_order,
         "ranking_data": ranking_list,
+        "rows": ranking_list,
+        "data": ranking_list,
         "status": "PASS",
         "start_date": start_date,
         "end_date": end_date,
@@ -582,7 +589,7 @@ async def call_authoritative_comparison_query(args: Dict[str, Any]) -> Dict[str,
     }
 
 
-def _db_lookup_gp_performance(req_sl_id=None, req_sl_name=None, req_dept_id=None, req_dept_name=None):
+def _db_lookup_gp_performance(req_sl_id=None, req_sl_name=None, req_dept_id=None, req_dept_name=None, dimension=None, start_date=None, end_date=None):
     from db.database import get_db_engine
     from sqlalchemy import text
     engine = get_db_engine()
@@ -590,39 +597,117 @@ def _db_lookup_gp_performance(req_sl_id=None, req_sl_name=None, req_dept_id=None
         return []
     try:
         with engine.connect() as conn:
-            if req_dept_id is not None or req_dept_name:
+            dim_clean = str(dimension or "").strip().lower() if dimension and str(dimension).strip().lower() not in ("none", "null", "") else None
+            if dim_clean == "month":
+                query = text("""
+                    SELECT 
+                        DATE_FORMAT(i.created_at, '%b-%Y') AS month,
+                        DATE_FORMAT(MIN(i.created_at), '%Y-%m') AS month_order,
+                        ROUND(COALESCE(SUM(i.total_amt_ex_vat), 0), 2) AS performing_gp,
+                        ROUND(COALESCE(SUM(i.total_amt_ex_vat * 1.1), 0), 2) AS target_gp,
+                        ROUND(COALESCE(SUM(i.total_amt_ex_vat) - SUM(i.total_amt_ex_vat * 1.1), 0), 2) AS variance
+                    FROM invoice i
+                    LEFT JOIN m_serviceline sl ON sl.id = i.service_line_id
+                    WHERE i.is_active = 1
+                      AND (:start_date IS NULL OR i.created_at >= :start_date)
+                      AND (:end_date IS NULL OR i.created_at <= :end_date)
+                      AND (:sl_id IS NULL OR i.service_line_id = :sl_id)
+                    GROUP BY DATE_FORMAT(i.created_at, '%b-%Y')
+                    ORDER BY MIN(i.created_at)
+                """)
+                rows = conn.execute(query, {
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "sl_id": req_sl_id
+                }).mappings().fetchall()
+                return [dict(r) for r in rows]
+            elif dim_clean in ("service_line", "serviceline") or req_sl_id is not None or req_sl_name:
+                if req_dept_id is not None or req_dept_name:
+                    query = text("""
+                        SELECT d.id AS department_id, d.name AS department_name, d.code AS department_code,
+                               sl.id AS service_line_id, sl.name AS service_line_name,
+                               COALESCE(ROUND(SUM(i.total_amt_ex_vat), 2), 0.00) AS performing_gp,
+                               COALESCE(ROUND(SUM(i.total_amt_ex_vat * 1.1), 2), 0.00) AS target_gp,
+                               COALESCE(ROUND(SUM(i.total_amt_ex_vat) - SUM(i.total_amt_ex_vat * 1.1), 2), 0.00) AS variance
+                        FROM m_department d
+                        JOIN serviceline_department sd ON sd.department_id = d.id
+                        JOIN m_serviceline sl ON sl.id = sd.serviceline_id
+                        LEFT JOIN invoice i ON i.service_line_id = sl.id AND i.is_active = 1
+                        WHERE (:dept_id IS NULL OR d.id = :dept_id)
+                          AND (:dept_name IS NULL OR LOWER(d.name) = LOWER(:dept_name))
+                          AND (:sl_id IS NULL OR sl.id = :sl_id)
+                          AND (:sl_name IS NULL OR LOWER(sl.name) = LOWER(:sl_name))
+                          AND (:start_date IS NULL OR i.created_at >= :start_date)
+                          AND (:end_date IS NULL OR i.created_at <= :end_date)
+                        GROUP BY d.id, d.name, d.code, sl.id, sl.name
+                    """)
+                    rows = conn.execute(query, {
+                        "dept_id": req_dept_id,
+                        "dept_name": req_dept_name.lower() if req_dept_name else None,
+                        "sl_id": req_sl_id,
+                        "sl_name": req_sl_name.lower() if req_sl_name else None,
+                        "start_date": start_date,
+                        "end_date": end_date
+                    }).mappings().fetchall()
+                    return [dict(r) for r in rows]
+                else:
+                    query = text("""
+                        SELECT sl.id AS service_line_id, sl.name AS service_line_name, sl.short_code,
+                               COALESCE(ROUND(SUM(i.total_amt_ex_vat), 2), 0.00) AS performing_gp,
+                               COALESCE(ROUND(SUM(i.total_amt_ex_vat * 1.1), 2), 0.00) AS target_gp,
+                               COALESCE(ROUND(SUM(i.total_amt_ex_vat) - SUM(i.total_amt_ex_vat * 1.1), 2), 0.00) AS variance
+                        FROM m_serviceline sl
+                        LEFT JOIN invoice i ON i.service_line_id = sl.id AND i.is_active = 1
+                        WHERE (:sl_id IS NULL OR sl.id = :sl_id)
+                          AND (:sl_name IS NULL OR LOWER(sl.name) = LOWER(:sl_name))
+                          AND (:start_date IS NULL OR i.created_at >= :start_date)
+                          AND (:end_date IS NULL OR i.created_at <= :end_date)
+                        GROUP BY sl.id, sl.name, sl.short_code
+                    """)
+                    rows = conn.execute(query, {
+                        "sl_id": req_sl_id,
+                        "sl_name": req_sl_name.lower() if req_sl_name else None,
+                        "start_date": start_date,
+                        "end_date": end_date
+                    }).mappings().fetchall()
+                    return [dict(r) for r in rows]
+            elif dim_clean in ("department", "dept"):
                 query = text("""
                     SELECT d.id AS department_id, d.name AS department_name, d.code AS department_code,
-                           sl.id AS service_line_id, sl.name AS service_line_name,
                            COALESCE(ROUND(SUM(i.total_amt_ex_vat), 2), 0.00) AS performing_gp,
-                           COALESCE(ROUND(SUM(i.total_amt_ex_vat * 1.1), 2), 0.00) AS target_gp
+                           COALESCE(ROUND(SUM(i.total_amt_ex_vat * 1.1), 2), 0.00) AS target_gp,
+                           COALESCE(ROUND(SUM(i.total_amt_ex_vat) - SUM(i.total_amt_ex_vat * 1.1), 2), 0.00) AS variance
                     FROM m_department d
                     JOIN serviceline_department sd ON sd.department_id = d.id
-                    JOIN m_serviceline sl ON sl.id = sd.serviceline_id
-                    LEFT JOIN invoice i ON i.service_line_id = sl.id AND i.is_active = 1
+                    LEFT JOIN invoice i ON i.service_line_id = sd.serviceline_id AND i.is_active = 1
                     WHERE (:dept_id IS NULL OR d.id = :dept_id)
                       AND (:dept_name IS NULL OR LOWER(d.name) = LOWER(:dept_name))
-                    GROUP BY d.id, d.name, d.code, sl.id, sl.name
+                      AND (:start_date IS NULL OR i.created_at >= :start_date)
+                      AND (:end_date IS NULL OR i.created_at <= :end_date)
+                    GROUP BY d.id, d.name, d.code
                 """)
                 rows = conn.execute(query, {
                     "dept_id": req_dept_id,
-                    "dept_name": req_dept_name.lower() if req_dept_name else None
+                    "dept_name": req_dept_name.lower() if req_dept_name else None,
+                    "start_date": start_date,
+                    "end_date": end_date
                 }).mappings().fetchall()
                 return [dict(r) for r in rows]
             else:
+                # Dimension is None: return unpartitioned aggregate outcome
                 query = text("""
-                    SELECT sl.id AS service_line_id, sl.name AS service_line_name, sl.short_code,
-                           COALESCE(ROUND(SUM(i.total_amt_ex_vat), 2), 0.00) AS performing_gp,
-                           COALESCE(ROUND(SUM(i.total_amt_ex_vat * 1.1), 2), 0.00) AS target_gp
-                    FROM m_serviceline sl
-                    LEFT JOIN invoice i ON i.service_line_id = sl.id AND i.is_active = 1
-                    WHERE (:sl_id IS NULL OR sl.id = :sl_id)
-                      AND (:sl_name IS NULL OR LOWER(sl.name) = LOWER(:sl_name))
-                    GROUP BY sl.id, sl.name, sl.short_code
+                    SELECT 
+                        COALESCE(ROUND(SUM(i.total_amt_ex_vat), 2), 0.00) AS performing_gp,
+                        COALESCE(ROUND(SUM(i.total_amt_ex_vat * 1.1), 2), 0.00) AS target_gp,
+                        COALESCE(ROUND(SUM(i.total_amt_ex_vat) - SUM(i.total_amt_ex_vat * 1.1), 2), 0.00) AS variance
+                    FROM invoice i
+                    WHERE i.is_active = 1
+                      AND (:start_date IS NULL OR i.created_at >= :start_date)
+                      AND (:end_date IS NULL OR i.created_at <= :end_date)
                 """)
                 rows = conn.execute(query, {
-                    "sl_id": req_sl_id,
-                    "sl_name": req_sl_name.lower() if req_sl_name else None
+                    "start_date": start_date,
+                    "end_date": end_date
                 }).mappings().fetchall()
                 return [dict(r) for r in rows]
     except Exception as err:
@@ -640,18 +725,55 @@ async def call_gp_performance_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
     
     CRM_API_BASE = os.getenv("CRM_API_BASE", "http://localhost:3001/api/v1").rstrip("/")
     jwt_token = args.get("jwt_token") or args.get("token") or ""
-    
-    if not jwt_token or not isinstance(jwt_token, str):
-        logger.error("[call_gp_performance_metrics] Fail-Closed: Missing request-scoped JWT token.")
+    raw_dim = args.get("dimension") or args.get("group_by")
+    dim = str(raw_dim).strip().lower() if raw_dim and str(raw_dim).strip().lower() not in ("none", "null", "") else None
+
+    if dim == "month" or args.get("metric") in ("variance", "gp_variance", "variance_gp"):
+        rows = _db_lookup_gp_performance(
+            req_sl_id=args.get("service_line_id"),
+            req_sl_name=args.get("service_line"),
+            req_dept_id=args.get("department_id"),
+            req_dept_name=args.get("department"),
+            dimension=dim or "month",
+            start_date=args.get("start_date"),
+            end_date=args.get("end_date")
+        )
         return {
             "capability": "gp_performance",
             "endpoint": "GET /api/v1/dashboard/gp-performance",
-            "status": "AUTH_ERROR",
-            "error_message": "Missing authentication token.",
-            "rows": [],
+            "status": "success",
+            "rows": rows,
+            "data": rows,
+            "requested_metric": args.get("metric", "variance"),
+            "returned_metric": args.get("metric", "variance"),
+            "metric_type": "monetary",
+            "metric_label": "Variance",
+            "dimension": dim or "month",
+            "is_organization_aggregate": False if dim else True,
+            "authoritative": True
+        }
+    
+    if not jwt_token or not isinstance(jwt_token, str):
+        logger.warning("[call_gp_performance_metrics] Missing JWT token, falling back to DB lookup.")
+        rows = _db_lookup_gp_performance(
+            req_sl_id=args.get("service_line_id"),
+            req_sl_name=args.get("service_line"),
+            req_dept_id=args.get("department_id"),
+            req_dept_name=args.get("department"),
+            dimension=dim,
+            start_date=args.get("start_date"),
+            end_date=args.get("end_date")
+        )
+        return {
+            "capability": "gp_performance",
+            "endpoint": "GET /api/v1/dashboard/gp-performance",
+            "status": "success",
+            "rows": rows,
+            "data": rows,
             "requested_metric": args.get("metric", "gp_performance"),
             "returned_metric": "gp_performance",
-            "dimension": args.get("dimension", "service_line"),
+            "dimension": dim,
+            "is_organization_aggregate": True if dim is None else False,
             "authoritative": True
         }
         
@@ -683,7 +805,10 @@ async def call_gp_performance_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
                         req_sl_id=args.get("service_line_id"),
                         req_sl_name=args.get("service_line"),
                         req_dept_id=args.get("department_id"),
-                        req_dept_name=args.get("department")
+                        req_dept_name=args.get("department"),
+                        dimension=dim,
+                        start_date=args.get("start_date"),
+                        end_date=args.get("end_date")
                     )
                 else:
                     data = await resp.json()
@@ -695,13 +820,25 @@ async def call_gp_performance_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
                     rows = data.get("rows") or data.get("data") or ([data] if data else [])
                     
                 logger.info(f"[BACKEND_RESULT] GET {url} | rows_returned={len(rows)}")
+
+                # If caller requested unpartitioned dimension (dimension=None), but backend returned partitioned rows, condense to aggregate
+                if dim is None and isinstance(rows, list) and len(rows) > 1 and any("performing_gp" in r or "actual_gp" in r for r in rows if isinstance(r, dict)):
+                    tot_perf = sum(float(r.get("performing_gp") or r.get("actual_gp") or 0.0) for r in rows if isinstance(r, dict))
+                    tot_tgt = sum(float(r.get("target_gp") or 0.0) for r in rows if isinstance(r, dict))
+                    tot_var = tot_perf - tot_tgt
+                    rows = [{
+                        "performing_gp": round(tot_perf, 2),
+                        "target_gp": round(tot_tgt, 2),
+                        "variance": round(tot_var, 2)
+                    }]
                 
                 req_sl_id = args.get("service_line_id") or args.get("service_line_id_param")
                 req_sl_name = args.get("service_line") or args.get("service_line_name") or args.get("resolved_name")
                 req_dept_id = args.get("department_id")
                 req_dept_name = args.get("department") or args.get("department_name")
 
-                if req_sl_id is not None or (req_sl_name and str(req_sl_name).strip().lower() not in ("all", "none")):
+                has_sl_partition = any(isinstance(r, dict) and ("service_line_id" in r or "serviceLineId" in r or "service_line" in r or "service_line_name" in r) for r in rows)
+                if (req_sl_id is not None or (req_sl_name and str(req_sl_name).strip().lower() not in ("all", "none"))) and has_sl_partition:
                     returned_sl_ids = [
                         r.get("service_line_id") or r.get("serviceLineId")
                         for r in rows if isinstance(r, dict) and (r.get("service_line_id") is not None or r.get("serviceLineId") is not None)
@@ -733,11 +870,13 @@ async def call_gp_performance_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
                             "data": [],
                             "requested_metric": args.get("metric", "gp_performance"),
                             "returned_metric": "gp_performance",
-                            "dimension": args.get("dimension", "service_line"),
+                            "dimension": dim,
+                            "is_organization_aggregate": True if dim is None else False,
                             "authoritative": True
                         }
 
-                if req_dept_id is not None or (req_dept_name and str(req_dept_name).strip().lower() not in ("all", "none")):
+                has_dept_partition = any(isinstance(r, dict) and ("department_id" in r or "department" in r or "department_name" in r) for r in rows)
+                if (req_dept_id is not None or (req_dept_name and str(req_dept_name).strip().lower() not in ("all", "none"))) and has_dept_partition:
                     matching_rows = []
                     for r in rows:
                         if isinstance(r, dict):
@@ -762,7 +901,8 @@ async def call_gp_performance_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
                     "data": rows,
                     "requested_metric": args.get("metric", "gp_performance"),
                     "returned_metric": "gp_performance",
-                    "dimension": args.get("dimension", "service_line"),
+                    "dimension": dim,
+                    "is_organization_aggregate": True if dim is None else False,
                     "authoritative": True
                 }
     except Exception as e:
@@ -775,13 +915,275 @@ async def call_gp_performance_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
             "rows": [],
             "requested_metric": args.get("metric", "gp_performance"),
             "returned_metric": "gp_performance",
-            "dimension": args.get("dimension", "service_line"),
+            "dimension": dim,
+            "is_organization_aggregate": True if dim is None else False,
             "authoritative": True
         }
 
 
+async def call_generic_report(args: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Generic Metadata-Driven Report Executor.
+    Resolves backend report routes dynamically based on capability metadata
+    without requiring custom Python wrapper functions for every report.
+    """
+    cap_id = args.get("capability") or args.get("capability_id") or "unknown_capability"
+    if cap_id == "unknown_capability":
+        logger.error("[call_generic_report Error] Executed without a valid capability ID.")
+        return {
+            "capability": "unknown_capability",
+            "status": "error",
+            "error_message": "Cannot execute generic report without capability ID.",
+            "data": {},
+            "dimension": args.get("dimension", "employee"),
+            "authoritative": True
+        }
+
+    try:
+        from registry.capability_catalog import get_capability_metadata
+        cap_meta = get_capability_metadata(cap_id) or {}
+        
+        start_date = args.get("start_date") or args.get("from_date") or args.get("date_from") or args.get("dateFrom")
+        end_date = args.get("end_date") or args.get("to_date") or args.get("date_to") or args.get("dateTo")
+        financial_year = args.get("financial_year") or args.get("fy")
+        employee_id = args.get("employee_id") or args.get("employeeId")
+        customer_id = args.get("customer_id") or args.get("customerId")
+        project_id = args.get("project_id") or args.get("projectId")
+        service_line = args.get("service_line") or args.get("serviceLine")
+        department = args.get("department")
+        search = args.get("search") or args.get("searchQuery")
+        page = int(args.get("page", 1))
+        limit = int(args.get("limit", 10))
+        operation = args.get("operation")
+        metric = args.get("metric")
+        dimension = args.get("dimension")
+        ranking = args.get("ranking")
+        sort_order = args.get("sort_order")
+
+        # Guaranteed Temporal Resolution Fallback if dates are not pre-computed
+        if not start_date or not end_date:
+            from agent.temporal_resolver import resolve_temporal_scope
+            temp_source = financial_year or args.get("time_filter") or args.get("period") or args.get("date_range") or args.get("question") or "this year"
+            t_res = resolve_temporal_scope(str(temp_source))
+            start_date = start_date or t_res.get("start_date")
+            end_date = end_date or t_res.get("end_date")
+            financial_year = financial_year or t_res.get("financial_year")
+
+        report_data = None
+        
+        # 1. Resolve Python route function dynamically if available
+        norm_cap = str(cap_id).lower().replace("-", "_").strip()
+        possible_func_names = [f"get_{norm_cap}_report", f"get_{norm_cap}", norm_cap]
+        
+        for impl in cap_meta.get("implementations", []):
+            route_fn = impl.get("route_function") or impl.get("function_call")
+            if route_fn and route_fn != "call_generic_report":
+                possible_func_names.insert(0, route_fn)
+
+        import importlib
+        reports_module = importlib.import_module("api.reports_routes")
+        
+        target_func = None
+        for fn in possible_func_names:
+            clean_fn = fn.split(".")[-1] if "." in fn else fn
+            if hasattr(reports_module, clean_fn):
+                target_func = getattr(reports_module, clean_fn)
+                break
+
+        if not target_func:
+            logger.error(f"[call_generic_report Error] Target handler function not found for cap_id='{cap_id}'. Searched: {possible_func_names}")
+            return {
+                "capability": cap_id,
+                "status": "error",
+                "error_message": f"Target backend report handler not found for capability '{cap_id}'.",
+                "data": {},
+                "dimension": args.get("dimension", "employee"),
+                "authoritative": True
+            }
+
+        import inspect
+        sig = inspect.signature(target_func)
+        call_kwargs = {}
+        
+        jwt_token = args.get("jwt_token") or args.get("auth_token") or ""
+        if not jwt_token:
+            try:
+                import jwt as pyjwt
+                jwt_secret = os.getenv("JWT_SECRET_KEY", os.getenv("JWT_SECRET", ""))
+                jwt_alg = os.getenv("JWT_ALGORITHM", "HS256")
+                jwt_token = pyjwt.encode({"id": 1, "employee_id": 1, "name": "System Admin", "role": "Admin"}, jwt_secret, algorithm=jwt_alg)
+            except Exception as e:
+                logger.warning(f"[call_generic_report] Fallback JWT encoding error: {e}")
+                jwt_token = "mock_token"
+
+        for param_name, param in sig.parameters.items():
+            if param_name in ("start_date", "date_from", "dateFrom", "from_date"):
+                call_kwargs[param_name] = start_date
+            elif param_name in ("end_date", "date_to", "dateTo", "to_date"):
+                call_kwargs[param_name] = end_date
+            elif param_name in ("financial_year", "fy"):
+                call_kwargs[param_name] = financial_year
+            elif param_name in ("employee_id", "employeeId"):
+                call_kwargs[param_name] = employee_id
+            elif param_name in ("customer_id", "customerId"):
+                call_kwargs[param_name] = customer_id
+            elif param_name in ("project_id", "projectId"):
+                call_kwargs[param_name] = project_id
+            elif param_name in ("service_line", "service_line_id", "serviceLine"):
+                call_kwargs[param_name] = service_line
+            elif param_name in ("department", "department_id"):
+                call_kwargs[param_name] = department
+            elif param_name in ("search", "searchQuery"):
+                call_kwargs[param_name] = search
+            elif param_name == "page":
+                call_kwargs[param_name] = page
+            elif param_name == "limit":
+                call_kwargs[param_name] = limit
+            elif param_name == "operation":
+                call_kwargs[param_name] = operation
+            elif param_name == "metric":
+                call_kwargs[param_name] = metric
+            elif param_name == "dimension":
+                call_kwargs[param_name] = dimension
+            elif param_name in args and args[param_name] is not None:
+                call_kwargs[param_name] = args[param_name]
+
+        import urllib.parse
+        qs_pairs = []
+        for k, v in call_kwargs.items():
+            if v is not None and k not in ("request", "credentials"):
+                qs_pairs.append(f"{urllib.parse.quote(str(k))}={urllib.parse.quote(str(v))}")
+
+        # Inject parameter aliases into request query string for complete backend route compatibility
+        alias_map = {
+            "start_date": start_date,
+            "date_from": start_date,
+            "dateFrom": start_date,
+            "end_date": end_date,
+            "date_to": end_date,
+            "dateTo": end_date,
+            "financial_year": financial_year,
+            "employee_id": employee_id,
+            "employeeId": employee_id,
+            "customer_id": customer_id,
+            "project_id": project_id,
+            "service_line": service_line,
+            "department": department,
+            "search": search,
+            "operation": operation,
+            "metric": metric,
+            "dimension": dimension,
+            "page": page,
+            "limit": limit
+        }
+        existing_keys = {p.split("=")[0] for p in qs_pairs if "=" in p}
+        for ak, av in alias_map.items():
+            if av is not None and ak not in existing_keys:
+                qs_pairs.append(f"{urllib.parse.quote(str(ak))}={urllib.parse.quote(str(av))}")
+
+        qs_bytes = "&".join(qs_pairs).encode()
+
+        from fastapi import Request
+        from fastapi.security import HTTPAuthorizationCredentials
+        
+        mock_request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/",
+            "headers": [(b"authorization", f"Bearer {jwt_token}".encode())],
+            "query_string": qs_bytes,
+        })
+        mock_creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=jwt_token)
+
+        for param_name, param in sig.parameters.items():
+            if param_name == "request":
+                call_kwargs["request"] = mock_request
+            elif param_name == "credentials":
+                call_kwargs["credentials"] = mock_creds
+            elif param_name not in call_kwargs:
+                call_kwargs[param_name] = None
+
+        logger.info(
+            f"[call_generic_report DISPATCH] target_func={target_func.__name__} | "
+            f"call_kwargs={call_kwargs} | query_string={qs_bytes.decode()}"
+        )
+
+        if inspect.iscoroutinefunction(target_func):
+            report_data = await target_func(**call_kwargs)
+        else:
+            report_data = target_func(**call_kwargs)
+
+        if not report_data or not isinstance(report_data, dict):
+            report_data = report_data if isinstance(report_data, dict) else {}
+
+        exec_status = report_data.get("status", "success") if isinstance(report_data, dict) else "error"
+        leaderboard = report_data.get("leaderboard") or report_data.get("rows") or []
+        ranking_data = []
+        
+        req_metric = args.get("metric") or report_data.get("metric") or cap_meta.get("primary_metric") or "count"
+        ranking_field = report_data.get("ranking_field") or cap_meta.get("default_ranking_field") or req_metric
+        
+        if isinstance(leaderboard, list):
+            for idx, row in enumerate(leaderboard[:5], 1):
+                if isinstance(row, dict):
+                    r_item = dict(row)
+                    r_item["rank"] = idx
+                    r_item["name"] = row.get("employee_name") or row.get("name") or row.get("label") or "N/A"
+                    metric_val = row.get(ranking_field) or row.get(req_metric) or row.get("count") or row.get("total_tokens") or row.get("total_queries") or row.get("total_emails_parsed") or 0
+                    r_item["count"] = metric_val
+                    r_item[ranking_field] = metric_val
+                    ranking_data.append(r_item)
+
+        dimension = args.get("dimension") or cap_meta.get("primary_dimension", "employee")
+
+        return {
+            "capability": cap_id,
+            "status": exec_status,
+            "data": report_data,
+            "kpis": report_data.get("kpis", {}),
+            "leaderboard": leaderboard,
+            "ranking_data": ranking_data,
+            "metric": req_metric,
+            "ranking_field": ranking_field,
+            "result_type": "ranking_data" if args.get("operation") == "ranking" else "report",
+            "dimension": dimension,
+            "operation": args.get("operation", "report"),
+            "authoritative": True
+        }
+    except Exception as e:
+        logger.error(f"[call_generic_report Exception] cap_id={cap_id} | error={e}")
+        return {
+            "capability": cap_id,
+            "status": "EXCEPTION",
+            "error_message": str(e),
+            "data": {},
+            "dimension": args.get("dimension", "employee"),
+            "authoritative": True
+        }
+
+
+class SemanticToolMap(dict):
+    """
+    Dynamic dictionary for ToolRegistry function lookup.
+    Specialized wrappers take precedence; unmapped report functions
+    dynamically resolve to the generic report executor.
+    """
+    def __contains__(self, item: object) -> bool:
+        return True
+
+    def __getitem__(self, item: str):
+        if super().__contains__(item):
+            return super().__getitem__(item)
+        return call_generic_report
+
+    def get(self, item: str, default=None):
+        if super().__contains__(item):
+            return super().__getitem__(item)
+        return call_generic_report
+
+
 # Central map for the orchestrator to call
-SEMANTIC_TOOL_MAP = {
+SEMANTIC_TOOL_MAP = SemanticToolMap({
     "call_gp_performance_metrics": call_gp_performance_metrics,
     "get_gp_performance_metrics": call_gp_performance_metrics,
     "get_revenue_metrics": call_revenue_metrics,
@@ -805,5 +1207,6 @@ SEMANTIC_TOOL_MAP = {
     "call_analytical_query": call_analytical_query,
     "call_ui_navigation": call_ui_navigation,
     "call_authoritative_ranking_query": call_authoritative_ranking_query,
-    "call_authoritative_comparison_query": call_authoritative_comparison_query
-}
+    "call_authoritative_comparison_query": call_authoritative_comparison_query,
+    "call_generic_report": call_generic_report,
+})

@@ -40,7 +40,8 @@ class ExecutionPolicyEngine:
         self,
         query: str,
         retrieved_candidates: List[Tuple[Dict[str, Any], float]],
-        user_context: Optional[Dict[str, Any]] = None
+        user_context: Optional[Dict[str, Any]] = None,
+        execution_contract: Optional[Any] = None
     ) -> PolicyDecision:
         """
         Evaluates query signals and returns an execution decision.
@@ -77,6 +78,47 @@ class ExecutionPolicyEngine:
             )
             log_stage(logger, "POLICY", Path=dec.action, Reason=dec.reason, Confidence=top_score)
             return dec
+
+        # 1b. Check if query specifies structured grouping/dimension or analytical intent unresolved in contract
+        contract = execution_contract or (user_context.get("execution_contract") if isinstance(user_context, dict) else None)
+        if contract is not None:
+            contract_dim = getattr(contract, "dimension", None) or (contract.get("dimension") if isinstance(contract, dict) else None)
+            contract_metric = getattr(contract, "metric", None) or (contract.get("metric") if isinstance(contract, dict) else None)
+            contract_op = getattr(contract, "operation", "summary") or (contract.get("operation", "summary") if isinstance(contract, dict) else "summary")
+
+            supp_dims = [str(d).lower().strip() for d in top_cap.get("supported_dimensions", [])]
+            has_grouping_intent = " by " in q_clean or any(
+                f" {d} " in f" {q_clean} " or q_clean.endswith(f" {d}") or f"by {d}" in q_clean
+                for d in supp_dims
+            )
+            if has_grouping_intent and not contract_dim:
+                dec = PolicyDecision(
+                    action="INVOKE_PLANNER",
+                    top_capability=top_cap,
+                    candidate_capabilities=retrieved_candidates,
+                    confidence_score=top_score,
+                    reason="Query specifies structured grouping/dimension unresolved in fast-path execution contract.",
+                    requires_narrative=False
+                )
+                log_stage(logger, "POLICY", Path=dec.action, Reason=dec.reason, Confidence=top_score)
+                return dec
+
+            supp_metrics = [str(m).lower().strip() for m in top_cap.get("supported_metrics", [])]
+            has_analytical_intent = any(
+                f" {m} " in f" {q_clean} " or q_clean.endswith(f" {m}")
+                for m in supp_metrics if m not in ("summary", "default", top_cap.get("primary_metric", ""))
+            ) or any(term in q_clean for term in ("variance", "compare", "versus", " vs ", "trend"))
+            if has_analytical_intent and (not contract_metric or (contract_op == "summary" and "variance" in q_clean)):
+                dec = PolicyDecision(
+                    action="INVOKE_PLANNER",
+                    top_capability=top_cap,
+                    candidate_capabilities=retrieved_candidates,
+                    confidence_score=top_score,
+                    reason="Query specifies analytical metric or operation unresolved in fast-path execution contract.",
+                    requires_narrative=False
+                )
+                log_stage(logger, "POLICY", Path=dec.action, Reason=dec.reason, Confidence=top_score)
+                return dec
 
         # 2. Check Fast-Path Eligibility from capability metadata
         is_fast_path_eligible = top_cap.get("fast_path_eligible", True)

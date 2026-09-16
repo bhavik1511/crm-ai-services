@@ -19,9 +19,7 @@ def clean_think_tags(text: str) -> str:
     # 2. Strip "Here's a thinking process:" / "Thinking Process:" / "Thought process:" headers and reasoning
     cleaned = re.sub(r'(?:Here\'?s a |Here is a |My |The )?(?:thinking|thought)\s+process:.*?(?:\n\s*\n|\Z)', '', cleaned, flags=re.DOTALL | re.IGNORECASE).strip()
 
-    # 3. Strip any residual leading lines starting with "Here's a thinking process:" or numbers like 1. 2.
-    cleaned = re.sub(r'^(?:Here\'?s a\s*)?(?:thinking|thought)\s+process:?\s*', '', cleaned, flags=re.IGNORECASE).strip()
-    cleaned = re.sub(r'^(?:\d+\.\s*.*?\n?)+', '', cleaned).strip()
+    # 3. Strip any residual leading lines starting with "Here's a thinking process:"
     cleaned = re.sub(r'^(?:Here\'?s a\s*)?(?:thinking|thought)\s+process:?\s*', '', cleaned, flags=re.IGNORECASE).strip()
     return cleaned
 
@@ -328,9 +326,8 @@ def get_llm(model_name: Optional[str] = None, temperature: Optional[float] = Non
             raise RuntimeError("LLM_API_KEY or GROQ_API_KEY is missing from .env")
         kwargs["model_name"] = model_name
         kwargs["groq_api_key"] = api_key
-        kwargs["max_retries"] = 1
-        if base_url:
-            kwargs["base_url"] = base_url
+        if "max_tokens" in kwargs and kwargs["max_tokens"] > 1000 and "qwen" in model_name.lower():
+            kwargs["max_tokens"] = 1000
         underlying = ChatGroq(**kwargs)
 
     return SecureLLMWrapper(underlying, stage=stage)
